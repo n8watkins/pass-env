@@ -85,6 +85,7 @@ Lose that key and every stored secret is gone.
 | `pass-env import <file> --prefix <prefix> --remove` | After testing: check every stored value, then delete those lines from the file | Yes |
 | `pass-env scrub` | Count the secrets coding agents already saved in their chat logs, per file. Prints none of them | Only with `--known` |
 | `pass-env scrub --fix` | Replace those secrets in the logs with `[REDACTED:<kind>]` | Only with `--known` |
+| `pass-env scrub --history` | Show when each log folder was last checked, what was found and what was fixed. Prints no secret | No |
 | `pass-env doctor` | Check pass, GPG, the store and the current folder, including env variables the code reads but nothing declares. Decrypts nothing | No |
 | `pass-env unlock` | Type your GPG passphrase for this session. Only works in your own terminal | |
 | `pass-env help` | Everything here, with examples | |
@@ -97,7 +98,7 @@ Options:
 - `--dry-run` on `import` shows the plan, names only.
 - `--skip NAME,NAME` on `import` leaves those names in the file, and `--force` replaces existing entries.
 - `--map NAME=entry` on `import` (repeatable) stores a name in an existing or shared entry, such as `--map GEMINI_API_KEY=shared/GEMINI_API_KEY`.
-- `--path <file-or-folder>` on `scrub` (repeatable) scans more places; `--known` also looks for the exact values in your store (needs unlock); `--include-active` lets `--fix` rewrite files changed in the last 10 minutes.
+- `--path <file-or-folder>` on `scrub` (repeatable) scans more places; `--known` also looks for the exact values in your store (needs unlock); `--include-active` lets `--fix` rewrite files changed in the last 10 minutes; `--all` reads every file again instead of skipping the ones unchanged since the last scan.
 
 An **entry** is just a name you choose, like `myapp/STRIPE_SECRET_KEY`.
 Names are visible file names, so never put a secret in a name.
@@ -275,6 +276,19 @@ The dry run exits with 1 if it found anything and 0 if not, so scripts can use i
 Add `--path <file-or-folder>` (repeatable) to scan other places as well.
 Files are read line by line, so logs of hundreds of megabytes are fine.
 
+### Scan history
+
+`scrub` remembers which files it checked, when, and how many suspected secrets of each kind it found, so later runs are fast.
+A file whose inode, size and modification time are unchanged is skipped, and the summary says so (`401 files unchanged since 2026-11-01 09:59, skipped`).
+A file that only grew, such as `~/.claude/history.jsonl` or a session log, is read from the line where the last scan stopped.
+Anything else, a newer version of the patterns, or a change to the store for `--known`, means the file is read whole again.
+Remembered findings still count: the dry run lists them with "unchanged since the scan on ..." and still exits with 1.
+The history is `${XDG_STATE_HOME:-~/.local/state}/pass-env/scrub.json`, readable only by you, and holds paths, sizes, times and counts, never a secret.
+For `--known` it keeps a fingerprint of the store made from entry names, sizes and times, without decrypting anything.
+Files that no longer exist are forgotten.
+`pass-env scrub --history` shows each location, newest first, with when it was last checked, how many files were checked, which kinds were found and how many files were fixed.
+`--all` ignores the history and reads every file again.
+
 `--fix` rewrites each affected file in place:
 
 - A line that was valid JSON stays valid JSON. If a replacement would break a line, that line is left as it was and counted as skipped.
@@ -404,8 +418,8 @@ Errors are one line, start with a code, and never include secret values or GPG o
 ## Tests
 
 ```sh
-bun test           # 55 tests with a fake pass, gpg and clipboard, including a real-terminal Ctrl-C test
-./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder, including import, --remove and scrub
+bun test           # 63 tests with a fake pass, gpg and clipboard, including a real-terminal Ctrl-C test
+./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder, including import, --remove, scrub and its scan history
 ```
 
 Set `PASS_ENV_BIN=path/to/binary` to run both against a compiled binary.

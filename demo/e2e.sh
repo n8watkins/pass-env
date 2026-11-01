@@ -105,24 +105,44 @@ printf '{"type":"assistant","text":"nothing secret here"}\n' >> "$log"
 touch -d '1 hour ago' "$log"
 printf '{"text":"%s"}\n' "$ghtoken" > "$rollout" # just written: an active session
 secrets_in() { grep -c -e "$ghtoken" -e Zk3mQ9pL2xV7nR4t -e sk_test_synthetic "$@"; }
-out=$(HOME="$home" pe scrub); code=$?; printf '%s\n' "$out"
+# The scan history goes to the temp HOME too, never your real ~/.local/state.
+sc() { HOME="$home" XDG_STATE_HOME="$home/.local/state" pe scrub "$@"; }
+out=$(sc); code=$?; printf '%s\n' "$out"
 expect "dry run exits 1 when it finds something" "$code" 1
 expect "dry run prints no secret" "$(printf '%s' "$out" | secrets_in)" 0
 expect "dry run changes nothing" "$(secrets_in "$log")" 2
 step "scrub --known while locked refuses"
 gpgconf --kill gpg-agent
-HOME="$home" pe scrub --known; expect "scrub --known while locked exits 1" "$?" 1
+sc --known; expect "scrub --known while locked exits 1" "$?" 1
 step "after unlock, --known also finds stored values no pattern knows (sk_test_synthetic is too short for the Stripe pattern)"
 gpg --batch -q --pinentry-mode loopback --passphrase demo-pass -d "$PASSWORD_STORE_DIR/app/STRIPE_SECRET_KEY.gpg" >/dev/null 2>&1 && echo unlocked
-out=$(HOME="$home" pe scrub --known); printf '%s\n' "$out"
+out=$(sc --known); printf '%s\n' "$out"
 expect "the stored Stripe value is found" "$(printf '%s' "$out" | grep -c 'session.jsonl: .*known-value 1')" 1
 expect "--known prints no secret" "$(printf '%s' "$out" | secrets_in)" 0
 step "scrub --fix rewrites the old log and skips the active one"
-HOME="$home" pe scrub --known --fix; expect "fix exit" "$?" 0
+sc --known --fix; expect "fix exit" "$?" 0
 cat "$log"
 expect "secrets gone from the log" "$(secrets_in "$log")" 0
 expect "every line is still JSON" "$(bun -e 'for (const line of require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n")) JSON.parse(line); console.log("valid")' "$log")" valid
 expect "the active file is untouched" "$(secrets_in "$rollout")" 1
+step "scan history: the next run skips unchanged files and remembers what is still there"
+out=$(sc --known); code=$?; printf '%s\n' "$out"
+expect "2 unchanged files skipped" "$(printf '%s' "$out" | grep -c '^2 files unchanged since .*, skipped')" 1
+expect "the active file's finding is remembered" "$(printf '%s' "$out" | grep -c 'rollout.jsonl: github-token 1 (unchanged since the scan on')" 1
+expect "remembered findings still exit 1" "$code" 1
+step "a log that only grew: just the new lines are read"
+printf '{"type":"tool","output":"DB_PASSWORD=Zk3mQ9pL2xV7nR4t"}\n' >> "$log"
+out=$(sc); printf '%s\n' "$out"
+expect "only the new line is read" "$(printf '%s' "$out" | grep -c '^1 file only grew since the last scan')" 1
+expect "the new secret is found once" "$(printf '%s' "$out" | grep -c 'session.jsonl: secret-assignment 1 (in use')" 1
+expect "no secret printed" "$(printf '%s' "$out" | secrets_in)" 0
+step "scrub --history: when each folder was checked and what was found (no secrets)"
+out=$(sc --history); printf '%s\n' "$out"
+expect "lists the Claude Code folder" "$(printf '%s' "$out" | grep -c '^~/.claude/projects$')" 1
+expect "history prints no secret" "$(printf '%s' "$out" | secrets_in)" 0
+state="$home/.local/state/pass-env/scrub.json"
+expect "the history file is readable only by you" "$(bun -e 'console.log((require("fs").statSync(process.argv[1]).mode & 0o777).toString(8))' "$state")" 600
+expect "the history file holds no secret" "$(secrets_in "$state")" 0
 
 step "result"
 if [ "$failures" -eq 0 ]; then echo "all checks passed"; else echo "$failures checks failed"; exit 1; fi

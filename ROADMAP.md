@@ -14,6 +14,8 @@ Each step keeps the existing rule: pass-env never prints a secret value.
 - **`scrub`**: find and blank out keys that coding agents already saved in their chat logs.
   See "Clean up keys agents already saw" in the README.
 - **Env drift in `doctor`**: names the code reads but nothing declares, and `.env.pass` names the code never reads.
+- **Scan history for `scrub`**: skip unchanged files, read only the new end of growing logs, and `scrub --history`.
+  See "Scan history" in the README.
 
 ### Decisions that differ from the original plan
 
@@ -33,6 +35,9 @@ Each step keeps the existing rule: pass-env never prints a secret value.
 - A dry run reads files an agent is still writing and marks them "in use", while `--fix` skips them, so the dry run shows everything there is.
 - `--fix` keeps each file's modification time, so tools that sort sessions by time (such as `claude --resume`) keep their order, and gives up on a file that changes while it is being rewritten.
 - A line that would stop being valid JSON is left whole rather than partly redacted; the summary counts it, and a later dry run still reports it.
+- The scan history records the patterns version and the store fingerprint per run, and marks a record stale or no longer checked against the store when they change, so a location left out of one run is never trusted with results from older patterns or another store.
+- A dry run that skips an unchanged file still reports what the last scan found in it and exits with 1; `--fix` skips a file whose remaining findings are only lines it already had to leave (they would not stay valid JSON).
+- A file that was not UTF-8 text is remembered too, so it is not read again until it changes.
 - The drift check also reads `Bun.env.X`, `const { X } = process.env` and Prisma's `env("X")`, skips Python virtual environments and common build folders besides the requested ones, and runs only when there is a declaration file to compare with.
 
 ## Next

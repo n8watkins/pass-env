@@ -3,8 +3,9 @@
 // showing them. Fork of misty-step/mistystack's bin/pass-env.ts (MIT).
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
-	appendFileSync, chmodSync, closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync,
+	appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync,
 	statSync, unlinkSync, utimesSync, writeFileSync, writeSync, type Stats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
@@ -31,7 +32,7 @@ type Options =
 	| ImportOptions
 	| ScrubOptions
 	| { command: "doctor" };
-type ScrubOptions = { command: "scrub"; paths: string[]; known: boolean; fix: boolean; includeActive: boolean };
+type ScrubOptions = { command: "scrub"; paths: string[]; known: boolean; fix: boolean; includeActive: boolean; all: boolean; history: boolean };
 type ImportOptions = {
 	command: "import"; file: string; prefix: string; skip: Set<string>; map: Map<string, string>; dryRun: boolean; force: boolean; remove: boolean;
 };
@@ -83,15 +84,20 @@ Move an existing .env file into pass
       then delete those lines from it. Needs GPG unlocked.
 
 Clean up keys agents already saw
-  pass-env scrub [--path <file-or-folder>]... [--known]
+  pass-env scrub [--path <file-or-folder>]... [--known] [--all]
       Coding agents keep chat logs (~/.claude, ~/.codex, ~/.pi, ~/.omp) with
       everything they saw. Count the secrets in them per file, by kind.
       Never prints them. Exits 1 if any are found. --known also finds the
       exact values in your store, even ones no pattern knows (needs unlock).
-  pass-env scrub --fix [--include-active] [--path ...]... [--known]
+      Remembers what it checked (paths, times and counts only), so the next
+      run skips unchanged files and reads only what was added to growing
+      ones. --all reads every file again.
+  pass-env scrub --fix [--include-active] [--path ...]... [--known] [--all]
       Replace each one with [REDACTED:<kind>] in place. JSONL lines stay
       valid. Skips files changed in the last 10 minutes (an agent may be
       writing them) unless --include-active. No backups, on purpose.
+  pass-env scrub --history
+      When each log folder was last checked, and what was found and fixed.
 
 Check and set up
   pass-env doctor
@@ -296,18 +302,21 @@ function parseImport(args: string[]): ImportOptions {
 }
 
 function parseScrub(args: string[]): ScrubOptions {
-	const options: ScrubOptions = { command: "scrub", paths: [], known: false, fix: false, includeActive: false };
+	const options: ScrubOptions = { command: "scrub", paths: [], known: false, fix: false, includeActive: false, all: false, history: false };
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		if (arg === "--known") options.known = true;
 		else if (arg === "--fix") options.fix = true;
 		else if (arg === "--include-active") options.includeActive = true;
+		else if (arg === "--all") options.all = true;
+		else if (arg === "--history") options.history = true;
 		else if (arg === "--path") {
 			const value = args[++index];
 			if (!value) throw new CliError("USAGE", "--path requires a file or folder", 2);
 			options.paths.push(value);
-		} else throw new CliError("USAGE", "expected scrub [--path <file-or-folder>]... [--known] [--fix [--include-active]]", 2);
+		} else throw new CliError("USAGE", "expected scrub [--path <file-or-folder>]... [--known] [--all] [--fix [--include-active]], or scrub --history", 2);
 	}
+	if (options.history && args.length > 1) throw new CliError("USAGE", "--history takes no other options", 2);
 	if (options.includeActive && !options.fix) throw new CliError("USAGE", "--include-active only applies to --fix (a dry run already reads every file)", 2);
 	return options;
 }
@@ -1330,12 +1339,20 @@ function addCounts(into: Map<string, number>, from: Map<string, number>): void {
 	for (const [kind, count] of from) into.set(kind, (into.get(kind) ?? 0) + count);
 }
 
-type Scanned = { counts: Map<string, number>; skippedLines: number };
+// resume: where a later scan of the grown file starts when this one ended
+// mid-line (the byte after the last newline), and what that partial line held.
+// fullRescan: the file ended inside a raw PEM block, so only a full scan sees it whole.
+// left: what was found on lines --fix had to leave as they were.
+type Scanned = {
+	counts: Map<string, number>; skippedLines: number; left: Map<string, number>;
+	resume?: { offset: number; counts: Map<string, number> }; fullRescan: boolean;
+};
 
-// Streams a file line by line, writing the redacted text to output if given.
+// Streams a file line by line from byte start (a line start) up to byte end,
+// writing the redacted text to output if given.
 // Returns undefined for a file that is not UTF-8 text.
-function scanFile(path: string, patterns: Pattern[], output?: number): Scanned | undefined {
-	const result: Scanned = { counts: new Map(), skippedLines: 0 };
+function scanFile(path: string, patterns: Pattern[], output?: number, start = 0, end?: number): Scanned | undefined {
+	const result: Scanned = { counts: new Map(), skippedLines: 0, left: new Map(), fullRescan: false };
 	let pending: string[] = [];
 	let pendingSize = 0;
 	const write = (text: string) => {
@@ -1355,6 +1372,7 @@ function scanFile(path: string, patterns: Pattern[], output?: number): Scanned |
 		// A replacement that would break a JSONL line leaves that line as it was.
 		if (counts.size && output !== undefined && parsesAsJson(text) && !parsesAsJson(changed)) {
 			result.skippedLines += 1;
+			addCounts(result.left, counts);
 			write(newline ? `${text}\n` : text);
 			return;
 		}
@@ -1379,9 +1397,18 @@ function scanFile(path: string, patterns: Pattern[], output?: number): Scanned |
 	const buffer = Buffer.allocUnsafe(CHUNK);
 	const input = openSync(path, "r");
 	let partial: string[] = [];
+	let position = start;
+	// The byte after the last newline read so far.
+	let lineEnd = start;
 	try {
 		for (;;) {
-			const bytes = readSync(input, buffer, 0, CHUNK, null);
+			const want = end === undefined ? CHUNK : Math.min(CHUNK, end - position);
+			const bytes = want > 0 ? readSync(input, buffer, 0, want, position) : 0;
+			if (bytes) {
+				const newline = buffer.lastIndexOf(10, bytes - 1);
+				if (newline !== -1) lineEnd = position + newline + 1;
+				position += bytes;
+			}
 			let text: string;
 			try {
 				text = bytes ? decoder.decode(buffer.subarray(0, bytes), { stream: true }) : decoder.decode();
@@ -1389,17 +1416,25 @@ function scanFile(path: string, patterns: Pattern[], output?: number): Scanned |
 				return undefined;
 			}
 			if (text.includes("\0")) return undefined;
-			let start = 0;
-			for (let end = text.indexOf("\n"); end !== -1; end = text.indexOf("\n", start)) {
-				handle(partial.join("") + text.slice(start, end), true);
+			let from = 0;
+			for (let stop = text.indexOf("\n"); stop !== -1; stop = text.indexOf("\n", from)) {
+				handle(partial.join("") + text.slice(from, stop), true);
 				partial = [];
-				start = end + 1;
+				from = stop + 1;
 			}
-			if (start < text.length) partial.push(text.slice(start));
+			if (from < text.length) partial.push(text.slice(from));
 			if (!bytes) break;
 		}
-		if (partial.length) handle(partial.join(""), false);
-		if (block.length) endBlock(false, false);
+		if (partial.length) {
+			if (block.length) result.fullRescan = true;
+			const before = new Map(result.counts);
+			handle(partial.join(""), false);
+			if (!result.fullRescan) result.resume = { offset: lineEnd, counts: difference(result.counts, before) };
+		}
+		if (block.length) {
+			result.fullRescan = true;
+			endBlock(false, false);
+		}
 		flush();
 		return result;
 	} finally {
@@ -1407,21 +1442,27 @@ function scanFile(path: string, patterns: Pattern[], output?: number): Scanned |
 	}
 }
 
-// Every regular file under the given files and folders; symlinks inside are not followed.
-function logFiles(roots: string[]): string[] {
-	const files = new Set<string>();
-	const visit = (path: string) => {
+const difference = (after: Map<string, number>, before: Map<string, number>) => new Map(
+	[...after].map(([kind, count]): [string, number] => [kind, count - (before.get(kind) ?? 0)]).filter(([, count]) => count > 0),
+);
+
+// Every regular file under the given files and folders, with the location it
+// was found in; symlinks inside are not followed.
+function logFiles(locations: string[]): Map<string, string> {
+	const files = new Map<string, string>();
+	const visit = (path: string, location: string) => {
 		let info: Stats;
 		try { info = lstatSync(path); } catch { return; }
-		if (info.isFile() && !/\.pass-env-\d+\.tmp$/.test(path)) files.add(path);
-		else if (info.isDirectory()) {
+		if (info.isFile() && !/\.pass-env-\d+\.tmp$/.test(path)) {
+			if (!files.has(path)) files.set(path, location);
+		} else if (info.isDirectory()) {
 			let names: string[];
 			try { names = readdirSync(path); } catch { return; }
-			for (const name of names) visit(join(path, name));
+			for (const name of names) visit(join(path, name), location);
 		}
 	};
-	roots.forEach(visit);
-	return [...files].sort();
+	for (const location of locations) visit(realpathSync(location), location);
+	return new Map([...files].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 }
 
 async function knownValues(): Promise<string[]> {
@@ -1441,14 +1482,26 @@ async function knownValues(): Promise<string[]> {
 	return [...values];
 }
 
+// Changes whenever an entry is added, removed or rewritten; reads no secret.
+function storeFingerprint(root: string): string {
+	const hash = createHash("sha256").update(`${root}\n`);
+	for (const entry of listEntries(root, "")) {
+		let info: Stats;
+		try { info = statSync(join(root, `${entry}.gpg`)); } catch { continue; }
+		hash.update(`${entry}\0${info.size}\0${info.mtimeMs}\n`);
+	}
+	return hash.digest("hex").slice(0, 32);
+}
+
 const plural = (count: number, one: string, many = `${one}s`) => `${count} ${count === 1 ? one : many}`;
 const describeCounts = (counts: Map<string, number>) => [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([kind, count]) => `${kind} ${count}`).join(", ");
 const total = (counts: Map<string, number>) => [...counts.values()].reduce((sum, count) => sum + count, 0);
 const size = (bytes: number) => bytes < 1_000_000 ? `${Math.ceil(bytes / 1000)} KB` : `${(bytes / 1_000_000).toFixed(1)} MB`;
 
 // Writes the redacted copy next to the file and renames it over the original,
-// keeping mode and times. Gives up if the file changes meanwhile.
-function rewriteFile(path: string, patterns: Pattern[], before: Stats): Scanned | "changed" | "failed" {
+// keeping mode and times. Gives up if the file changes meanwhile. Returns what
+// was written, so the scan history can recognise the new file.
+function rewriteFile(path: string, patterns: Pattern[], before: Stats): (Scanned & { written: Stats }) | "changed" | "failed" {
 	const temp = join(dirname(path), `.${basename(path)}.pass-env-${process.pid}.tmp`);
 	const mode = before.mode & 0o7777;
 	let output: number | undefined;
@@ -1464,8 +1517,9 @@ function rewriteFile(path: string, patterns: Pattern[], before: Stats): Scanned 
 		}
 		chmodSync(temp, mode);
 		utimesSync(temp, before.atime, before.mtime);
+		const written = statSync(temp);
 		renameSync(temp, path);
-		return result;
+		return { ...result, written };
 	} catch {
 		if (output !== undefined) closeSync(output);
 		rmSync(temp, { force: true });
@@ -1473,9 +1527,143 @@ function rewriteFile(path: string, patterns: Pattern[], before: Stats): Scanned 
 	}
 }
 
+// Scan history: which files scrub read, when, and what it found, so the next
+// run skips unchanged files and reads only the new end of files that grew.
+// It holds paths, sizes, times and counts only, never a secret.
+// Bump PATTERNS_VERSION whenever PATTERNS or the way files are read changes,
+// so every file is read again.
+const PATTERNS_VERSION = 1;
+type Counts = Record<string, number>;
+type FileRecord = {
+	location: string; dev: number; ino: number; size: number; mtime_ms: number; scanned_at: string; counts: Counts;
+	fixed_at?: string;
+	left?: number; // how many of the counts are on lines --fix had to leave
+	known?: true; // scanned with --known against the store in store_fingerprint
+	binary?: true; // not UTF-8 text
+	stale?: true; // scanned with older patterns
+	resume?: { offset: number; counts: Counts };
+	full_rescan?: true;
+};
+type ScrubState = {
+	version: 1; patterns_version: number; store_fingerprint?: string;
+	locations: Record<string, { checked_at: string }>; files: Record<string, FileRecord>;
+};
+
+function historyPath(home: string): string {
+	const state = process.env.XDG_STATE_HOME;
+	return join(state && isAbsolute(state) ? state : join(home, ".local", "state"), "pass-env", "scrub.json");
+}
+
+const toCounts = (counts: Map<string, number>): Counts => Object.fromEntries([...counts].sort(([a], [b]) => a.localeCompare(b)));
+const fromCounts = (counts: Counts) => new Map(Object.entries(counts));
+const isCounts = (value: unknown): value is Counts => typeof value === "object" && value !== null && Object.values(value).every((count) => Number.isInteger(count));
+const validRecord = (record: FileRecord) => typeof record === "object" && record !== null && typeof record.location === "string"
+	&& [record.dev, record.ino, record.size, record.mtime_ms].every((value) => typeof value === "number") && typeof record.scanned_at === "string"
+	&& isCounts(record.counts) && (record.resume === undefined || (typeof record.resume.offset === "number" && isCounts(record.resume.counts)));
+
+function loadHistory(path: string): ScrubState {
+	const empty: ScrubState = { version: 1, patterns_version: PATTERNS_VERSION, locations: {}, files: {} };
+	let text: string;
+	try { text = readFileSync(path, "utf8"); } catch { return empty; }
+	try {
+		const state = JSON.parse(text) as ScrubState;
+		if (state.version !== 1 || typeof state.files !== "object" || typeof state.locations !== "object" || !state.files || !state.locations) throw new Error();
+		for (const [file, record] of Object.entries(state.files)) if (!validRecord(record)) delete state.files[file];
+		if (state.patterns_version !== PATTERNS_VERSION) {
+			for (const record of Object.values(state.files)) record.stale = true;
+			state.patterns_version = PATTERNS_VERSION;
+		}
+		return state;
+	} catch {
+		console.error(`warning: ${tilde(path)} is not a scan history this version can read, so every file is read again`);
+		return empty;
+	}
+}
+
+// Readable only by you, and replaced in one step so a crash never leaves half a file.
+function saveHistory(path: string, state: ScrubState): void {
+	const temp = `${path}.pass-env-${process.pid}.tmp`;
+	try {
+		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		rmSync(temp, { force: true });
+		writeFileSync(temp, `${JSON.stringify(state)}\n`, { mode: 0o600, flag: "wx" });
+		chmodSync(temp, 0o600);
+		renameSync(temp, path);
+	} catch {
+		rmSync(temp, { force: true });
+		console.error(`warning: could not save the scan history to ${tilde(path)}, so the next run reads every file again`);
+	}
+}
+
+function when(iso: string): string {
+	const date = new Date(iso);
+	const two = (value: number) => String(value).padStart(2, "0");
+	return `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())}`;
+}
+
+function byteAt(path: string, offset: number): number {
+	let input: number | undefined;
+	try {
+		input = openSync(path, "r");
+		const buffer = Buffer.alloc(1);
+		return readSync(input, buffer, 0, 1, offset) === 1 ? buffer[0] : -1;
+	} catch {
+		return -1;
+	} finally {
+		if (input !== undefined) closeSync(input);
+	}
+}
+
+type ScanPlan = { how: "same" } | { how: "append"; start: number } | { how: "full" };
+
+// How much of a file to read, given what the last scan saw. A file that kept
+// its inode and only grew is read from where the last scan stopped (a line
+// start); anything else is read whole.
+function scanPlan(path: string, info: Stats, record: FileRecord | undefined, known: boolean): ScanPlan {
+	if (!record || record.stale || (known && !record.known) || record.dev !== info.dev || record.ino !== info.ino) return { how: "full" };
+	if (info.size === record.size && info.mtimeMs === record.mtime_ms) return { how: "same" };
+	if (info.size > record.size && info.mtimeMs > record.mtime_ms && !record.full_rescan && !record.binary) {
+		const start = record.resume?.offset ?? record.size;
+		if (start <= record.size && (start === 0 || byteAt(path, start - 1) === 10)) return { how: "append", start };
+	}
+	return { how: "full" };
+}
+
+// Whether --fix has something to do: not for lines it already had to leave,
+// nor for exact store values when this run does not look for them.
+const fixable = (record: FileRecord, known: boolean) =>
+	Object.entries(record.counts).reduce((sum, [kind, count]) => sum + (known || kind !== "known-value" ? count : 0), 0) > (record.left ?? 0);
+
+function scrubHistory(home: string): number {
+	const path = historyPath(home);
+	if (!existsSync(path)) {
+		console.log("No scan history yet. Run pass-env scrub first.");
+		return 0;
+	}
+	const state = loadHistory(path);
+	const groups = new Map<string, FileRecord[]>();
+	for (const record of Object.values(state.files)) groups.set(record.location, [...(groups.get(record.location) ?? []), record]);
+	const checked = (location: string) => state.locations[location]?.checked_at
+		?? (groups.get(location) ?? []).map((record) => record.scanned_at).sort().at(-1) ?? "";
+	const locations = [...new Set([...Object.keys(state.locations), ...groups.keys()])].sort((a, b) => checked(b).localeCompare(checked(a)));
+	console.log(`Scan history in ${tilde(path)} (paths, times and counts only), newest first:`);
+	for (const location of locations) {
+		const records = groups.get(location) ?? [];
+		const found = records.filter((record) => Object.keys(record.counts).length);
+		const counts = new Map<string, number>();
+		for (const record of found) addCounts(counts, fromCounts(record.counts));
+		const fixed = records.filter((record) => record.fixed_at).length;
+		console.log(`\n${tilde(location)}\n  last checked ${checked(location) ? when(checked(location)) : "never"}: ${plural(records.length, "file")}, `
+			+ `${found.length} with findings${found.length ? ` (${describeCounts(counts)})` : ""}, ${fixed} fixed`);
+	}
+	if (Object.values(state.files).some((record) => record.stale)) console.log("\nThe patterns changed since some of these scans; the next scrub reads those files again.");
+	return 0;
+}
+
 async function scrub(options: ScrubOptions): Promise<number> {
 	const home = process.env.HOME;
 	if (!home) throw new CliError("USAGE", "HOME is not set, so the agent logs cannot be found", 2);
+	if (options.history) return scrubHistory(home);
 	for (const path of options.paths) {
 		if (!existsSync(path)) throw new CliError("USAGE", `--path ${path}: no such file or folder`, 2);
 	}
@@ -1485,19 +1673,18 @@ async function scrub(options: ScrubOptions): Promise<number> {
 		console.log("No agent logs found (looked in ~/.claude, ~/.codex, ~/.pi and ~/.omp). Add --path <file-or-folder> to scan somewhere else.");
 		return 0;
 	}
-	const known = options.known ? knownPattern(await knownValues()) : undefined;
-	const patterns = known ? [known, ...PATTERNS] : PATTERNS;
-	const files = logFiles(locations.map((path) => realpathSync(path)));
+	const historyFile = historyPath(home);
+	const state = loadHistory(historyFile);
+	if (options.known) {
+		const fingerprint = storeFingerprint(storePath());
+		// The store changed, so earlier --known scans looked for other values.
+		if (state.store_fingerprint !== fingerprint) for (const record of Object.values(state.files)) delete record.known;
+		state.store_fingerprint = fingerprint;
+	}
 	const cutoff = Date.now() - ACTIVE_MS;
-	const found = new Map<string, number>();
-	const fixed = new Map<string, number>();
-	let bytes = 0;
-	let affected = 0;
-	let notText = 0;
 	let active = 0;
-	let skippedLines = 0;
-	const failed: string[] = [];
-	for (const path of files) {
+	const plans: { path: string; location: string; info: Stats; busy: boolean; record?: FileRecord; plan: ScanPlan }[] = [];
+	for (const [path, location] of logFiles(locations)) {
 		let info: Stats;
 		try { info = statSync(path); } catch { continue; }
 		const busy = info.mtimeMs > cutoff;
@@ -1505,32 +1692,124 @@ async function scrub(options: ScrubOptions): Promise<number> {
 			active += 1;
 			continue;
 		}
-		bytes += info.size;
-		let scanned: Scanned | undefined;
-		try { scanned = scanFile(path, patterns); } catch { scanned = undefined; }
-		if (!scanned) {
-			notText += 1;
-			continue;
+		const record = options.all ? undefined : state.files[path];
+		plans.push({ path, location, info, busy, record, plan: scanPlan(path, info, record, options.known) });
+	}
+	// Decrypt only when some file has to be read.
+	const reads = (item: (typeof plans)[number]) => item.plan.how !== "same" || (options.fix && fixable(item.record!, options.known));
+	const known = options.known && plans.some(reads) ? knownPattern(await knownValues()) : undefined;
+	const patterns = known ? [known, ...PATTERNS] : PATTERNS;
+	const now = new Date().toISOString();
+	const found = new Map<string, number>();
+	const fixed = new Map<string, number>();
+	let read = 0;
+	let bytes = 0;
+	let appended = 0;
+	let unchanged = 0;
+	let newest = "";
+	let remembered = 0;
+	let affected = 0;
+	let notText = 0;
+	let skippedLines = 0;
+	const failed: string[] = [];
+	for (const item of plans) {
+		const { path, location, info, busy, record, plan } = item;
+		const ids = (stats: Stats) => ({ location, dev: stats.dev, ino: stats.ino, size: stats.size, mtime_ms: stats.mtimeMs });
+		const fixedAt = state.files[path]?.fixed_at;
+		let counts: Map<string, number>;
+		if (plan.how === "same" && !reads(item)) {
+			unchanged += 1;
+			if (record!.scanned_at > newest) newest = record!.scanned_at;
+			record!.location = location;
+			counts = fromCounts(record!.counts);
+			if (!counts.size || options.fix) continue;
+			remembered += 1;
+		} else if (plan.how === "same") {
+			// --fix on a file the last scan found secrets in: the rewrite reads it.
+			counts = fromCounts(record!.counts);
+		} else {
+			const start = plan.how === "append" ? plan.start : 0;
+			let scanned: Scanned | undefined;
+			try {
+				scanned = scanFile(path, patterns, undefined, start, info.size);
+			} catch {
+				notText += 1;
+				delete state.files[path];
+				continue;
+			}
+			read += 1;
+			bytes += info.size - start;
+			if (!scanned) {
+				notText += 1;
+				state.files[path] = { ...ids(info), scanned_at: now, counts: {}, binary: true };
+				continue;
+			}
+			counts = scanned.counts;
+			let left: number | undefined;
+			if (plan.how === "append") {
+				appended += 1;
+				counts = fromCounts(record!.counts);
+				for (const [kind, count] of fromCounts(record!.resume?.counts ?? {})) {
+					if ((counts.get(kind) ?? 0) > count) counts.set(kind, counts.get(kind)! - count);
+					else counts.delete(kind);
+				}
+				addCounts(counts, scanned.counts);
+				left = record!.left;
+			}
+			state.files[path] = {
+				...ids(info), scanned_at: now, counts: toCounts(counts),
+				...(fixedAt && { fixed_at: fixedAt }), ...(left && { left }), ...(options.known && { known: true as const }),
+				...(scanned.resume && { resume: { offset: scanned.resume.offset, counts: toCounts(scanned.resume.counts) } }),
+				...(scanned.fullRescan && { full_rescan: true as const }),
+			};
+			if (!counts.size) continue;
 		}
-		if (!scanned.counts.size) continue;
-		affected += 1;
-		addCounts(found, scanned.counts);
 		if (!options.fix) {
-			console.log(`${tilde(path)}: ${describeCounts(scanned.counts)}${busy ? " (in use: --fix skips it)" : ""}`);
+			affected += 1;
+			addCounts(found, counts);
+			const notes = [plan.how === "same" && `unchanged since the scan on ${when(record!.scanned_at)}`, busy && "in use: --fix skips it"].filter(Boolean);
+			console.log(`${tilde(path)}: ${describeCounts(counts)}${notes.length ? ` (${notes.join("; ")})` : ""}`);
 			continue;
 		}
+		if (!fixable(state.files[path], options.known)) continue;
+		if (plan.how === "same") {
+			read += 1;
+			bytes += info.size;
+		}
+		affected += 1;
+		addCounts(found, counts);
 		const result = rewriteFile(path, patterns, info);
 		if (result === "changed" || result === "failed") {
+			if (result === "changed") delete state.files[path];
 			failed.push(tilde(path));
 			console.log(`${tilde(path)}: ${result === "changed" ? "changed while scrubbing" : "could not be rewritten"}, so it was left as it was`);
 			continue;
 		}
+		// Record the rewritten file, unless something changed it right after the rename.
+		let after: Stats | undefined;
+		try { after = statSync(path); } catch { after = undefined; }
+		const { written } = result;
+		if (after && after.ino === written.ino && after.size === written.size && after.mtimeMs === written.mtimeMs) {
+			const left = total(result.left);
+			state.files[path] = {
+				...ids(written), scanned_at: now, counts: toCounts(result.left), fixed_at: now,
+				...(left && { left }), ...(options.known && { known: true as const }), ...((result.resume || result.fullRescan) && { full_rescan: true as const }),
+			};
+		} else delete state.files[path];
 		addCounts(fixed, result.counts);
 		skippedLines += result.skippedLines;
 		const skipped = result.skippedLines ? `; ${plural(result.skippedLines, "line")} left as is (would not stay valid JSON)` : "";
 		console.log(`${tilde(path)}: redacted ${describeCounts(result.counts) || "nothing"}${skipped}`);
 	}
-	console.log(`${affected ? "\n" : ""}Scanned ${plural(files.length - active, "file")} (${size(bytes)}) in ${shownLocations}.`);
+	// Forget files that are gone, note when each location was checked, and save.
+	for (const path of Object.keys(state.files)) if (!existsSync(path)) delete state.files[path];
+	for (const location of locations) state.locations[location] = { checked_at: now };
+	for (const location of Object.keys(state.locations)) if (!existsSync(location)) delete state.locations[location];
+	saveHistory(historyFile, state);
+
+	console.log(`${affected ? "\n" : ""}${read || !unchanged ? `Scanned ${plural(read, "file")} (${size(bytes)})` : "Nothing new to scan"} in ${shownLocations}.`);
+	if (appended) console.log(`${plural(appended, "file")} only grew since the last scan, so only ${appended === 1 ? "its" : "their"} new lines were read.`);
+	if (unchanged) console.log(`${plural(unchanged, "file")} unchanged since ${when(newest)}, skipped (--all reads everything again).`);
 	if (notText) console.log(`Skipped ${plural(notText, "file")} that ${notText === 1 ? "is" : "are"} not UTF-8 text or could not be read.`);
 	if (options.fix) {
 		const count = total(fixed);
@@ -1548,6 +1827,7 @@ async function scrub(options: ScrubOptions): Promise<number> {
 	}
 	const flags = [...options.paths.map((path) => ` --path ${path}`), options.known ? " --known" : ""].join("");
 	console.log(`Found ${plural(count, "suspected secret")} in ${plural(affected, "file")}: ${describeCounts(found)}.`);
+	if (remembered) console.log(`${remembered} of these files ${remembered === 1 ? "was" : "were"} not read again: unchanged since the scan that found ${remembered === 1 ? "it" : "them"}.`);
 	console.log(`Nothing was changed. To replace them with [REDACTED:<kind>]: pass-env scrub --fix${flags}`);
 	console.log("Rotate any real key in this list: it was also sent to the agent's model provider.");
 	return 1;

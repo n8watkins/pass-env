@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -68,7 +68,8 @@ exit 2
 	return {
 		root, store, calls,
 		env: {
-			...process.env, HOME: root, PASSWORD_STORE_DIR: store, PATH: `${bin}:${process.env.PATH}`, TEST_PASS_CALLS: calls,
+			// XDG_STATE_HOME keeps scrub's scan history inside the temp folder, never the real one.
+			...process.env, HOME: root, XDG_STATE_HOME: join(root, ".local", "state"), PASSWORD_STORE_DIR: store, PATH: `${bin}:${process.env.PATH}`, TEST_PASS_CALLS: calls,
 			PASS_ENV_CLIPBOARD: "fakeclip", PASS_ENV_CLIPBOARD_READ: "fakepaste", CLIP_FILE: join(root, "clipboard"), PASSWORD_STORE_CLIP_TIME: "1",
 		},
 	};
@@ -948,10 +949,14 @@ describe("scrub", () => {
 		expect(statSync(path).mode & 0o777).toBe(0o600);
 		expect(statSync(path).mtimeMs).toBe(mtime);
 		expect(readFileSync(path, "utf8")).not.toContain(".pass-env-");
-		// Running again finds only the line it could not fix.
+		// Running again remembers the line it could not fix, and --all reads it again.
 		const again = invoke(fx, ["scrub"]);
-		expect(again.stdout).toContain("session.jsonl: private-key 1\n");
+		expect(again.stdout).toContain("session.jsonl: private-key 1 (unchanged since the scan on ");
+		expect(again.stdout).toContain("1 of these files was not read again");
 		expect(again.status).toBe(1);
+		const all = invoke(fx, ["scrub", "--all"]);
+		expect(all.stdout).toContain("session.jsonl: private-key 1\n");
+		expect(all.status).toBe(1);
 	});
 
 	test("skips files changed in the last 10 minutes unless --include-active", () => {
@@ -1007,11 +1012,188 @@ describe("scrub", () => {
 		expect(readFileSync(join(fx.root, "raw.txt"), "utf8")).toBe("copy: [REDACTED:known-value]\n");
 
 		fx.env.TEST_PASS_LOCKED = "1";
-		const locked = invoke(fx, ["scrub", "--known"]);
+		// Nothing changed since the last --known scan, so nothing needs decrypting.
+		const remembered = invoke(fx, ["scrub", "--known", "--path", "raw.txt"]);
+		expect(remembered.status).toBe(0);
+		expect(remembered.stdout).toContain("2 files unchanged since");
+		const locked = invoke(fx, ["scrub", "--known", "--all"]);
 		expect(locked.status).toBe(1);
 		expect(locked.stderr).toStartWith("LOCKED:");
 		expect(locked.stderr).toContain("pass-env unlock");
 		expect(locked.stdout).toBe("");
+	});
+
+	describe("scan history", () => {
+		const historyFile = (fx: Fixture) => join(fx.root, ".local", "state", "pass-env", "scrub.json");
+		const history = (fx: Fixture) => JSON.parse(readFileSync(historyFile(fx), "utf8"));
+		const at = (path: string, minutesAgo: number) => utimesSync(path, new Date(Date.now() - minutesAgo * 60_000), new Date(Date.now() - minutesAgo * 60_000));
+		const line = (text: string) => `${JSON.stringify({ type: "tool", output: text })}\n`;
+
+		test("skips unchanged files, reads changed ones, and keeps only paths, times and counts in a file only you can read", () => {
+			const fx = fixture({});
+			const one = session(fx, [JSON.stringify({ text: samples["github-token"] })]);
+			const two = session(fx, [JSON.stringify({ text: "nothing" })], ".codex/sessions/2026/11/01/rollout.jsonl");
+			const first = invoke(fx, ["scrub"]);
+			expect(first.stdout).toContain("Scanned 2 files");
+			expect(first.status).toBe(1);
+			const again = invoke(fx, ["scrub"]);
+			expect(again.stdout).toContain("Nothing new to scan in ~/.claude/projects, ~/.codex/sessions.");
+			expect(again.stdout).toMatch(/2 files unchanged since \d{4}-\d\d-\d\d \d\d:\d\d, skipped \(--all reads everything again\)\./);
+			expect(again.stdout).toContain("session.jsonl: github-token 1 (unchanged since the scan on ");
+			expect(again.status).toBe(1);
+			writeFileSync(two, `${JSON.stringify({ text: samples.jwt })}\n`);
+			old(two);
+			const changed = invoke(fx, ["scrub"]);
+			expect(changed.stdout).toContain("Scanned 1 file");
+			expect(changed.stdout).toContain("rollout.jsonl: jwt 1\n");
+			expect(changed.stdout).toContain("1 file unchanged since");
+			expect(invoke(fx, ["scrub", "--all"]).stdout).toContain("Scanned 2 files");
+
+			const state = history(fx);
+			expect(statSync(historyFile(fx)).mode & 0o777).toBe(0o600);
+			expect(statSync(dirname(historyFile(fx))).mode & 0o777).toBe(0o700);
+			expect(Object.keys(state.files).sort()).toEqual([one, two].sort());
+			expect(state.files[one]).toMatchObject({ location: join(fx.root, ".claude/projects"), size: statSync(one).size, counts: { "github-token": 1 } });
+			noSecrets(readFileSync(historyFile(fx), "utf8"));
+		});
+
+		test("a newer pattern version reads every file again", () => {
+			const fx = fixture({});
+			session(fx, [JSON.stringify({ text: "nothing" })]);
+			invoke(fx, ["scrub"]);
+			const state = history(fx);
+			state.patterns_version = 0;
+			writeFileSync(historyFile(fx), JSON.stringify(state));
+			expect(invoke(fx, ["scrub", "--history"]).stdout).toContain("The patterns changed since some of these scans");
+			const result = invoke(fx, ["scrub"]);
+			expect(result.stdout).toContain("Scanned 1 file");
+			expect(result.stdout).not.toContain("unchanged");
+			expect(invoke(fx, ["scrub"]).stdout).toContain("1 file unchanged since");
+		});
+
+		test("--known reads files again when the store changes, and a plain scan does not count for --known", () => {
+			const value = "only-the-store-knows-this-value";
+			const fx = fixture({ "app/A": "something-else-entirely\n" });
+			session(fx, [JSON.stringify({ text: `here ${value}` })]);
+			expect(invoke(fx, ["scrub"]).status).toBe(0);
+			const first = invoke(fx, ["scrub", "--known"]);
+			expect(first.stdout).toContain("Scanned 1 file");
+			expect(first.status).toBe(0);
+			expect(invoke(fx, ["scrub", "--known"]).stdout).toContain("1 file unchanged since");
+			writeFileSync(join(fx.store, "app", "B.gpg"), `${value}\n`);
+			const changed = invoke(fx, ["scrub", "--known"]);
+			expect(changed.stdout).toContain("Scanned 1 file");
+			expect(changed.stdout).toContain("session.jsonl: known-value 1\n");
+			expect(changed.stdout + changed.stderr).not.toContain(value);
+			expect(changed.status).toBe(1);
+			// The fingerprint is names, sizes and times: no value reaches the history.
+			expect(readFileSync(historyFile(fx), "utf8")).not.toContain(value);
+			// --fix without --known cannot redact a known value, so it leaves the file alone.
+			const plain = invoke(fx, ["scrub", "--fix"]);
+			expect(plain.stdout).toContain("1 file unchanged since");
+			expect(plain.stdout).toContain("No suspected secrets were redacted.");
+			expect(invoke(fx, ["scrub", "--known", "--fix"]).stdout).toContain("session.jsonl: redacted known-value 1");
+			expect(invoke(fx, ["scrub", "--known"]).status).toBe(0);
+		});
+
+		test("a file that only grew is read from where the last scan stopped, also mid-line", () => {
+			const fx = fixture({});
+			const filler = line("x".repeat(200_000));
+			const path = session(fx, [JSON.stringify({ text: samples["github-token"] })]);
+			writeFileSync(path, filler, { flag: "a" });
+			at(path, 60);
+			expect(invoke(fx, ["scrub"]).stdout).toContain("session.jsonl: github-token 1\n");
+			writeFileSync(path, line(`key ${samples["openai-key"]}`), { flag: "a" });
+			at(path, 50);
+			const grown = invoke(fx, ["scrub"]);
+			expect(grown.stdout).toContain("session.jsonl: github-token 1, openai-key 1\n");
+			expect(grown.stdout).toContain("Scanned 1 file (1 KB)");
+			expect(grown.stdout).toContain("1 file only grew since the last scan, so only its new lines were read.");
+			// A line still being written: its start is read again once it is finished.
+			writeFileSync(path, `{"text":"${samples.jwt.slice(0, 30)}`, { flag: "a" });
+			at(path, 40);
+			expect(invoke(fx, ["scrub"]).stdout).toContain("session.jsonl: github-token 1, openai-key 1\n");
+			writeFileSync(path, `${samples.jwt.slice(30)} and ${samples["stripe-key"]}"}\n`, { flag: "a" });
+			at(path, 30);
+			const finished = invoke(fx, ["scrub"]);
+			expect(finished.stdout).toContain("session.jsonl: github-token 1, jwt 1, openai-key 1, stripe-key 1\n");
+			expect(finished.stdout).toContain("Scanned 1 file (1 KB)");
+			expect(invoke(fx, ["scrub", "--all"]).stdout).toContain("session.jsonl: github-token 1, jwt 1, openai-key 1, stripe-key 1\n");
+		});
+
+		test("a replaced file (new inode) or one that shrank is read whole", () => {
+			const fx = fixture({});
+			const path = session(fx, [JSON.stringify({ text: samples["github-token"] })]);
+			at(path, 60);
+			invoke(fx, ["scrub"]);
+			const temp = `${path}.new`;
+			writeFileSync(temp, `${readFileSync(path, "utf8")}${line(samples["openai-key"])}`);
+			renameSync(temp, path);
+			at(path, 50);
+			const replaced = invoke(fx, ["scrub"]);
+			expect(replaced.stdout).not.toContain("only grew");
+			expect(replaced.stdout).toContain("session.jsonl: github-token 1, openai-key 1\n");
+			writeFileSync(path, line(samples.jwt));
+			at(path, 40);
+			const shrank = invoke(fx, ["scrub"]);
+			expect(shrank.stdout).toContain("session.jsonl: jwt 1\n");
+			expect(shrank.stdout).not.toContain("only grew");
+		});
+
+		test("--fix records the rewritten file, so the next run skips it; deleted files are forgotten", () => {
+			const fx = fixture({});
+			const path = session(fx, [JSON.stringify({ text: samples["github-token"] })]);
+			const gone = session(fx, [JSON.stringify({ text: "nothing" })], ".claude/projects/-home-me-app/other.jsonl");
+			const inode = statSync(path).ino;
+			expect(invoke(fx, ["scrub", "--fix"]).stdout).toContain("session.jsonl: redacted github-token 1");
+			expect(statSync(path).ino).not.toBe(inode);
+			const after = invoke(fx, ["scrub"]);
+			expect(after.stdout).toContain("2 files unchanged since");
+			expect(after.stdout).toContain("No suspected secrets found.");
+			expect(after.status).toBe(0);
+			const again = invoke(fx, ["scrub", "--fix"]);
+			expect(again.stdout).toContain("2 files unchanged since");
+			expect(again.stdout).toContain("No suspected secrets were redacted.");
+			expect(history(fx).files[path]).toMatchObject({ counts: {}, size: statSync(path).size, mtime_ms: statSync(path).mtimeMs });
+			expect(history(fx).files[path].fixed_at).toBeString();
+			rmSync(gone);
+			invoke(fx, ["scrub"]);
+			expect(Object.keys(history(fx).files)).toEqual([path]);
+		});
+
+		test("--history lists each location, newest first, with counts and fixes but no secret", () => {
+			const fx = fixture({});
+			expect(invoke(fx, ["scrub", "--history"]).stdout).toBe("No scan history yet. Run pass-env scrub first.\n");
+			session(fx, [JSON.stringify({ text: samples["github-token"] }), JSON.stringify({ text: samples.jwt })]);
+			session(fx, [JSON.stringify({ text: samples["openai-key"] })], ".claude/projects/-home-me-app/two.jsonl");
+			session(fx, [JSON.stringify({ text: "nothing" })], ".codex/sessions/2026/11/01/rollout.jsonl");
+			writeFileSync(join(fx.root, "notes.txt"), `DB_PASSWORD=Zk3mQ9pL2xV7nR4t\n`);
+			old(join(fx.root, "notes.txt"));
+			invoke(fx, ["scrub", "--path", "notes.txt"]);
+			invoke(fx, ["scrub", "--fix", "--path", "notes.txt"]);
+			const state = history(fx);
+			state.locations[join(fx.root, "notes.txt")].checked_at = "2026-01-02T03:04:00.000Z";
+			writeFileSync(historyFile(fx), JSON.stringify(state));
+			const result = invoke(fx, ["scrub", "--history"]);
+			expect(result.status).toBe(0);
+			noSecrets(result.stdout + result.stderr);
+			expect(result.stdout).toStartWith("Scan history in ~/.local/state/pass-env/scrub.json (paths, times and counts only), newest first:\n");
+			expect(result.stdout).toMatch(/~\/\.claude\/projects\n {2}last checked \d{4}-\d\d-\d\d \d\d:\d\d: 2 files, 0 with findings, 2 fixed\n/);
+			expect(result.stdout).toMatch(/~\/\.codex\/sessions\n {2}last checked [^:]+:\d\d: 1 file, 0 with findings, 0 fixed\n/);
+			expect(result.stdout).toMatch(/~\/notes\.txt\n {2}last checked 2026-01-0\d \d\d:\d\d: 1 file, 0 with findings, 1 fixed\n$/);
+			for (const args of [["scrub", "--history", "--all"], ["scrub", "--fix", "--history"]]) expect(invoke(fx, args).status).toBe(2);
+		});
+
+		test("an unreadable history starts over with a warning", () => {
+			const fx = fixture({});
+			session(fx, [JSON.stringify({ text: "nothing" })]);
+			mkdirSync(dirname(historyFile(fx)), { recursive: true });
+			writeFileSync(historyFile(fx), "not json");
+			const result = invoke(fx, ["scrub"]);
+			expect(result.stderr).toBe("warning: ~/.local/state/pass-env/scrub.json is not a scan history this version can read, so every file is read again\n");
+			expect(result.stdout).toContain("Scanned 1 file");
+			expect(invoke(fx, ["scrub"]).stdout).toContain("1 file unchanged since");
+		});
 	});
 
 	test("usage errors exit 2, and no logs at all is fine", () => {
