@@ -1,0 +1,11 @@
+{
+  "name": "pass-env",
+  "version": "1.0.0",
+  "description": "Run programs with secrets from pass, without the secrets landing in files, terminals or AI agent transcripts.",
+  "license": "MIT",
+  "type": "module",
+  "bin": { "pass-env": "./pass-env.ts" },
+  "files": ["pass-env.ts", "README.md", "LICENSE", "CHANGES.md"],
+  "scripts": { "test": "bun test", "e2e": "./demo/e2e.sh" },
+  "repository": { "type": "git", "url": "git+https://github.com/n8watkins/pass-env.git" }
+}
