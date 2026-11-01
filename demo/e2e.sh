@@ -81,8 +81,13 @@ step "the human unlocks and tests the app"
 gpg --batch -q --pinentry-mode loopback --passphrase demo-pass -d "$PASSWORD_STORE_DIR/web/OPENAI_API_KEY.gpg" >/dev/null 2>&1 && echo unlocked
 pe run -- sh -c 'printf "OPENAI_API_KEY %s chars, PRIVATE_KEY %s lines\n" "${#OPENAI_API_KEY}" "$(printf "%s\n" "$PRIVATE_KEY" | wc -l)"'
 expect "multi-line value round-trips exactly" "$(pe run -- sh -c 'printf %s "$PRIVATE_KEY"')" "$(printf -- '-----BEGIN SYNTHETIC KEY-----\nabc123\n-----END SYNTHETIC KEY-----')"
+step "a second file in the same folder reuses entries with the same value (no --force)"
+printf 'OPENAI_API_KEY=sk-synthetic-openai\nWORKER_TOKEN=synthetic-worker\n' > .dev.vars
+pe import .dev.vars --prefix web; expect "second import exit" "$?" 0
 step "remove the secret lines after checking every value"
 pe import .env.local --prefix web --remove; expect "remove exit" "$?" 0
+pe import .dev.vars --prefix web --remove; expect "remove .dev.vars exit" "$?" 0
+expect ".dev.vars deleted" "$(test -e .dev.vars && echo present)" ""
 cat .env.local
 expect "secrets gone from .env.local" "$(grep -c synthetic .env.local)" 0
 expect "public and skipped lines kept" "$(grep -c -e NEXT_PUBLIC_SITE_URL -e DIRECT_URL .env.local)" 2

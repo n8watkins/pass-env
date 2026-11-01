@@ -29,13 +29,19 @@ type Options =
 	| { command: "unlock"; entry?: string }
 	| ImportOptions
 	| { command: "doctor" };
-type ImportOptions = { command: "import"; file: string; prefix: string; skip: Set<string>; dryRun: boolean; force: boolean; remove: boolean };
+type ImportOptions = {
+	command: "import"; file: string; prefix: string; skip: Set<string>; map: Map<string, string>; dryRun: boolean; force: boolean; remove: boolean;
+};
 
 const DEFAULT_FILE = ".env.pass";
 const MULTILINE = "multiline:";
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // Frameworks compile these into the browser bundle, so they are not secret.
 const PUBLIC_PREFIXES = ["NEXT_PUBLIC_", "VITE_", "PUBLIC_", "EXPO_PUBLIC_", "REACT_APP_"];
+// Public names that still look like secrets, e.g. NEXT_PUBLIC_GEMINI_API_KEY.
+const SECRET_LOOKING = /SECRET|PRIVATE|TOKEN|PASSWORD|(GEMINI|OPENAI|ANTHROPIC|GROQ|MISTRAL|RESEND|SENDGRID|TWILIO).*KEY/;
+const PLACEHOLDER = /your|xxx|changeme|example|placeholder|replace/i;
+const EXAMPLE_FILES = [".env.example", ".env.sample", ".dev.vars.example"];
 const CHARSETS: Record<Charset, string> = {
 	alnum: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
 	hex: "0123456789abcdef",
@@ -63,11 +69,13 @@ Use a secret
       Put one secret on your clipboard, cleared after 45s.
 
 Move an existing .env file into pass
-  pass-env import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--force]
+  pass-env import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--map NAME=entry]... [--force]
       Store each secret as <prefix>/<NAME> and add it to .env.pass next to
-      the file. Public names (NEXT_PUBLIC_*, VITE_*, ...) stay. The file is
-      not changed. --dry-run shows the plan, names only.
-  pass-env import <file> --prefix <prefix> [--skip NAME,NAME] --remove
+      the file. Public names (NEXT_PUBLIC_*, VITE_*, ...) and placeholders
+      stay. The file is not changed. --dry-run shows the plan, names only.
+      --map points a name at another entry, e.g. GEMINI_API_KEY=shared/GEMINI_API_KEY.
+      An existing entry is reused if its value is the same (needs unlock).
+  pass-env import <file> --prefix <prefix> [--skip ...] [--map ...] --remove
       After testing with run: check every stored value against the file,
       then delete those lines from it. Needs GPG unlocked.
 
@@ -247,18 +255,21 @@ function parseArgs(args: string[]): Options {
 }
 
 function parseImport(args: string[]): ImportOptions {
-	const options: ImportOptions = { command: "import", file: "", prefix: "", skip: new Set(), dryRun: false, force: false, remove: false };
-	const expected = "expected import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--force] [--remove]";
+	const options: ImportOptions = { command: "import", file: "", prefix: "", skip: new Set(), map: new Map(), dryRun: false, force: false, remove: false };
+	const expected = "expected import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--map NAME=entry]... [--force] [--remove]";
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		if (arg === "--dry-run") options.dryRun = true;
 		else if (arg === "--force") options.force = true;
 		else if (arg === "--remove") options.remove = true;
-		else if (arg === "--prefix" || arg === "--skip") {
+		else if (arg === "--prefix" || arg === "--skip" || arg === "--map") {
 			const value = args[++index];
 			if (!value || value.startsWith("-")) throw new CliError("USAGE", `${arg} requires a value`, 2);
 			if (arg === "--prefix") options.prefix = checkedEntry(value.replace(/\/$/, ""), "prefix");
-			else value.split(",").filter(Boolean).forEach((name) => options.skip.add(name));
+			else if (arg === "--map") {
+				const item = mapping(value, "--map");
+				options.map.set(item.name, item.entry);
+			} else value.split(",").filter(Boolean).forEach((name) => options.skip.add(name));
 		} else if (arg.startsWith("-") || options.file) throw new CliError("USAGE", expected, 2);
 		else options.file = arg;
 	}
@@ -578,11 +589,14 @@ async function runChild(argv: string[], env: NodeJS.ProcessEnv, input?: string):
 // A dotenv line or quoted block: lines first..last of the file.
 type DotenvRecord = { name: string; value: string; first: number; last: number; ambiguous: boolean };
 type Dotenv = { lines: string[]; bom: boolean; records: DotenvRecord[] };
-type Planned = { name: string; value: string; entry: string; multiline: boolean; action: "store" | "public" | "skip"; reason?: string };
+type Planned = {
+	name: string; value: string; entry: string; multiline: boolean; action: "store" | "public" | "skip"; reason?: string; secretLooking?: boolean;
+};
+type PlanOptions = { prefix: string; skip: Set<string>; map: Map<string, string>; examples: Map<string, string> };
 
 // Mirrors dotenv (used by Next.js, Vite and Wrangler). Errors name lines, never content.
 function parseDotenv(text: string, label: string): Dotenv {
-	const bom = text.startsWith("﻿");
+	const bom = text.startsWith("\uFEFF");
 	const lines = (bom ? text.slice(1) : text).split("\n");
 	const line = (index: number) => lines[index].replace(/\r$/, "");
 	const records: DotenvRecord[] = [];
@@ -630,7 +644,7 @@ function closingQuote(body: string, quote: string): number {
 	return -1;
 }
 
-function planImport(dotenv: Dotenv, prefix: string, skip: Set<string>): { items: Planned[]; duplicates: string[] } {
+function planImport(dotenv: Dotenv, { prefix, skip, map, examples }: PlanOptions): { items: Planned[]; duplicates: string[] } {
 	const latest = new Map<string, DotenvRecord>();
 	const duplicates = new Set<string>();
 	for (const record of dotenv.records) {
@@ -640,13 +654,15 @@ function planImport(dotenv: Dotenv, prefix: string, skip: Set<string>): { items:
 	const items = [...latest.values()].map((record): Planned => {
 		const { name, value } = record;
 		const plan = (action: Planned["action"], reason?: string): Planned => ({
-			name, value, entry: `${prefix}/${name}`, multiline: /[\r\n]/.test(value), action, reason,
+			name, value, entry: map.get(name) ?? `${prefix}/${name}`, multiline: /[\r\n]/.test(value), action, reason,
 		});
 		if (skip.has(name)) return plan("skip", "--skip");
-		if (PUBLIC_PREFIXES.some((public_) => name.startsWith(public_))) return plan("public");
+		const public_ = PUBLIC_PREFIXES.find((start) => name.startsWith(start));
+		if (public_) return { ...plan("public"), secretLooking: Boolean(value) && SECRET_LOOKING.test(name.slice(public_.length)) };
 		if (!NAME.test(name)) return plan("skip", "not a valid variable name");
 		if (!value) return plan("skip", "empty value");
 		if (record.ambiguous) return plan("skip", "unquoted # (quote the value)");
+		if (PLACEHOLDER.test(value) || examples.get(name) === value) return plan("skip", "placeholder");
 		// Next.js expands $NAME and ${NAME}, and turns \$ into $.
 		if (/\$[{A-Za-z_]|\\\$/.test(value)) return plan("skip", "references another variable");
 		return plan("store");
@@ -654,10 +670,37 @@ function planImport(dotenv: Dotenv, prefix: string, skip: Set<string>): { items:
 	return { items, duplicates: [...duplicates] };
 }
 
+// Values from committed example files next to the file, to spot placeholders.
+function exampleValues(directory: string): Map<string, string> {
+	const values = new Map<string, string>();
+	for (const name of EXAMPLE_FILES) {
+		try {
+			const path = join(directory, name);
+			for (const record of parseDotenv(readText(path, path), path).records) values.set(record.name, record.value);
+		} catch { /* Missing or unreadable: nothing to compare with. */ }
+	}
+	return values;
+}
+
+function git(directory: string, args: string[]): number | undefined {
+	if (!Bun.which("git")) return undefined;
+	return Bun.spawnSync({ cmd: ["git", ...args], cwd: directory, stdout: "ignore", stderr: "ignore" }).exitCode;
+}
+
+const gitTracked = (path: string) => git(dirname(path), ["ls-files", "--error-unmatch", "--", basename(path)]) === 0;
+
+function publicSecretWarning(item: Planned): string {
+	return `${item.name} looks like a secret, but public names are built into the browser bundle. If it holds a real key: rotate it, delete this line, and use it only on the server under a name without the public prefix`;
+}
+
 function readDotenv(options: ImportOptions): { dotenv: Dotenv; items: Planned[] } {
+	if (gitTracked(options.file)) {
+		throw new CliError("TRACKED", `${options.file} is committed to git, so it is shared config (deploys and teammates use it), not a local secret file; pass-env will not change it. If it holds real secrets, rotate them and git rm --cached it`);
+	}
 	const dotenv = parseDotenv(readText(options.file, options.file), options.file);
-	const { items, duplicates } = planImport(dotenv, options.prefix, options.skip);
+	const { items, duplicates } = planImport(dotenv, { ...options, examples: exampleValues(dirname(options.file)) });
 	for (const name of duplicates) console.error(`warning: ${name} is set more than once in ${options.file}; the last value is used`);
+	for (const item of items.filter((item) => item.secretLooking)) console.error(`warning: ${publicSecretWarning(item)}.`);
 	return { dotenv, items };
 }
 
@@ -665,12 +708,14 @@ function describePlan(items: Planned[], note: (item: Planned) => string = () => 
 	const width = Math.max(...items.map((item) => item.name.length));
 	return items.map((item) => {
 		const what = item.action === "store" ? `stored as ${item.entry}${item.multiline ? " (multiline)" : ""}`
-			: item.action === "public" ? "kept public" : `skipped: ${item.reason}`;
+			: item.action === "public" ? `kept public${item.secretLooking ? " (but looks like a secret, see warning)" : ""}` : `skipped: ${item.reason}`;
 		return `  ${item.name.padEnd(width)}  ${what}${note(item)}`;
 	}).join("\n");
 }
 
 const sameMapping = (mapping: Mapping, item: Planned) => mapping.entry === item.entry && mapping.multiline === item.multiline;
+const importFlags = (options: ImportOptions) => `--prefix ${options.prefix}${options.skip.size ? ` --skip ${[...options.skip].join(",")}` : ""}${
+	[...options.map].map(([name, entry]) => ` --map ${name}=${entry}`).join("")}`;
 const mappingLine = (item: Planned) => `${item.name}=${item.multiline ? MULTILINE : ""}${item.entry}`;
 const shown = (path: string) => relative(process.cwd(), path) || ".";
 
@@ -705,13 +750,14 @@ async function importFile(root: string, options: ImportOptions): Promise<number>
 	if (conflicts.length) {
 		throw new CliError("CONFLICT", `${shown(reference)} already maps ${conflicts.map((item) => item.name).join(", ")} to other entries; change those lines or use --skip`);
 	}
-	if (taken.size && !options.force) throw new CliError("EXISTS", `already in the store: ${[...taken].map((name) => `${options.prefix}/${name}`).join(", ")}; add --force to replace them`);
+	const same = options.force ? new Set<string>() : await sameValues(root, secrets.filter((item) => taken.has(item.name)));
 	let count = 0;
 	for (const item of secrets) {
+		if (same.has(item.name)) continue;
 		try {
 			await store(root, item.entry, item.value, true, item.multiline);
 		} catch (error) {
-			const stored = count ? `; ${count} of ${secrets.length} were stored, so re-run with --force` : "";
+			const stored = count ? `; ${count} of ${secrets.length - same.size} were stored, so re-run with --force` : "";
 			throw new CliError(error instanceof CliError ? error.code : "STORE", `${error instanceof CliError ? error.message : `could not store ${item.entry}`}${stored}`);
 		}
 		count += 1;
@@ -723,23 +769,46 @@ async function importFile(root: string, options: ImportOptions): Promise<number>
 		appendFileSync(reference, `${separator}${before.trim() ? "\n" : ""}# Imported from ${basename(options.file)}\n${added.map(mappingLine).join("\n")}\n`);
 	}
 	console.log(`Imported ${options.file}:`);
-	console.log(describePlan(items));
-	console.log(`\nStored ${count} ${count === 1 ? "entry" : "entries"}; added ${added.length} ${added.length === 1 ? "line" : "lines"} to ${shown(reference)}. ${options.file} was not changed.`);
+	console.log(describePlan(items, (item) => same.has(item.name) ? " (already stored with the same value)" : ""));
+	console.log(`\nStored ${count} ${count === 1 ? "entry" : "entries"}${same.size ? ` (${same.size} already had the same value)` : ""}; added ${added.length} ${added.length === 1 ? "line" : "lines"} to ${shown(reference)}. ${options.file} was not changed.`);
 	const rule = gitIgnoreRule(reference);
-	if (rule && count) console.error(`warning: git ignores ${shown(reference)} (${rule}). To commit it, add this line to .gitignore:\n  !.env.pass`);
-	if (!count) return 0;
+	if (rule && secrets.length) console.error(`warning: git ignores ${shown(reference)} (${rule}). To commit it, add this line to .gitignore:\n  !.env.pass`);
+	if (!secrets.length) return 0;
 	const here = dirname(options.file) === "." ? "" : `cd ${dirname(options.file)} && `;
-	const remove = `pass-env import ${options.file} --prefix ${options.prefix}${options.skip.size ? ` --skip ${[...options.skip].join(",")}` : ""} --remove`;
+	const remove = `pass-env import ${options.file} ${importFlags(options)} --remove`;
 	console.log(`\nNext:
   1. ${here}pass-env check
   2. ${here}pass-env run -- <your dev command>    (if it says LOCKED, run pass-env unlock first)
   3. ${remove}
      checks every stored value, then deletes those lines from ${options.file}`);
-	if (isDevVars(options.file)) console.log(`\nWrangler reads ${basename(options.file)} instead of the environment until that file is gone; see --remove.`);
+	if (isDevVars(options.file)) console.log(`\n${DEV_VARS_READERS} read ${basename(options.file)} instead of the environment until that file is gone; see --remove.`);
 	return 0;
 }
 
+// Existing entries whose stored value equals the file's; any other existing entry needs --force.
+async function sameValues(root: string, taken: Planned[]): Promise<Set<string>> {
+	const same = new Set<string>();
+	const differ: string[] = [];
+	let locked = false;
+	for (const item of taken) {
+		try {
+			if (!locked && await decrypt(root, item) === item.value) {
+				same.add(item.name);
+				continue;
+			}
+		} catch (error) {
+			if (error instanceof CliError && error.code === "LOCKED") locked = true;
+		}
+		differ.push(item.entry);
+	}
+	if (!differ.length) return same;
+	throw new CliError("EXISTS", locked
+		? `already in the store: ${differ.join(", ")}; GPG is locked, so import cannot check whether the values are the same. Run pass-env unlock, or add --force to replace them`
+		: `already in the store with a different value: ${differ.join(", ")}; add --force to replace them`);
+}
+
 const isDevVars = (file: string) => basename(file) === ".dev.vars" || basename(file).startsWith(".dev.vars.");
+const DEV_VARS_READERS = "wrangler dev, the Cloudflare Vite plugin and OpenNext's next dev";
 
 // Rewrites via a temporary file and rename, keeping the mode.
 function replaceFile(path: string, text: string): void {
@@ -767,7 +836,7 @@ async function removeImported(root: string, options: ImportOptions): Promise<num
 	const existing = existsSync(reference) ? referenceFile(reference, shown(reference)) : [];
 	const unmapped = secrets.filter((item) => !existing.some((mapping) => mapping.name === item.name && sameMapping(mapping, item)));
 	if (unmapped.length) {
-		throw new CliError("REFERENCE_FILE", `${shown(reference)} does not map ${unmapped.map((item) => item.name).join(", ")} to ${options.prefix}/; run the import without --remove first. Nothing was removed`);
+		throw new CliError("REFERENCE_FILE", `${shown(reference)} does not map ${unmapped.map((item) => `${item.name} to ${item.entry}`).join(", ")}; run the import without --remove first. Nothing was removed`);
 	}
 	const missing = secrets.filter((item) => !entryExists(root, item.entry));
 	if (missing.length) throw new CliError("ENTRY", `not in the store: ${missing.map((item) => item.entry).join(", ")}; nothing was removed`);
@@ -790,15 +859,15 @@ async function removeImported(root: string, options: ImportOptions): Promise<num
 		unlinkSync(options.file);
 		console.log(`Deleted ${options.file}: only comments and blank lines were left.`);
 	} else {
-		replaceFile(options.file, `${dotenv.bom ? "﻿" : ""}${kept.join("\n")}`);
+		replaceFile(options.file, `${dotenv.bom ? "\uFEFF" : ""}${kept.join("\n")}`);
 		console.log(`Removed ${secrets.map((item) => item.name).join(", ")} from ${options.file}.`);
 		const left = items.filter((item) => item.action !== "store");
 		if (left.length) console.log(`Still in ${options.file}:\n${describePlan(left)}`);
 	}
 	if (isDevVars(options.file)) {
 		console.log(empty
-			? "\nWrangler can now read the environment: CLOUDFLARE_INCLUDE_PROCESS_ENV=true pass-env run -- npx wrangler dev"
-			: `\nWrangler ignores environment variables while ${basename(options.file)} exists, so pass-env run cannot reach wrangler dev yet.
+			? `\n${DEV_VARS_READERS} can now read the environment, e.g. CLOUDFLARE_INCLUDE_PROCESS_ENV=true pass-env run -- npx wrangler dev`
+			: `\n${DEV_VARS_READERS} ignore environment variables while ${basename(options.file)} exists, so pass-env run cannot reach them yet.
 Move the remaining values into "vars" in wrangler.jsonc (or [vars] in wrangler.toml), then delete ${basename(options.file)}.`);
 	}
 	return 0;
@@ -909,15 +978,32 @@ function folderChecks(): Check[] {
 	const plaintext = readdirSync(".").filter((name) => /^(\.env(\..+)?|\.dev\.vars(\..+)?)$/.test(name)
 		&& name !== DEFAULT_FILE && !/\.(example|sample|template|dist)$/.test(name)
 		&& lstatSync(name).isFile()).sort();
+	const examples = exampleValues(".");
+	const repository = git(".", ["rev-parse", "--is-inside-work-tree"]) === 0;
 	for (const name of plaintext) {
+		let items: Planned[];
 		try {
-			const { items } = planImport(parseDotenv(readText(name, name), name), "x", new Set());
-			const secrets = items.filter((item) => item.action === "store").length;
-			checks.push(secrets
-				? warn(`${name} holds ${secrets} plaintext ${secrets === 1 ? "value" : "values"} that may be secret`, `pass-env import ${name} --prefix ${prefix} --dry-run`)
-				: ok(`${name} holds no secret-looking values`));
+			items = planImport(parseDotenv(readText(name, name), name), { prefix: "x", skip: new Set(), map: new Map(), examples }).items;
 		} catch {
 			checks.push(warn(`${name} could not be read as a dotenv file`, `check ${name} by hand`));
+			continue;
+		}
+		for (const item of items.filter((item) => item.secretLooking)) {
+			checks.push(warn(`${name}: ${item.name} looks like a secret under a public name (built into the browser bundle)`, "if it is a real key: rotate it and use it only on the server, without the public prefix"));
+		}
+		const secrets = items.filter((item) => item.action === "store").length;
+		if (!secrets) {
+			checks.push(ok(`${name} holds no secret-looking values`));
+			continue;
+		}
+		const tracked = repository && gitTracked(resolve(name));
+		const values = `${secrets} plaintext ${secrets === 1 ? "value" : "values"} that may be secret`;
+		if (tracked) checks.push(warn(`${name} is committed to git and holds ${values}`, `if they are real secrets: rotate them, then git rm --cached ${name}`));
+		else checks.push(warn(`${name} holds ${values}`, `pass-env import ${name} --prefix ${prefix} --dry-run`));
+		const mode = statSync(name).mode & 0o777;
+		if (mode & 0o077) checks.push(warn(`${name} can be read by other users (mode ${mode.toString(8)})`, `chmod 600 ${name}`));
+		if (repository && !tracked && !gitIgnoreRule(resolve(name))) {
+			checks.push(warn(`${name} is neither committed nor ignored by git, so git add . would commit it`, `echo '${name}' >> .gitignore`));
 		}
 	}
 	if (!plaintext.length) checks.push(ok("no plaintext .env files in this folder"));

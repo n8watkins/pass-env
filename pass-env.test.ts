@@ -442,7 +442,7 @@ describe("unlock and list", () => {
 
 describe("import", () => {
 	const lines = [
-		"﻿# Settings for the app",
+		"\uFEFF# Settings for the app",
 		"NEXT_PUBLIC_SITE_URL=https://example.invalid",
 		"export OPENAI_API_KEY=sk-synthetic-openai # the key",
 		"SINGLE='literal-synthetic \\n kept #not-a-comment'",
@@ -459,7 +459,7 @@ describe("import", () => {
 		"  SPACED  =  synthetic-spaced  ",
 	];
 	const sample = `${lines.join("\r\n")}\r\n`;
-	const kept = "﻿# Settings for the app\r\nNEXT_PUBLIC_SITE_URL=https://example.invalid\r\nEMPTY=\r\nREFERENCE=${OPENAI_API_KEY}/synthetic\r\nBARE_HASH=synthetic#def\r\nmy.var=synthetic-dotted\r\n";
+	const kept = "\uFEFF# Settings for the app\r\nNEXT_PUBLIC_SITE_URL=https://example.invalid\r\nEMPTY=\r\nREFERENCE=${OPENAI_API_KEY}/synthetic\r\nBARE_HASH=synthetic#def\r\nmy.var=synthetic-dotted\r\n";
 	const secretFree = (text: string) => {
 		for (const word of ["synthetic", "SYNTHETIC", "example.invalid", "line two"]) expect(text).not.toContain(word);
 	};
@@ -519,8 +519,8 @@ describe("import", () => {
 		const files = setup({ "app/PEM": "old" });
 		const result = invoke(files, ["import", ".env.local", "--prefix", "app"]);
 		expect(result.status).toBe(1);
-		expect(error(result.stderr)).toStartWith("EXISTS: already in the store: app/PEM;");
-		expect(existsSync(files.calls)).toBe(false);
+		expect(error(result.stderr)).toStartWith("EXISTS: already in the store with a different value: app/PEM;");
+		expect(readFileSync(files.calls, "utf8")).toBe("show -- app/PEM\n");
 		expect(existsSync(join(files.root, ".env.pass"))).toBe(false);
 		expect(invoke(files, ["import", ".env.local", "--prefix", "app", "--force"]).status).toBe(0);
 		expect(stored(files, "app/PEM")).toBe("-----BEGIN SYNTHETIC-----\nabc\n-----END SYNTHETIC-----");
@@ -601,6 +601,7 @@ describe("import", () => {
 		expect(result.status).toBe(0);
 		expect(existsSync(join(files.root, ".dev.vars"))).toBe(false);
 		expect(result.stdout).toContain("Deleted .dev.vars");
+		expect(result.stdout).toContain("the Cloudflare Vite plugin and OpenNext's next dev can now read the environment");
 		expect(result.stdout).toContain("CLOUDFLARE_INCLUDE_PROCESS_ENV=true pass-env run -- npx wrangler dev");
 
 		mkdirSync(join(files.root, "sub"));
@@ -611,8 +612,69 @@ describe("import", () => {
 		const partial = invoke(files, ["import", "sub/.dev.vars", "--prefix", "worker", "--remove"]);
 		expect(partial.status).toBe(0);
 		expect(read(files, "sub/.dev.vars")).toBe("PUBLIC_MODE=dev\n");
-		expect(partial.stdout).toContain("Wrangler ignores environment variables while .dev.vars exists");
+		expect(partial.stdout).toContain("wrangler dev, the Cloudflare Vite plugin and OpenNext's next dev ignore environment variables while .dev.vars exists");
 		expect(partial.stdout).toContain('"vars" in wrangler.jsonc');
+	});
+
+	test("skips placeholders and warns about secrets under public names without storing them", () => {
+		const files = fixture({});
+		writeFileSync(join(files.root, ".env.example"), "STRIPE_KEY=sk_test_synthetic_sample\n");
+		writeFileSync(join(files.root, ".env.local"), [
+			"OPENAI_API_KEY=your-openai-key", "AUTH_SECRET=changeme", "STRIPE_KEY=sk_test_synthetic_sample",
+			"NEXT_PUBLIC_GEMINI_API_KEY=AIza-synthetic", "NEXT_PUBLIC_SITE_URL=https://synthetic.invalid", "REAL=synthetic-real",
+		].join("\n"));
+		const dry = invoke(files, ["import", ".env.local", "--prefix", "app", "--dry-run"]);
+		secretFree(dry.stdout + dry.stderr);
+		for (const name of ["OPENAI_API_KEY", "AUTH_SECRET", "STRIPE_KEY"]) expect(dry.stdout).toMatch(new RegExp(`${name}\\s+skipped: placeholder`));
+		expect(dry.stdout).toMatch(/NEXT_PUBLIC_GEMINI_API_KEY\s+kept public \(but looks like a secret, see warning\)/);
+		expect(dry.stdout).toMatch(/NEXT_PUBLIC_SITE_URL\s+kept public\n/);
+		expect(dry.stderr).toContain("warning: NEXT_PUBLIC_GEMINI_API_KEY looks like a secret");
+		expect(dry.stderr).not.toContain("NEXT_PUBLIC_SITE_URL");
+		expect(invoke(files, ["import", ".env.local", "--prefix", "app"]).status).toBe(0);
+		expect(read(files, ".env.pass")).toBe("# Imported from .env.local\nREAL=app/REAL\n");
+	});
+
+	test("--map points a name at a shared entry, and an existing entry with the same value needs no --force", () => {
+		const files = fixture({ "shared/GEMINI_API_KEY": "gemini-synthetic\n" });
+		writeFileSync(join(files.root, ".env.local"), "GEMINI_API_KEY=gemini-synthetic\nAUTH_SECRET=auth-synthetic\n");
+		writeFileSync(join(files.root, ".dev.vars"), "AUTH_SECRET=auth-synthetic\nGEMINI_API_KEY=gemini-synthetic\n");
+		const map = ["--map", "GEMINI_API_KEY=shared/GEMINI_API_KEY"];
+		const first = invoke(files, ["import", ".env.local", "--prefix", "web", ...map]);
+		expect(first.status).toBe(0);
+		expect(first.stdout).toMatch(/GEMINI_API_KEY\s+stored as shared\/GEMINI_API_KEY \(already stored with the same value\)/);
+		expect(first.stdout).toContain("--prefix web --map GEMINI_API_KEY=shared/GEMINI_API_KEY --remove");
+		expect(readFileSync(files.calls, "utf8")).not.toContain("insert --multiline --force -- shared/GEMINI_API_KEY");
+		expect(read(files, ".env.pass")).toBe("# Imported from .env.local\nGEMINI_API_KEY=shared/GEMINI_API_KEY\nAUTH_SECRET=web/AUTH_SECRET\n");
+
+		const second = invoke(files, ["import", ".dev.vars", "--prefix", "web", ...map]);
+		expect(second.status).toBe(0);
+		expect(second.stdout).toContain("Stored 0 entries (2 already had the same value); added 0 lines");
+		expect(invoke(files, ["import", ".env.local", "--prefix", "web", ...map, "--remove"]).status).toBe(0);
+		expect(invoke(files, ["import", ".dev.vars", "--prefix", "web", ...map, "--remove"]).status).toBe(0);
+		expect(existsSync(join(files.root, ".env.local"))).toBe(false);
+		expect(existsSync(join(files.root, ".dev.vars"))).toBe(false);
+
+		writeFileSync(join(files.root, ".env.local"), "AUTH_SECRET=other-synthetic\n");
+		expect(error(invoke(files, ["import", ".env.local", "--prefix", "web"]).stderr)).toStartWith("EXISTS: already in the store with a different value: web/AUTH_SECRET");
+		writeFileSync(join(files.root, ".env.local"), "AUTH_SECRET=auth-synthetic\n");
+		files.env.TEST_PASS_LOCKED = "1";
+		const locked = error(invoke(files, ["import", ".env.local", "--prefix", "web"]).stderr);
+		expect(locked).toStartWith("EXISTS: already in the store: web/AUTH_SECRET; GPG is locked");
+		expect(locked).toContain("pass-env unlock");
+		expect(invoke(files, ["import", ".env.local", "--prefix", "web", "--map", "bad name=x"]).status).toBe(2);
+	});
+
+	test("refuses to import or remove a file committed to git", () => {
+		const files = setup();
+		spawnSync("git", ["init", "-q"], { cwd: files.root });
+		spawnSync("git", ["add", ".env.local"], { cwd: files.root });
+		for (const extra of [[], ["--dry-run"], ["--remove"]]) {
+			const result = invoke(files, ["import", ".env.local", "--prefix", "app", ...extra]);
+			expect(result.status).toBe(1);
+			expect(result.stderr).toStartWith("TRACKED: .env.local is committed to git, so it is shared config");
+		}
+		expect(existsSync(files.calls)).toBe(false);
+		expect(read(files, ".env.local")).toBe(sample);
 	});
 
 	test("bad arguments and unparseable files fail clearly without echoing content", () => {
@@ -692,7 +754,8 @@ describe("doctor", () => {
 		const files = healthy();
 		writeFileSync(join(files.env.GNUPGHOME!, "gpg-agent.conf"), "default-cache-ttl 600\nmax-cache-ttl 999999\n");
 		files.env.WSL_DISTRO_NAME = "synthetic";
-		writeFileSync(join(files.root, ".env.local"), "SECRET_KEY=synthetic-secret\nNEXT_PUBLIC_X=synthetic-public\n");
+		writeFileSync(join(files.root, ".env.local"), "SECRET_KEY=synthetic-secret\nNEXT_PUBLIC_X=synthetic-public\n", { mode: 0o644 });
+		chmodSync(join(files.root, ".env.local"), 0o644);
 		writeFileSync(join(files.root, ".env"), "NEXT_PUBLIC_X=synthetic-public\n");
 		writeFileSync(join(files.root, ".env.example"), "SECRET_KEY=synthetic-placeholder\n");
 		spawnSync("git", ["init", "-q"], { cwd: files.root });
@@ -712,7 +775,29 @@ describe("doctor", () => {
 		expect(result.stdout).toContain("fix: echo '!.env.pass' >> .gitignore");
 		line(result.stdout, "warn", "Claude Code may read .env files");
 
+		line(result.stdout, "warn", "\\.env\\.local can be read by other users \\(mode 644\\)");
+		expect(result.stdout).toContain("fix: chmod 600 .env.local");
+
 		writeFileSync(join(files.root, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Read(**/.env.*)"] } }));
 		line(invoke(files, ["doctor"]).stdout, "ok", "Claude Code is denied reading .env files");
+	});
+
+	test("warns about secret-looking public names, and secret files git would commit or already tracks", () => {
+		const files = healthy();
+		spawnSync("git", ["init", "-q"], { cwd: files.root });
+		writeFileSync(join(files.root, ".env.local"), "API_KEY=synthetic-key\n");
+		chmodSync(join(files.root, ".env.local"), 0o600);
+		writeFileSync(join(files.root, ".env.production"), "DB_PASSWORD=synthetic-password\nNEXT_PUBLIC_GEMINI_API_KEY=AIza-synthetic\n");
+		chmodSync(join(files.root, ".env.production"), 0o600);
+		spawnSync("git", ["add", ".env.production"], { cwd: files.root });
+		const result = invoke(files, ["doctor"]);
+		expect(result.status).toBe(0);
+		expect(result.stdout).not.toContain("synthetic-");
+		expect(result.stdout).not.toContain("other users");
+		line(result.stdout, "warn", "\\.env\\.local is neither committed nor ignored by git");
+		expect(result.stdout).toContain("fix: echo '.env.local' >> .gitignore");
+		line(result.stdout, "warn", "\\.env\\.production is committed to git and holds 1 plaintext value");
+		expect(result.stdout).toContain("git rm --cached .env.production");
+		line(result.stdout, "warn", "\\.env\\.production: NEXT_PUBLIC_GEMINI_API_KEY looks like a secret under a public name");
 	});
 });
