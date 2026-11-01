@@ -39,5 +39,7 @@ before=$(pe run -- sh -c 'printf %s "$AUTH_SECRET"' | sha256sum | cut -c1-8)
 pe generate app/AUTH_SECRET --force
 after=$(pe run -- sh -c 'printf %s "$AUTH_SECRET"' | sha256sum | cut -c1-8)
 echo "fingerprint $before -> $after"
+step "pipe one secret into a command (stands in for gh secret set)"
+pe pipe app/STRIPE_SECRET_KEY -- sh -c 'v=$(cat); printf "received %s chars\n" "${#v}"'
 step "pass still shows entries normally to the human"
 pass show app/STRIPE_SECRET_KEY | head -c 8; echo "..."

@@ -1,29 +1,27 @@
 # pass-env
 
-Run programs with secrets from [`pass`](https://www.passwordstore.org/), without the secrets landing in files, terminals or AI agent transcripts.
+Use secrets from [`pass`](https://www.passwordstore.org/) in your apps, your deploys and your AI coding agents, without the secrets ever showing up in files, terminals or chat transcripts.
 
 ```sh
-pass-env set myapp/STRIPE_SECRET_KEY        # paste the key once; it is encrypted
+pass-env set myapp/STRIPE_SECRET_KEY                      # paste the key once, it gets encrypted
 echo 'STRIPE_SECRET_KEY=myapp/STRIPE_SECRET_KEY' >> .env.pass
-pass-env run -- pnpm dev                    # your app gets the key, nothing prints it
+pass-env run -- pnpm dev                                  # your app gets the key, nothing prints it
 ```
 
-Your project keeps a `.env.pass` file that lists **names only**, never values.
-It is safe to commit and safe for coding agents to read.
-The real keys stay encrypted in your `pass` store and are decrypted only into the one program you start.
+Each project keeps a `.env.pass` file that lists **names only**.
+It is safe to commit and safe for agents to read.
+The real values stay encrypted in your `pass` store.
 
 ## Why
 
 Coding agents (Claude Code, Codex, Cursor and others) read files and run commands as you.
-A plaintext `.env.local` is one `cat` away from being copied into an agent's transcript, and from there into logs, caches and provider requests.
+A plaintext `.env.local` is one `cat` away from being copied into an agent's transcript, and from there into logs and caches.
 That is how real keys leak.
-pass-env removes plaintext secrets from the places agents look by habit, while still letting agents run your app, generate new secrets and push secrets to production without seeing them.
+pass-env takes plaintext secrets out of the places agents look, while still letting agents run your app, create new secrets and push secrets to production without seeing them.
 
-### What it does not do
-
-pass-env prevents accidents, not a determined attacker.
-Once you unlock GPG, anything running as your user can decrypt until GPG's cache expires, including an agent that runs `pass-env run -- printenv KEY` on purpose.
-For a hard boundary, run agents as a different OS user or in a container, and keep production keys in your hosting platform rather than on your laptop.
+**What it does not do:** stop a determined attacker.
+While GPG is unlocked, anything running as your user can decrypt, including an agent that runs `pass-env run -- printenv KEY` on purpose.
+For a hard boundary, run agents as a different OS user or in a container, and keep production keys in your hosting platform.
 
 ## Install
 
@@ -31,12 +29,12 @@ Needs [Bun](https://bun.sh), `gpg` and `pass`.
 Works on Linux, macOS and Windows through WSL.
 
 ```sh
-# 1. pass and a GPG key (skip what you already have)
-sudo apt install pass            # macOS: brew install pass gnupg
-gpg --full-generate-key          # pick a passphrase you can type daily
-pass init you@example.com        # the email on that key
+# pass and a GPG key (skip what you already have)
+sudo apt install pass                 # macOS: brew install pass gnupg
+gpg --full-generate-key               # choose a passphrase you can type daily
+pass init you@example.com             # the email on that key
 
-# 2. pass-env
+# pass-env
 mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/n8watkins/pass-env/main/pass-env.ts -o ~/.local/bin/pass-env
 chmod +x ~/.local/bin/pass-env
@@ -44,69 +42,89 @@ pass-env help
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
+Back up your GPG private key once (`gpg --export-secret-keys --armor you@example.com > key.asc`), store it offline, and delete the file.
+Lose that key and every stored secret is gone.
 
-Back up your GPG private key once (`gpg --export-secret-keys --armor you@example.com > key.asc`), keep it somewhere offline, then delete the file.
-If you lose it, every stored secret is gone.
+## All commands
 
-## Everyday use
+| Command | What it does | Needs unlock? |
+| --- | --- | --- |
+| `pass-env set <entry>` | Store a key you were given. Paste it at the hidden prompt, or pipe it in | No |
+| `pass-env generate <entry>` | Make a random secret and store it. Never printed | No |
+| `pass-env generate <entry> --copy` | Same, and put it on your clipboard to paste somewhere (cleared after 45s) | No |
+| `pass-env run -- <command>` | Run a command with the secrets from `./.env.pass` as environment variables | Yes |
+| `pass-env pipe <entry> -- <command>` | Send one secret to a command's input, for example `gh secret set` | Yes |
+| `pass-env copy <entry>` | Put one stored secret on your clipboard (cleared after 45s) | Yes |
+| `pass-env check` | Show each line of `./.env.pass` as ok or MISSING | No |
+| `pass-env list [prefix]` | Show the names in your store | No |
+| `pass-env unlock` | Type your GPG passphrase for this session. Only works in your own terminal | |
+| `pass-env help` | Everything here, with examples | |
 
-### Add a key you got from a provider
+Options:
+- `--force` on `set` or `generate` replaces an existing entry (rotation).
+- `generate <entry> 64 --charset hex` sets the length (16 to 512, default 48) and characters (`alnum`, `hex`, `base64url`).
+- `--multiline` on `pipe` or `copy` uses the whole entry instead of its first line.
+- `run -f file` or `run -e NAME=entry` uses other mappings instead of `./.env.pass`.
+
+An **entry** is just a name you choose, like `myapp/STRIPE_SECRET_KEY`.
+Names are visible file names, so never put a secret in a name.
+
+## Common tasks
+
+### Store a key a provider gave you
 
 ```sh
 pass-env set myapp/OPENAI_API_KEY
 ```
 
-Paste the key when prompted, then paste it again to confirm.
-Nothing is echoed or saved in shell history.
-The text after `set` is the **name** you choose, not the key.
-Names are visible file names, so never put a secret in a name.
+Paste it, then paste it again to confirm.
+Nothing is echoed or saved in your shell history.
 
-You can also pipe a value in: `pbpaste | pass-env set myapp/OPENAI_API_KEY`.
+### Make up a new secret
 
-### Make up a secret you control
+For values you invent rather than receive: `AUTH_SECRET`, session keys, cron tokens, your own webhook secrets.
+There are two ways, depending on who needs it.
 
-For values you invent rather than receive, such as `AUTH_SECRET`, session keys, cron tokens or your own webhook secrets:
+**You need to paste it somewhere** (a dashboard field, another machine):
 
 ```sh
-pass-env generate myapp/AUTH_SECRET                    # 48 random letters and digits
-pass-env generate myapp/WEBHOOK_SECRET 64 --charset hex
+pass-env generate myapp/WEBHOOK_SECRET --copy
 ```
 
-The value is never printed, so an agent can do this for you safely.
-Storing never needs your passphrase, because it only encrypts.
+It is stored and on your clipboard. Paste it within 45 seconds.
 
-### Tell the project which keys it needs
-
-`.env.pass` in the project folder:
+**An agent or script needs to use it** (nobody sees it):
 
 ```sh
-# variable name = name in pass
+pass-env generate myapp/WEBHOOK_SECRET
+pass-env pipe myapp/WEBHOOK_SECRET -- gh secret set WEBHOOK_SECRET
+```
+
+### Use secrets in your app
+
+List what the project needs in `.env.pass`:
+
+```sh
+# variable name = entry name
 OPENAI_API_KEY=myapp/OPENAI_API_KEY
 AUTH_SECRET=myapp/AUTH_SECRET
 GEMINI_API_KEY=shared/GEMINI_API_KEY
 FIREBASE_ADMIN_KEY=multiline:myapp/FIREBASE_ADMIN_KEY
 ```
 
-Each variable gets the first line of its entry, the same convention `pass`, QtPass and browser extensions use.
-Use `multiline:` for keys that span lines, such as PEM private keys or JSON.
-
-Check it any time; this decrypts nothing:
+Then:
 
 ```sh
-pass-env check
-```
-
-### Run your app
-
-```sh
-pass-env unlock          # once per session, in your own terminal: type your passphrase
+pass-env check                # anything missing?
+pass-env unlock               # once per session, in your terminal
 pass-env run -- pnpm dev
 ```
 
-`run` uses `./.env.pass` unless you pass `-f file` or `-e NAME=entry`.
-It never prompts: if GPG is locked it stops at once with `LOCKED: ... run pass-env unlock`.
+Each variable gets the first line of its entry, the same convention `pass` and its apps use.
+Use `multiline:` for values that span lines, such as PEM keys or JSON.
+Lines are data only: no quotes, `export`, interpolation or comments after a value.
 
-Add scripts so nobody has to remember the prefix:
+Put it in your scripts so nobody has to remember:
 
 ```json
 "scripts": {
@@ -115,84 +133,68 @@ Add scripts so nobody has to remember the prefix:
 }
 ```
 
-### Send a key to production without showing it
+### Send a secret to production
 
 ```sh
-# GitHub Actions
-pass-env run -e V=myapp/STRIPE_SECRET_KEY -- sh -c 'printf %s "$V" | gh secret set STRIPE_SECRET_KEY'
-# Vercel
-pass-env run -e V=myapp/STRIPE_SECRET_KEY -- sh -c 'printf %s "$V" | vercel env add STRIPE_SECRET_KEY production'
-# Cloudflare Workers
-pass-env run -e V=myapp/STRIPE_SECRET_KEY -- sh -c 'printf %s "$V" | npx wrangler secret put STRIPE_SECRET_KEY'
+pass-env pipe myapp/STRIPE_SECRET_KEY -- gh secret set STRIPE_SECRET_KEY                    # GitHub Actions
+pass-env pipe myapp/STRIPE_SECRET_KEY -- vercel env add STRIPE_SECRET_KEY production        # Vercel
+pass-env pipe myapp/STRIPE_SECRET_KEY -- npx wrangler secret put STRIPE_SECRET_KEY          # Cloudflare Workers
 ```
 
-### Rotate a key
+### Paste a stored secret into a website
 
-| Kind of secret | How to rotate |
+```sh
+pass-env copy myapp/STRIPE_SECRET_KEY
+```
+
+### Rotate a secret
+
+| The secret is | Rotate it with |
 | --- | --- |
-| One you generated (`AUTH_SECRET`, cron token, your own webhook secret) | `pass-env generate myapp/AUTH_SECRET --force` |
-| One a provider issued (Stripe, OpenAI, Resend, Clerk, Stripe webhook `whsec_...`) | Roll it in the provider's dashboard, then `pass-env set myapp/STRIPE_SECRET_KEY --force` |
+| One you made up (`AUTH_SECRET`, cron token, your own webhook secret) | `pass-env generate <entry> --force` (add `--copy` if you must paste it somewhere) |
+| One a provider issued (Stripe, OpenAI, Resend, Clerk, Stripe's `whsec_` webhook secret) | Roll it in the provider's dashboard, then `pass-env set <entry> --force` |
 
-Then update every place that holds a copy: re-run the production command above, and for shared secrets (a webhook secret both sides check) update the other side too.
-Every local project that points at the entry picks up the new value on its next run.
-Rotating `AUTH_SECRET` signs everyone out, which is usually the point.
-
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| `pass-env run [-f file]... [-e NAME=entry]... -- cmd` | Start `cmd` with the secrets in its environment. Defaults to `./.env.pass` |
-| `pass-env check [-f file]...` | List each mapping as ok or MISSING. Decrypts nothing |
-| `pass-env set <entry> [--force]` | Store a pasted or piped value |
-| `pass-env generate <entry> [length] [--charset alnum\|hex\|base64url] [--force]` | Store a new random secret (16 to 512 chars, default 48 alnum). Never printed |
-| `pass-env unlock [entry]` | Type your passphrase so runs can decrypt. Refuses without a terminal |
-| `pass-env list [prefix] [--json]` | Show entry names. Decrypts nothing |
-| `pass-env help` | All of the above with examples |
-
-Errors are short codes with a cause, and never include secret values or GPG output: `ENTRY`, `LOCKED`, `DECRYPT`, `EXISTS`, `STORE`, `USAGE`, `TTY`, `PASS_MISSING`.
+Then update every copy: run the production `pipe` command again, and update the other side of anything shared (a webhook secret is checked by the receiver and known by the sender).
+Local projects pick up the new value on their next run.
+Rotating `AUTH_SECRET` signs everyone out.
 
 ## Does it work with my setup?
 
-pass-env sets normal environment variables, so anything that reads `process.env` (or `os.environ`, `ENV`, and so on) works unchanged.
+pass-env sets ordinary environment variables, so anything that reads them works unchanged.
 
 | Setup | Works? | Notes |
 | --- | --- | --- |
-| Next.js | Yes | Real environment variables win over `.env*` files. `NEXT_PUBLIC_*` values are compiled into the browser bundle, so they are public anyway; keep those in a normal `.env` |
-| Vite | Yes | Existing environment variables win over `.env` files. Only `VITE_*` reaches the browser, and that is public too |
-| Node, Bun, Python, Go, Rust, Ruby scripts | Yes | |
-| Prisma, Drizzle, Convex, Supabase CLIs | Yes | Run them through `pass-env run` |
-| Cloudflare Workers (`wrangler dev`) | With one setting | Wrangler reads `.dev.vars`, not the environment. Delete `.dev.vars` and run `CLOUDFLARE_INCLUDE_PROCESS_ENV=true pass-env run -- npx wrangler dev` |
-| Docker | With flags | List the names: `pass-env run -- docker run -e STRIPE_SECRET_KEY -e AUTH_SECRET image` |
-| Tools that want a key **file** (`GOOGLE_APPLICATION_CREDENTIALS`, SSH keys, certificates) | Not directly | Prefer the tool's env-var option (many accept the JSON or PEM text). Otherwise `sh -c 'printf %s "$KEY" > /dev/shm/k && tool --key /dev/shm/k; rm /dev/shm/k'` |
-| Editor run buttons, debuggers, GUI apps, cron, systemd | Only if started through pass-env | They don't inherit your terminal. Start them from a terminal with `pass-env run`, or wrap the command in their config |
-| Production hosting (Vercel, Cloudflare, GitHub Actions) | No, by design | They don't have your store. Push the values once with the commands above |
+| Next.js, Vite | Yes | Real environment variables win over `.env` files, so no code changes. Browser-visible values (`NEXT_PUBLIC_*`, `VITE_*`) are public by design; keep them in a normal `.env` |
+| Node, Bun, Python, Go, Ruby, Rust | Yes | |
+| Prisma, Drizzle, Convex, Supabase and other CLIs | Yes | Run them through `pass-env run` |
+| Cloudflare Workers (`wrangler dev`) | One setting | Wrangler reads `.dev.vars`, not the environment. Delete `.dev.vars` and run `CLOUDFLARE_INCLUDE_PROCESS_ENV=true pass-env run -- npx wrangler dev` |
+| Docker | With flags | Name the variables: `pass-env run -- docker run -e STRIPE_SECRET_KEY image` |
+| Tools that want a key file (Google credentials JSON, SSH keys, certificates) | Not directly | Use the tool's environment-variable option if it has one |
+| Editor run buttons, debuggers, GUI apps, cron | Only when started through pass-env | They don't inherit your terminal |
+| Hosting (Vercel, Cloudflare, GitHub Actions) | No, by design | Send values once with `pass-env pipe` |
 
-## Using it with AI coding agents
+## With AI coding agents
 
-Paste this into your `CLAUDE.md`, `AGENTS.md` or equivalent:
+Paste this into `CLAUDE.md`, `AGENTS.md` or your agent's equivalent:
 
 ```markdown
 ## Secrets
-- Never open .env, .env.*, .dev.vars, or anything in ~/.password-store, and never run env, printenv or echo on secret variables.
-- Each project lists its secrets by name in .env.pass. Run anything that needs them with `pass-env run -- <command>`; check with `pass-env check`.
-- To create a secret we control (AUTH_SECRET, cron or webhook secrets we define): `pass-env generate <project>/<NAME>`, then add `NAME=<project>/<NAME>` to .env.pass.
-- To rotate one of those: `pass-env generate <entry> --force`, push it to production with `pass-env run -e V=<entry> -- sh -c 'printf %s "$V" | <platform> ...'`, then tell me every other place that still holds the old value.
-- For keys a provider issues (Stripe, OpenAI, Resend...), ask me to run `pass-env set <entry>` myself. Never ask me to paste a key into chat.
-- If you see LOCKED, ask me to run `pass-env unlock`; you cannot unlock it yourself.
+- Never open .env, .env.*, .dev.vars or ~/.password-store, and never print secret variables (env, printenv, echo).
+- Each project lists its secrets by name in .env.pass. Run things with `pass-env run -- <command>`; check with `pass-env check`.
+- To create a secret we control: `pass-env generate <project>/<NAME>`, then add `NAME=<project>/<NAME>` to .env.pass.
+- To send a secret somewhere: `pass-env pipe <entry> -- <command that reads stdin>`.
+- To rotate one we control: `pass-env generate <entry> --force`, re-send it to production with pipe, then tell me every other place that still holds the old value.
+- For keys a provider issues (Stripe, OpenAI, Resend...), ask me to run `pass-env set <entry>`. Never ask me to paste a key into chat.
+- If you see LOCKED, ask me to run `pass-env unlock`; you cannot unlock it.
 ```
 
 For Claude Code, also block reads of secret files in `~/.claude/settings.json`:
 
 ```json
-{
-  "permissions": {
-    "deny": ["Read(**/.env)", "Read(**/.env.*)", "Read(**/.dev.vars)", "Read(~/.password-store/**)"]
-  }
-}
+{ "permissions": { "deny": ["Read(**/.env)", "Read(**/.env.*)", "Read(**/.dev.vars)", "Read(~/.password-store/**)"] } }
 ```
 
-Keep GPG's cache short so an unlocked session does not stay open all day.
-In `~/.gnupg/gpg-agent.conf`:
+Keep GPG's unlock short. In `~/.gnupg/gpg-agent.conf`:
 
 ```
 default-cache-ttl 3600
@@ -203,30 +205,45 @@ max-cache-ttl 28800
 
 Install and use everything inside WSL.
 Keep the store and `~/.gnupg` on the Linux side; under `/mnt/c` file permissions do not apply.
-For the passphrase prompt, use the terminal one (`pinentry-program /usr/bin/pinentry-curses` in `gpg-agent.conf`) and add `export GPG_TTY=$(tty)` to your shell profile.
-If you want a GUI to browse entries, QtPass runs inside WSL (`sudo apt install qtpass`) and shows up as a normal window; it uses the same store, and pass-env reads its entries correctly because it only takes the first line.
+Use the terminal passphrase prompt (`pinentry-program /usr/bin/pinentry-curses` in `gpg-agent.conf`) and add `export GPG_TTY=$(tty)` to your shell profile.
+`--copy` and `copy` use the Windows clipboard (`clip.exe`), so you can paste straight into a browser.
+For a GUI to browse entries, QtPass runs inside WSL (`sudo apt install qtpass`) and uses the same store.
 
 ## Migrating from .env files
 
-For each secret in an existing `.env.local`:
+For each secret in an old `.env.local`:
 
 ```sh
-pass-env set myapp/STRIPE_SECRET_KEY      # paste the value from the old file
+pass-env set myapp/STRIPE_SECRET_KEY                       # paste the value from the old file
 echo 'STRIPE_SECRET_KEY=myapp/STRIPE_SECRET_KEY' >> .env.pass
 ```
 
 Then `pass-env check`, run the app once, and delete the old file.
-Keep public, non-secret settings in a committed `.env`.
+Keep public settings in a committed `.env`.
+
+## Errors
+
+Errors are one line, start with a code, and never include secret values or GPG output.
+
+| Code | Meaning |
+| --- | --- |
+| `LOCKED` | GPG needs your passphrase: run `pass-env unlock` |
+| `ENTRY` | The entry does not exist: `pass-env check` shows which |
+| `EXISTS` | Already stored: add `--force` to replace it |
+| `DECRYPT` | This machine's GPG key cannot open the entry |
+| `CLIPBOARD` | No clipboard tool found (`clip.exe`, `pbcopy`, `wl-copy` or `xclip`) |
+| `TTY` | `unlock` was run without a terminal (for example by an agent) |
+| `USAGE`, `STORE`, `PASS_MISSING` | Wrong arguments, no store yet (`pass init`), or `pass` not installed |
 
 ## Tests
 
 ```sh
-bun test           # 22 tests with a fake pass, including a real-terminal Ctrl-C test
-./demo/e2e.sh      # full walk-through against real pass and GPG in a temp dir
+bun test           # 27 tests with a fake pass and clipboard, including a real-terminal Ctrl-C test
+./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder
 ```
 
 ## Credits
 
 pass-env was written by Phaedrus Raznikov at [Misty Step](https://github.com/misty-step) as part of [mistystack](https://github.com/misty-step/mistystack) (MIT).
-This fork adds `set`, `generate`, `unlock` and `check`, first-line values with `multiline:` opt-in, a default `.env.pass`, clearer errors, and a fix for Ctrl-C reaching the child twice.
+This fork fixes three bugs and adds `set`, `generate`, `pipe`, `copy`, `unlock` and `check`.
 See [CHANGES.md](CHANGES.md).

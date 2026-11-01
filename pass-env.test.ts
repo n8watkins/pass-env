@@ -50,9 +50,15 @@ if (args[2] in failures) {
 }
 process.stdout.write(readFileSync(file(args[2])));
 `, { mode: 0o700 });
+	// A fake clipboard backed by a file.
+	writeFileSync(join(bin, "fakeclip"), `#!/bin/sh\ncat > "$CLIP_FILE"\n`, { mode: 0o700 });
+	writeFileSync(join(bin, "fakepaste"), `#!/bin/sh\ncat "$CLIP_FILE"\n`, { mode: 0o700 });
 	return {
 		root, store, calls,
-		env: { ...process.env, HOME: root, PASSWORD_STORE_DIR: store, PATH: `${bin}:${process.env.PATH}`, TEST_PASS_CALLS: calls },
+		env: {
+			...process.env, HOME: root, PASSWORD_STORE_DIR: store, PATH: `${bin}:${process.env.PATH}`, TEST_PASS_CALLS: calls,
+			PASS_ENV_CLIPBOARD: "fakeclip", PASS_ENV_CLIPBOARD_READ: "fakepaste", CLIP_FILE: join(root, "clipboard"), PASSWORD_STORE_CLIP_TIME: "1",
+		},
 	};
 }
 
@@ -286,7 +292,7 @@ describe("generate", () => {
 		expect(stored(files, "a/HEX")).toMatch(/^[0-9a-f]{64}\n$/);
 		expect(invoke(files, ["generate", "a/B64", "--charset", "base64url", "20"]).status).toBe(0);
 		expect(stored(files, "a/B64")).toMatch(/^[A-Za-z0-9_-]{20}\n$/);
-		for (const bad of [["generate", "a/X", "8"], ["generate", "a/X", "--charset", "emoji"], ["generate", "../x"], ["generate"]]) {
+		for (const bad of [["generate", "a/X", "8"], ["generate", "a/X", "--charset", "emoji"], ["generate", "a/X", "--charset", "toString"], ["generate", "../x"], ["generate"]]) {
 			expect(invoke(files, bad).status).toBe(2);
 		}
 	});
@@ -296,6 +302,63 @@ describe("generate", () => {
 		invoke(files, ["generate", "app/S"]);
 		const result = invoke(files, ["run", "-e", "S=app/S", "--", "sh", "-c", 'printf %s "$S"']);
 		expect(result.stdout).toBe(stored(files, "app/S").trimEnd());
+	});
+});
+
+describe("clipboard", () => {
+	const clip = (files: Fixture) => existsSync(files.env.CLIP_FILE!) ? readFileSync(files.env.CLIP_FILE!, "utf8") : "";
+
+	test("generate --copy stores the secret, copies exactly it, never prints it, and clears it later", async () => {
+		const files = fixture({});
+		const result = invoke(files, ["generate", "app/WEBHOOK_SECRET", "--copy"]);
+		expect(result.status).toBe(0);
+		const value = stored(files, "app/WEBHOOK_SECRET").trimEnd();
+		expect(clip(files)).toBe(value);
+		expect(result.stdout).not.toContain(value);
+		expect(result.stdout).toContain("clears in 1s");
+		await Bun.sleep(1800);
+		expect(clip(files)).toBe("");
+	});
+
+	test("copy puts the first line on the clipboard and does not clear something copied since", async () => {
+		const files = fixture({ "app/KEY": "sk-synthetic\nuser: me\n" });
+		const result = invoke(files, ["copy", "app/KEY"]);
+		expect(result.status).toBe(0);
+		expect(result.stdout).not.toContain("sk-synthetic");
+		expect(clip(files)).toBe("sk-synthetic");
+		writeFileSync(files.env.CLIP_FILE!, "something else");
+		await Bun.sleep(1800);
+		expect(clip(files)).toBe("something else");
+	});
+
+	test("copy fails clearly with no clipboard tool and for missing entries", () => {
+		const files = fixture({ "app/KEY": "x" });
+		expect(invoke(files, ["copy", "app/NOPE"]).stderr).toStartWith("ENTRY:");
+		files.env.PASS_ENV_CLIPBOARD = "";
+		files.env.PATH = join(files.root, "bin");
+		files.env.DISPLAY = "";
+		files.env.WAYLAND_DISPLAY = "";
+		const result = invoke(files, ["generate", "app/NEW", "--copy"]);
+		expect(result.stderr).toStartWith("CLIPBOARD:");
+		expect(existsSync(join(files.store, "app/NEW.gpg"))).toBe(false);
+	});
+});
+
+describe("pipe", () => {
+	test("sends one secret to a command's stdin with no trailing newline and keeps its exit status", () => {
+		const files = fixture({ "app/KEY": "sk-synthetic\n" });
+		const result = invoke(files, ["pipe", "app/KEY", "--", process.execPath, "-e",
+			'const v = await Bun.stdin.text(); console.log(JSON.stringify(v)); process.exitCode = 3']);
+		expect(result.stdout).toBe('"sk-synthetic"\n');
+		expect(result.status).toBe(3);
+	});
+
+	test("multiline sends the whole entry; missing entries and commands are rejected", () => {
+		const files = fixture({ "app/PEM": "-----BEGIN-----\nabc\n-----END-----\n" });
+		expect(invoke(files, ["pipe", "app/PEM", "--multiline", "--", "cat"]).stdout).toBe("-----BEGIN-----\nabc\n-----END-----\n");
+		expect(invoke(files, ["pipe", "app/NOPE", "--", "cat"]).status).toBe(1);
+		expect(invoke(files, ["pipe", "app/PEM"]).status).toBe(2);
+		expect(invoke(files, ["pipe", "app/PEM", "--"]).status).toBe(2);
 	});
 });
 
@@ -348,6 +411,6 @@ describe("unlock and list", () => {
 	test("help lists every command", () => {
 		const files = fixture();
 		const out = invoke(files, ["help"]).stdout;
-		for (const command of ["run", "check", "set", "generate", "unlock", "list"]) expect(out).toContain(`pass-env ${command}`);
+		for (const command of ["run", "pipe", "copy", "check", "set", "generate", "unlock", "list"]) expect(out).toContain(`pass-env ${command}`);
 	});
 });

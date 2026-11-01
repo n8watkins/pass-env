@@ -2,6 +2,7 @@
 // pass-env: give programs and coding agents secrets from `pass` without
 // showing them. Fork of misty-step/mistystack's bin/pass-env.ts (MIT).
 
+import { spawn } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
@@ -20,7 +21,9 @@ type Options =
 	| ({ command: "run"; argv: string[] } & Sources)
 	| ({ command: "check" } & Sources)
 	| { command: "set"; entry: string; force: boolean }
-	| { command: "generate"; entry: string; length: number; charset: Charset; force: boolean }
+	| { command: "generate"; entry: string; length: number; charset: Charset; force: boolean; copy: boolean }
+	| { command: "copy"; entry: string; multiline: boolean }
+	| { command: "pipe"; entry: string; multiline: boolean; argv: string[] }
 	| { command: "unlock"; entry?: string };
 
 const DEFAULT_FILE = ".env.pass";
@@ -32,48 +35,60 @@ const CHARSETS: Record<Charset, string> = {
 };
 
 function usage(): string {
-	return `pass-env: run programs with secrets from pass, without printing them.
+	return `pass-env: use secrets from pass without printing them.
 
-Commands
-  pass-env run [-f file]... [-e NAME=entry]... -- command args...
-      Start a command with the mapped secrets in its environment.
-      With no -f or -e, uses ./.env.pass.
-  pass-env check [-f file]... [-e NAME=entry]...
-      Confirm every mapped entry exists. Decrypts nothing.
+Store a secret
   pass-env set <entry> [--force]
-      Store a value you paste (hidden prompt) or pipe in.
-  pass-env generate <entry> [length] [--charset alnum|hex|base64url] [--force]
-      Store a new random secret (default 48 alnum characters). Prints nothing secret.
-  pass-env unlock [entry]
-      Type your GPG passphrase once so later runs can decrypt. Terminal only.
+      Paste a key you were given (hidden prompt), or pipe it in.
+  pass-env generate <entry> [length] [--charset alnum|hex|base64url] [--copy] [--force]
+      Make a random secret (default 48 alnum). Never printed.
+      --copy also puts it on your clipboard to paste somewhere, cleared after 45s.
+      --force replaces an existing one (rotation).
+
+Use a secret
+  pass-env run [-f file]... [-e NAME=entry]... -- command args...
+      Start a command with secrets as environment variables.
+      With no -f or -e, uses ./.env.pass.
+  pass-env pipe <entry> [--multiline] -- command args...
+      Send one secret to a command's input, e.g. gh secret set NAME.
+  pass-env copy <entry> [--multiline]
+      Put one secret on your clipboard, cleared after 45s.
+
+Check and set up
+  pass-env check [-f file]... [-e NAME=entry]...
+      Show each mapping as ok or MISSING. Decrypts nothing.
   pass-env list [prefix] [--json]
       Show entry names. Decrypts nothing.
+  pass-env unlock [entry]
+      Type your GPG passphrase once per session. Terminal only.
+  pass-env help
 
 Reference files (.env.pass)
-  One NAME=entry per line; blank lines and full-line # comments allowed.
-  The variable gets the entry's first line, the same convention pass,
-  QtPass and browser extensions use. For keys that span lines (PEM, JSON),
-  write NAME=multiline:entry to get the whole entry exactly.
-  Files are data: no quotes, interpolation, export or inline comments.
-  Later files override earlier ones; -e overrides all files.
+  One NAME=entry per line, full-line # comments allowed. Names only, safe
+  to commit. A variable gets the entry's first line (pass's convention);
+  write NAME=multiline:entry for PEM keys or JSON. No quotes, interpolation
+  or inline comments. Later files override earlier ones; -e wins.
 
 Examples
-  pass-env set myapp/STRIPE_SECRET_KEY            # paste the key when asked
-  pass-env generate myapp/AUTH_SECRET             # make one up, never shown
-  pass-env generate myapp/AUTH_SECRET --force     # rotate it
+  pass-env set myapp/STRIPE_SECRET_KEY              # paste the key when asked
+  pass-env generate myapp/AUTH_SECRET               # agent-safe, never shown
+  pass-env generate myapp/WEBHOOK_SECRET --copy     # then paste it in a dashboard
+  pass-env generate myapp/AUTH_SECRET --force       # rotate
   echo 'STRIPE_SECRET_KEY=myapp/STRIPE_SECRET_KEY' >> .env.pass
   pass-env check
   pass-env run -- pnpm dev
-  pass-env run -e T=myapp/STRIPE_SECRET_KEY -- \\
-    sh -c 'printf %s "$T" | gh secret set STRIPE_SECRET_KEY'
+  pass-env pipe myapp/STRIPE_SECRET_KEY -- gh secret set STRIPE_SECRET_KEY
+  pass-env pipe myapp/STRIPE_SECRET_KEY -- vercel env add STRIPE_SECRET_KEY production
+  pass-env pipe myapp/STRIPE_SECRET_KEY -- npx wrangler secret put STRIPE_SECRET_KEY
 
 Notes
   The store is PASSWORD_STORE_DIR or ~/.password-store. Entry names are
-  visible file names, so never put a secret in a name.
-  run and check never prompt: if GPG is locked they fail fast and say so.
-  Storing (set, generate) only encrypts, so it works while locked.
-  pass-env never prints a secret, but the commands you run can.
-  Anything running as you can decrypt while GPG is unlocked.`;
+  visible file names: never put a secret in a name.
+  set and generate only encrypt, so they work while GPG is locked.
+  run, pipe and copy never prompt: if GPG is locked they say so.
+  Clipboard clear time: PASSWORD_STORE_CLIP_TIME (default 45 seconds).
+  pass-env never prints a secret, but the commands you run can, and
+  anything running as you can decrypt while GPG is unlocked.`;
 }
 
 function validEntry(entry: string): boolean {
@@ -160,24 +175,41 @@ function parseArgs(args: string[]): Options {
 		}
 		case "generate": {
 			let force = false;
+			let copy = false;
 			let charset: Charset = "alnum";
 			const positional: string[] = [];
 			for (let index = 0; index < rest.length; index += 1) {
 				const arg = rest[index];
 				if (arg === "--force") force = true;
+				else if (arg === "--copy") copy = true;
 				else if (arg === "--charset") {
 					const value = rest[++index];
-					if (!value || !(value in CHARSETS)) throw new CliError("USAGE", "--charset must be alnum, hex or base64url", 2);
+					if (!value || !Object.hasOwn(CHARSETS, value)) throw new CliError("USAGE", "--charset must be alnum, hex or base64url", 2);
 					charset = value as Charset;
 				} else if (arg.startsWith("-")) throw new CliError("USAGE", `unexpected argument ${JSON.stringify(arg)}`, 2);
 				else positional.push(arg);
 			}
 			if (positional.length < 1 || positional.length > 2) {
-				throw new CliError("USAGE", "expected generate <entry> [length] [--charset alnum|hex|base64url] [--force]", 2);
+				throw new CliError("USAGE", "expected generate <entry> [length] [--charset alnum|hex|base64url] [--copy] [--force]", 2);
 			}
 			const length = positional[1] === undefined ? 48 : Number(positional[1]);
 			if (!Number.isInteger(length) || length < 16 || length > 512) throw new CliError("USAGE", "length must be a whole number from 16 to 512", 2);
-			return { command: "generate", entry: checkedEntry(positional[0]), length, charset, force };
+			return { command: "generate", entry: checkedEntry(positional[0]), length, charset, force, copy };
+		}
+		case "copy": {
+			const multiline = rest.includes("--multiline");
+			const positional = rest.filter((arg) => arg !== "--multiline");
+			if (positional.length !== 1) throw new CliError("USAGE", "expected copy <entry> [--multiline]", 2);
+			return { command: "copy", entry: checkedEntry(positional[0]), multiline };
+		}
+		case "pipe": {
+			const split = rest.indexOf("--");
+			const before = split === -1 ? rest : rest.slice(0, split);
+			const argv = split === -1 ? [] : rest.slice(split + 1);
+			const multiline = before.includes("--multiline");
+			const positional = before.filter((arg) => arg !== "--multiline");
+			if (positional.length !== 1 || !argv[0]) throw new CliError("USAGE", "expected pipe <entry> [--multiline] -- command args...", 2);
+			return { command: "pipe", entry: checkedEntry(positional[0]), multiline, argv };
 		}
 		case "unlock": {
 			if (rest.length > 1) throw new CliError("USAGE", "expected unlock [entry]", 2);
@@ -370,6 +402,55 @@ async function setEntry(root: string, entry: string, force: boolean): Promise<vo
 	if (await backend.exited !== 0) throw new CliError("STORE", `${entry} was not stored`);
 }
 
+type Clipboard = { write: string[]; read?: string[] };
+
+function clipboard(): Clipboard {
+	const words = (value: string | undefined) => value?.split(" ").filter(Boolean);
+	if (process.env.PASS_ENV_CLIPBOARD) {
+		return { write: words(process.env.PASS_ENV_CLIPBOARD)!, read: words(process.env.PASS_ENV_CLIPBOARD_READ) };
+	}
+	let wsl = false;
+	try { wsl = /microsoft/i.test(readFileSync("/proc/version", "utf8")); } catch { /* Not Linux. */ }
+	if (wsl && Bun.which("clip.exe")) {
+		return { write: ["clip.exe"], read: Bun.which("powershell.exe") ? ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"] : undefined };
+	}
+	if (Bun.which("pbcopy")) return { write: ["pbcopy"], read: ["pbpaste"] };
+	if (process.env.WAYLAND_DISPLAY && Bun.which("wl-copy")) return { write: ["wl-copy"], read: ["wl-paste", "--no-newline"] };
+	if (process.env.DISPLAY && Bun.which("xclip")) {
+		return { write: ["xclip", "-selection", "clipboard"], read: ["xclip", "-selection", "clipboard", "-o"] };
+	}
+	throw new CliError("CLIPBOARD", "no clipboard tool found (clip.exe, pbcopy, wl-copy or xclip)");
+}
+
+function clipSeconds(): number {
+	const seconds = Number(process.env.PASSWORD_STORE_CLIP_TIME ?? 45);
+	return Number.isInteger(seconds) && seconds > 0 ? seconds : 45;
+}
+
+async function copyToClipboard(board: Clipboard, value: string): Promise<number> {
+	let writer;
+	try {
+		writer = Bun.spawn({ cmd: board.write, stdin: "pipe", stdout: "ignore", stderr: "ignore" });
+	} catch {
+		throw new CliError("CLIPBOARD", "could not start the clipboard tool");
+	}
+	writer.stdin.write(value);
+	await writer.stdin.end();
+	if (await writer.exited !== 0) throw new CliError("CLIPBOARD", "could not copy to the clipboard");
+	// A detached shell clears the clipboard later, but only if it still holds
+	// our value. The value travels over stdin, never argv.
+	const seconds = clipSeconds();
+	const quote = (parts: string[]) => parts.map((part) => `'${part.replace(/'/g, "'\\''")}'`).join(" ");
+	const clear = `printf '' | ${quote(board.write)}`;
+	const script = board.read
+		? `expected=$(cat); sleep ${seconds}; current=$(${quote(board.read)} 2>/dev/null | tr -d '\\r'); [ "$current" = "$expected" ] && ${clear}`
+		: `cat >/dev/null; sleep ${seconds}; ${clear}`;
+	const clearer = spawn("sh", ["-c", script], { detached: true, stdio: ["pipe", "ignore", "ignore"] });
+	await new Promise<void>((done) => clearer.stdin!.end(value, done));
+	clearer.unref();
+	return seconds;
+}
+
 function terminalTty(): string | undefined {
 	if (process.env.GPG_TTY) return process.env.GPG_TTY;
 	const result = Bun.spawnSync({ cmd: ["tty"], stdin: "inherit", stdout: "pipe", stderr: "ignore" });
@@ -406,12 +487,17 @@ function terminalSignalsReachChild(): boolean {
 	}
 }
 
-async function runChild(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
-	let child: Bun.Subprocess<"inherit", "inherit", "inherit">;
+async function runChild(argv: string[], env: NodeJS.ProcessEnv, input?: string): Promise<number> {
+	let child: Bun.Subprocess<"inherit" | "pipe", "inherit", "inherit">;
 	try {
-		child = Bun.spawn({ cmd: argv, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+		child = Bun.spawn({ cmd: argv, env, stdin: input === undefined ? "inherit" : "pipe", stdout: "inherit", stderr: "inherit" });
 	} catch {
 		throw new CliError("COMMAND", "could not start command");
+	}
+	if (input !== undefined) {
+		const sink = child.stdin as import("bun").FileSink;
+		sink.write(input);
+		await sink.end();
 	}
 	const signals = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as const;
 	const handlers = signals.map((signal) => {
@@ -462,10 +548,29 @@ async function main(args: string[]): Promise<number> {
 			await setEntry(root, options.entry, options.force);
 			console.log(`Stored ${options.entry}.`);
 			return 0;
-		case "generate":
-			await store(root, options.entry, randomSecret(options.length, options.charset), options.force);
-			console.log(`${options.force ? "Replaced" : "Generated"} ${options.entry}: ${options.length} random ${options.charset} characters. The value was not shown.`);
+		case "generate": {
+			const board = options.copy ? clipboard() : undefined;
+			const secret = randomSecret(options.length, options.charset);
+			await store(root, options.entry, secret, options.force);
+			const verb = options.force ? "Replaced" : "Generated";
+			if (!board) {
+				console.log(`${verb} ${options.entry}: ${options.length} random ${options.charset} characters. The value was not shown.`);
+				return 0;
+			}
+			const seconds = await copyToClipboard(board, secret);
+			console.log(`${verb} ${options.entry} and copied it to the clipboard; it clears in ${seconds}s.`);
 			return 0;
+		}
+		case "copy":
+		case "pipe": {
+			if (!entryExists(root, options.entry)) throw new CliError("ENTRY", `${options.entry}: entry does not exist or is a symlink`);
+			const board = options.command === "copy" ? clipboard() : undefined;
+			const value = await decrypt(root, { name: options.entry, entry: options.entry, multiline: options.multiline });
+			if (options.command === "pipe") return runChild(options.argv, process.env, value);
+			const seconds = await copyToClipboard(board!, value);
+			console.log(`Copied ${options.entry} to the clipboard; it clears in ${seconds}s.`);
+			return 0;
+		}
 		case "unlock": {
 			const entry = await unlock(root, options.entry);
 			console.log(`Unlocked (checked with ${entry}). Runs can decrypt until GPG's cache expires.`);

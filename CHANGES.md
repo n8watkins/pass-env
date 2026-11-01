@@ -20,7 +20,9 @@ The first commit in this repository is that file unchanged.
 ## Added
 
 - `set <entry>`: store a pasted (hidden, confirmed prompt) or piped value.
-- `generate <entry> [length] [--charset]`: store a random secret without printing it, unlike `pass generate`, which prints the new password.
+- `generate <entry> [length] [--charset] [--copy]`: store a random secret without printing it, unlike `pass generate`, which prints the new password. `--copy` also puts it on the clipboard for a human to paste.
+- `pipe <entry> -- command`: send one secret to a command's stdin, replacing `sh -c 'printf %s "$V" | ...'`.
+- `copy <entry>`: put one secret on the clipboard. Like `pass -c`, it is cleared after `PASSWORD_STORE_CLIP_TIME` seconds (default 45), but only if the clipboard still holds it. Uses `clip.exe` on WSL, then `pbcopy`, `wl-copy` or `xclip`.
 - `unlock [entry]`: one place to type the GPG passphrase; refuses without a terminal so an agent cannot trigger a prompt.
 - `check`: report each mapping as ok or missing without decrypting.
 - `run` and `check` default to `./.env.pass`.
