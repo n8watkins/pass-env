@@ -81,7 +81,8 @@ Move an existing .env file into pass
 
 Check and set up
   pass-env doctor
-      Check pass, GPG, the store and this folder. Decrypts nothing.
+      Check pass, GPG, the store and this folder, including env variables
+      the code reads but nothing declares. Decrypts nothing.
   pass-env check [-f file]... [-e NAME=entry]...
       Show each mapping as ok or MISSING. Decrypts nothing.
   pass-env list [prefix] [--json]
@@ -1025,8 +1026,164 @@ function claudeCheck(): Check[] {
 		`add to "permissions": { "deny": [...] } in ~/.claude/settings.json: "Read(**/.env)", "Read(**/.env.*)", "Read(**/.dev.vars)"`)];
 }
 
+// Env drift: variable names the code reads versus names the project declares.
+const DRIFT_SKIP_DIRS = new Set([
+	"node_modules", ".next", "dist", "build", ".git", ".worktrees", "out", "coverage",
+	".venv", "venv", "__pycache__", ".wrangler", ".vercel", ".turbo", ".svelte-kit", ".output",
+]);
+const CODE_FILE = /\.(?:[cm]?[jt]sx?|py)$/;
+const ENV_READS = [
+	/\bprocess\.env\.([A-Za-z_]\w*)/g,
+	/\bprocess\.env\[\s*["'`]([A-Za-z_]\w*)["'`]\s*\]/g,
+	/\bimport\.meta\.env\.([A-Za-z_]\w*)/g,
+	/\bBun\.env\.([A-Za-z_]\w*)/g,
+	/\bDeno\.env\.get\(\s*["'`]([A-Za-z_]\w*)["'`]/g,
+	/\bos\.environ\[\s*["']([A-Za-z_]\w*)["']\s*\]/g,
+	/\bos\.(?:getenv|environ\.get)\(\s*["']([A-Za-z_]\w*)["']/g,
+];
+// const { A, B: b, C = "x" } = process.env
+const ENV_DESTRUCTURE = /\{([^{}]*)\}\s*=\s*process\.env\b/g;
+// Set by the runtime, the platform or the framework, so nobody declares them.
+const RUNTIME_VARS = new Set([
+	"NODE_ENV", "PORT", "HOST", "HOSTNAME", "CI", "HOME", "PATH", "PWD", "USER", "SHELL", "TERM", "TMPDIR", "TZ", "LANG", "DEBUG",
+	"NEXT_RUNTIME", "NEXT_PHASE", "MODE", "DEV", "PROD", "SSR", "BASE_URL",
+]);
+const RUNTIME_PREFIXES = ["VERCEL", "GITHUB_", "CF_PAGES", "npm_"];
+const DOTENV_NAME = /^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=/;
+const DRIFT_MAX_FILES = 20_000;
+const DRIFT_MAX_BYTES = 1_000_000;
+
+type ProjectEnv = { used: Set<string>; declared: Set<string>; mapped: Set<string>; sources: number };
+
+function readSmall(path: string): string | undefined {
+	try {
+		return statSync(path).size <= DRIFT_MAX_BYTES ? readFileSync(path, "utf8") : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+// JSON with comments and trailing commas, as wrangler.jsonc allows.
+function parseJsonc(text: string): unknown {
+	let out = "";
+	for (let index = 0; index < text.length; index += 1) {
+		const char = text[index];
+		if (char === '"') {
+			const start = index;
+			for (index += 1; index < text.length && text[index] !== '"'; index += 1) if (text[index] === "\\") index += 1;
+			out += text.slice(start, index + 1);
+		} else if (char === "/" && text[index + 1] === "/") {
+			while (index < text.length && text[index] !== "\n") index += 1;
+			out += "\n";
+		} else if (char === "/" && text[index + 1] === "*") {
+			const end = text.indexOf("*/", index + 2);
+			index = end === -1 ? text.length : end + 1;
+		} else out += char;
+	}
+	return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+}
+
+function wranglerVars(name: string, text: string): string[] {
+	if (name.endsWith(".toml")) {
+		const names: string[] = [];
+		let inVars = false;
+		for (const raw of text.split("\n")) {
+			const line = raw.trim();
+			if (line.startsWith("[")) {
+				inVars = /^\[\s*(?:env\.[^.\]]+\.)?vars\s*\]$/.test(line);
+				continue;
+			}
+			const inline = /^vars\s*=\s*\{(.*)\}/.exec(line);
+			if (inline) for (const match of inline[1].matchAll(/([A-Za-z_]\w*)\s*=/g)) names.push(match[1]);
+			const key = inVars && /^["']?([A-Za-z_]\w*)["']?\s*=/.exec(line);
+			if (key) names.push(key[1]);
+		}
+		return names;
+	}
+	try {
+		const config = parseJsonc(text) as { vars?: object; env?: Record<string, { vars?: object }> };
+		const objects = [config.vars, ...Object.values(config.env ?? {}).map((env) => env?.vars)];
+		return objects.flatMap((vars) => vars && typeof vars === "object" ? Object.keys(vars) : []);
+	} catch {
+		return [];
+	}
+}
+
+function codeReads(text: string, used: Set<string>): void {
+	for (const pattern of ENV_READS) for (const match of text.matchAll(pattern)) used.add(match[1]);
+	for (const match of text.matchAll(ENV_DESTRUCTURE)) {
+		for (const part of match[1].split(",")) {
+			const name = /^\s*([A-Za-z_]\w*)/.exec(part.trim().startsWith("...") ? "" : part);
+			if (name) used.add(name[1]);
+		}
+	}
+}
+
+// One walk of the current folder: names read by code, and names declared in
+// dotenv files, .env.pass, .dev.vars and Wrangler config.
+function projectEnv(): ProjectEnv {
+	const env: ProjectEnv = { used: new Set(), declared: new Set(), mapped: new Set(), sources: 0 };
+	let budget = DRIFT_MAX_FILES;
+	const visit = (directory: string): void => {
+		let items;
+		try { items = readdirSync(directory, { withFileTypes: true }); } catch { return; }
+		for (const item of items) {
+			if (budget <= 0) return;
+			const path = directory === "." ? item.name : join(directory, item.name);
+			if (item.isDirectory()) {
+				if (!DRIFT_SKIP_DIRS.has(item.name)) visit(path);
+				continue;
+			}
+			if (!item.isFile()) continue;
+			budget -= 1;
+			const dotenv = /^(\.env(\..+)?|\.dev\.vars(\..+)?)$/.test(item.name);
+			const wrangler = /^wrangler\.(jsonc?|toml)$/.test(item.name);
+			const code = CODE_FILE.test(item.name);
+			if (!dotenv && !wrangler && !code && !item.name.endsWith(".prisma")) continue;
+			const text = readSmall(path);
+			if (text === undefined) continue;
+			if (code) codeReads(text, env.used);
+			else if (item.name.endsWith(".prisma")) for (const match of text.matchAll(/\benv\(\s*"([A-Za-z_]\w*)"\s*\)/g)) env.used.add(match[1]);
+			else {
+				env.sources += 1;
+				const names = wrangler ? wranglerVars(item.name, text) : text.split("\n").map((line) => DOTENV_NAME.exec(line)?.[1]).filter((name) => name !== undefined);
+				for (const name of names) {
+					env.declared.add(name);
+					if (item.name === DEFAULT_FILE) env.mapped.add(name);
+				}
+			}
+		}
+	};
+	visit(".");
+	return env;
+}
+
+function capped(names: string[], limit = 10): string {
+	return names.length > limit ? `${names.slice(0, limit).join(", ")} and ${names.length - limit} more` : names.join(", ");
+}
+
+function driftChecks(): Check[] {
+	const { used, declared, mapped, sources } = projectEnv();
+	// Nothing to compare: no code reading the environment, or no declarations.
+	if (!used.size || !sources) return [];
+	const runtime = (name: string) => RUNTIME_VARS.has(name) || RUNTIME_PREFIXES.some((prefix) => name.startsWith(prefix));
+	const undeclared = [...used].filter((name) => !declared.has(name) && !runtime(name)).sort();
+	const unread = [...mapped].filter((name) => !used.has(name)).sort();
+	const checks: Check[] = [];
+	if (undeclared.length) {
+		checks.push(warn(`env vars used in code but declared nowhere: ${capped(undeclared)}`,
+			"add secrets to .env.pass and other values to .env.example, unless your platform sets them"));
+	}
+	if (unread.length) {
+		checks.push(warn(`env vars in ${DEFAULT_FILE} but never read by the code: ${capped(unread)}`,
+			"delete those lines if nothing uses them (tools such as Prisma or Auth.js can read variables your code does not)"));
+	}
+	if (!checks.length) checks.push(ok(`env vars: the code reads ${used.size}, all declared or set by the runtime`));
+	return checks;
+}
+
 function doctor(): number {
-	const checks = [...toolChecks(), ...storeChecks(), ...gpgChecks(), clipboardCheck(), ...folderChecks(), ...claudeCheck()];
+	const checks = [...toolChecks(), ...storeChecks(), ...gpgChecks(), clipboardCheck(), ...folderChecks(), ...driftChecks(), ...claudeCheck()];
 	for (const check of checks) {
 		console.log(`${check.status.padEnd(4)}  ${check.text}`);
 		if (check.fix) console.log(`      fix: ${check.fix}`);

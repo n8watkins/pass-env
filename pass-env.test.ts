@@ -802,3 +802,50 @@ describe("doctor", () => {
 		line(result.stdout, "warn", "\\.env\\.production: NEXT_PUBLIC_GEMINI_API_KEY looks like a secret under a public name");
 	});
 });
+
+describe("doctor env drift", () => {
+	const project = (files: Record<string, string>) => {
+		const fx = fixture();
+		for (const [name, text] of Object.entries(files)) {
+			mkdirSync(dirname(join(fx.root, name)), { recursive: true });
+			writeFileSync(join(fx.root, name), text);
+		}
+		return fx;
+	};
+	const doctorOut = (fx: Fixture) => invoke(fx, ["doctor"]).stdout;
+
+	test("names read by code but declared nowhere, and .env.pass names the code never reads", () => {
+		const fx = project({
+			"src/app.ts": 'const a = process.env.APP_A; const b = process.env["APP_B"]; const n = process.env.NODE_ENV + process.env.VERCEL_URL;\nconst { APP_H, APP_I: renamed, APP_J = "x", ...rest } = process.env;',
+			"src/client.tsx": "export const c = import.meta.env.VITE_C + import.meta.env.MODE;",
+			"worker/edge.mjs": 'Deno.env.get("APP_D"); Bun.env.APP_K;',
+			"tools/job.py": 'import os\nos.environ["APP_E"]\nos.getenv("APP_F")\nos.environ.get(\'APP_G\', "x")\n',
+			"prisma/schema.prisma": 'datasource db {\n  url = env("DATABASE_URL")\n}\n',
+			"node_modules/dep/index.js": "process.env.FROM_DEPENDENCY",
+			".next/server.js": "process.env.FROM_BUILD",
+			".env.pass": "APP_A=app/A\nUNUSED_KEY=app/UNUSED_KEY\nDATABASE_URL=app/DATABASE_URL\n",
+			".env.example": "APP_B=\n",
+			"wrangler.jsonc": '{\n  // comment\n  "vars": { "VITE_C": "x", }, /* block */\n  "env": { "staging": { "vars": { "APP_D": "y" } } },\n}\n',
+			"worker/wrangler.toml": 'name = "w"\n[vars]\nAPP_E = "1"\n[env.prod.vars]\nAPP_F = "2"\n[build]\nAPP_K = "not vars"\n',
+			"tools/.env.local": "export APP_G=\n",
+		});
+		const out = doctorOut(fx);
+		expect(out).toMatch(/^warn\s+env vars used in code but declared nowhere: APP_H, APP_I, APP_J, APP_K$/m);
+		expect(out).toMatch(/^warn\s+env vars in \.env\.pass but never read by the code: UNUSED_KEY$/m);
+		for (const name of ["FROM_DEPENDENCY", "FROM_BUILD", "NODE_ENV", "VERCEL_URL", "MODE", "rest", "renamed"]) expect(out).not.toContain(name);
+	});
+
+	test("long lists are capped, a fully declared project is ok, and no declarations means no check", () => {
+		const names = Array.from({ length: 13 }, (_, index) => `NAME_${String(index).padStart(2, "0")}`);
+		const fx = project({ "index.js": names.map((name) => `process.env.${name};`).join("\n"), ".env.pass": "NAME_00=app/NAME_00\n" });
+		expect(doctorOut(fx)).toMatch(/declared nowhere: NAME_01, .*, NAME_10 and 2 more$/m);
+
+		const clean = project({ "index.js": "process.env.ONLY; process.env.PORT;", ".env.pass": "ONLY=app/ONLY\n" });
+		const out = doctorOut(clean);
+		expect(out).toMatch(/^ok\s+env vars: the code reads 2, all declared or set by the runtime$/m);
+		expect(out).not.toMatch(/^warn\s+env/m);
+
+		const bare = project({ "index.js": "process.env.ANYTHING;" });
+		expect(doctorOut(bare)).not.toContain("env vars");
+	});
+});
