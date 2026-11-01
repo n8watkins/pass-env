@@ -810,9 +810,10 @@ async function sameValues(root: string, taken: Planned[]): Promise<Set<string>> 
 const isDevVars = (file: string) => basename(file) === ".dev.vars" || basename(file).startsWith(".dev.vars.");
 const DEV_VARS_READERS = "wrangler dev, the Cloudflare Vite plugin and OpenNext's next dev";
 
-// Rewrites via a temporary file and rename, keeping the mode.
-function replaceFile(path: string, text: string): void {
-	const mode = statSync(path).mode & 0o7777;
+// Rewrites via a temporary file and rename, keeping the mode unless asked
+// to drop group and other access.
+function replaceFile(path: string, text: string, privateMode = false): void {
+	const mode = (statSync(path).mode & 0o7777) & (privateMode ? ~0o077 : 0o7777);
 	const temp = join(dirname(path), `.${basename(path)}.pass-env-${process.pid}.tmp`);
 	try {
 		writeFileSync(temp, text, { mode, flag: "wx" });
@@ -859,8 +860,10 @@ async function removeImported(root: string, options: ImportOptions): Promise<num
 		unlinkSync(options.file);
 		console.log(`Deleted ${options.file}: only comments and blank lines were left.`);
 	} else {
-		replaceFile(options.file, `${dotenv.bom ? "\uFEFF" : ""}${kept.join("\n")}`);
+		const shared = (statSync(options.file).mode & 0o077) !== 0;
+		replaceFile(options.file, `${dotenv.bom ? "\uFEFF" : ""}${kept.join("\n")}`, true);
 		console.log(`Removed ${secrets.map((item) => item.name).join(", ")} from ${options.file}.`);
+		if (shared) console.log(`Made ${options.file} readable only by you (it was readable by other users).`);
 		const left = items.filter((item) => item.action !== "store");
 		if (left.length) console.log(`Still in ${options.file}:\n${describePlan(left)}`);
 	}

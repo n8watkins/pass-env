@@ -306,6 +306,8 @@ pass-env import .env.local --prefix myapp --remove
 This decrypts each stored value and compares it with the file.
 Only if every value matches, it rewrites the file without those lines, keeping comments, public values and skipped lines.
 If nothing but comments is left, it deletes the file.
+If the file was readable by other users, it also makes it readable only by you.
+A value left in the file that refers to a removed one, like `DIRECT_URL=${DATABASE_URL}?pgbouncer=true`, keeps working when the app runs through `pass-env run`, because Next.js and other dotenv loaders fill `${DATABASE_URL}` in from the real environment.
 There is no backup copy on purpose: it would be one more plaintext copy of your secrets.
 
 For Cloudflare Workers, `wrangler dev`, the Cloudflare Vite plugin and OpenNext's `next dev` ignore environment variables while `.dev.vars` exists.

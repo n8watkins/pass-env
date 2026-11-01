@@ -555,7 +555,7 @@ describe("import", () => {
 		expect(invoke(files, ["import", ".env.local", "--prefix", "app", "--force"]).stderr).not.toContain("git ignores");
 	});
 
-	test("--remove checks every value, then rewrites the file keeping comments, public and skipped lines and its mode", () => {
+	test("--remove checks every value, then rewrites the file keeping comments, public and skipped lines, readable only by the owner", () => {
 		const files = setup();
 		invoke(files, ["import", ".env.local", "--prefix", "app"]);
 		chmodSync(join(files.root, ".env.local"), 0o640);
@@ -566,7 +566,8 @@ describe("import", () => {
 		expect(result.stdout).toContain("Checked 6 stored values against .env.local: all match.");
 		expect(result.stdout).toMatch(/Still in \.env\.local:\n\s+NEXT_PUBLIC_SITE_URL\s+kept public/);
 		expect(read(files, ".env.local")).toBe(kept);
-		expect(statSync(join(files.root, ".env.local")).mode & 0o777).toBe(0o640);
+		expect(statSync(join(files.root, ".env.local")).mode & 0o777).toBe(0o600);
+		expect(result.stdout).toContain("readable only by you");
 		expect(invoke(files, ["import", ".env.local", "--prefix", "app", "--remove"]).stdout).toContain("no secret lines left");
 	});
 
