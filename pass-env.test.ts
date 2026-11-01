@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
-const cli = join(import.meta.dir, "pass-env.ts");
+// PASS_ENV_BIN runs the whole suite against a compiled binary instead.
+const cli = process.env.PASS_ENV_BIN ? resolve(process.env.PASS_ENV_BIN) : join(import.meta.dir, "pass-env.ts");
+const launcher = process.env.PASS_ENV_BIN ? [cli] : [process.execPath, cli];
 const roots: string[] = [];
 type Fixture = { root: string; store: string; env: NodeJS.ProcessEnv; calls: string };
 
@@ -24,7 +26,7 @@ function fixture(entries: Record<string, string | Uint8Array> = { token: "synthe
 	}
 	writeFileSync(join(bin, "pass"), `#!${process.execPath}
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 const args = process.argv.slice(2);
 appendFileSync(process.env.TEST_PASS_CALLS, args.join(" ") + "\\n");
 const file = (entry) => join(process.env.PASSWORD_STORE_DIR, entry + ".gpg");
@@ -36,6 +38,10 @@ if (args[0] === "insert") {
 }
 if (args[0] !== "show" || args[1] !== "--" || args.length !== 3) process.exit(7);
 if (process.env.PASSWORD_STORE_GPG_OPTS !== "--batch --pinentry-mode error") process.exit(8);
+if (process.env.TEST_PASS_LOCKED) {
+  process.stderr.write("gpg: decryption failed: No pinentry synthetic-locked");
+  process.exit(2);
+}
 // Deliberately drain backend stdin: the launcher must leave child stdin alone.
 await Bun.stdin.text();
 const failures = {
@@ -53,6 +59,12 @@ process.stdout.write(readFileSync(file(args[2])));
 	// A fake clipboard backed by a file.
 	writeFileSync(join(bin, "fakeclip"), `#!/bin/sh\ncat > "$CLIP_FILE"\n`, { mode: 0o700 });
 	writeFileSync(join(bin, "fakepaste"), `#!/bin/sh\ncat "$CLIP_FILE"\n`, { mode: 0o700 });
+	// A fake gpg that only answers doctor's secret-key question.
+	writeFileSync(join(bin, "gpg"), `#!/bin/sh
+for id; do :; done
+case " $TEST_GPG_SECRET_KEYS " in *" $id "*) echo "sec:u:255:22:SYNTHETIC::::::::::"; exit 0;; esac
+exit 2
+`, { mode: 0o700 });
 	return {
 		root, store, calls,
 		env: {
@@ -63,7 +75,7 @@ process.stdout.write(readFileSync(file(args[2])));
 }
 
 function invoke(files: Fixture, args: string[], input = "") {
-	const result = spawnSync(process.execPath, [cli, ...args], {
+	const result = spawnSync(launcher[0], [...launcher.slice(1), ...args], {
 		cwd: files.root, env: files.env, input, encoding: "utf8", timeout: 10_000,
 	});
 	if (result.error) throw result.error;
@@ -211,7 +223,7 @@ describe("run", () => {
 
 	test("a signal sent to the launcher reaches its running child", async () => {
 		const files = fixture();
-		const child = spawn(process.execPath, [cli, "run", "-e", "TOKEN=token", "--", process.execPath, "-e",
+		const child = spawn(launcher[0], [...launcher.slice(1), "run", "-e", "TOKEN=token", "--", process.execPath, "-e",
 			'process.on("SIGTERM", () => process.exit(42)); process.stdin.resume(); console.log("ready");',
 		], { cwd: files.root, env: files.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
 		const { promise, resolve: accept, reject } = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
@@ -241,7 +253,7 @@ describe("run", () => {
 process.on("SIGINT", () => { n += 1; });
 fs.writeFileSync(${JSON.stringify(ready)}, "1");
 setTimeout(() => { fs.writeFileSync(${JSON.stringify(count)}, String(n)); process.exit(0); }, 1500);`);
-		const command = [process.execPath, cli, "run", "-e", "TOKEN=token", "--", process.execPath, childScript]
+		const command = [...launcher, "run", "-e", "TOKEN=token", "--", process.execPath, childScript]
 			.map((part) => `'${part}'`).join(" ");
 		const term = spawn("script", ["-qec", command, "/dev/null"], { cwd: files.root, env: files.env, stdio: ["pipe", "ignore", "ignore"] });
 		const deadline = Date.now() + 5000;
@@ -378,6 +390,19 @@ describe("set", () => {
 		expect(stored(files, "app/KEY")).toBe("other\n");
 	});
 
+	test("piped input with several lines is stored exactly and round-trips through multiline:", () => {
+		const files = fixture({});
+		const pem = "-----BEGIN SYNTHETIC-----\r\nabc\n-----END SYNTHETIC-----";
+		const result = invoke(files, ["set", "app/PEM"], pem);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toBe("Stored app/PEM exactly as piped (3 lines); map it with multiline:app/PEM.\n");
+		expect(stored(files, "app/PEM")).toBe(pem);
+		expect(invoke(files, ["set", "app/FILE"], `${pem}\n`).status).toBe(0);
+		expect(stored(files, "app/FILE")).toBe(`${pem}\n`);
+		const run = invoke(files, ["run", "-e", "PEM=multiline:app/PEM", "--", process.execPath, "-e", "process.stdout.write(JSON.stringify(process.env.PEM))"]);
+		expect(JSON.parse(run.stdout)).toBe(pem);
+	});
+
 	test("empty input and bad names are rejected", () => {
 		const files = fixture({});
 		expect(invoke(files, ["set", "app/KEY"], "").status).toBe(1);
@@ -411,6 +436,283 @@ describe("unlock and list", () => {
 	test("help lists every command", () => {
 		const files = fixture();
 		const out = invoke(files, ["help"]).stdout;
-		for (const command of ["run", "pipe", "copy", "check", "set", "generate", "unlock", "list"]) expect(out).toContain(`pass-env ${command}`);
+		for (const command of ["run", "pipe", "copy", "check", "set", "generate", "unlock", "list", "import", "doctor"]) expect(out).toContain(`pass-env ${command}`);
+	});
+});
+
+describe("import", () => {
+	const lines = [
+		"﻿# Settings for the app",
+		"NEXT_PUBLIC_SITE_URL=https://example.invalid",
+		"export OPENAI_API_KEY=sk-synthetic-openai # the key",
+		"SINGLE='literal-synthetic \\n kept #not-a-comment'",
+		'ESCAPED="synthetic line one\\nline two"',
+		'PEM="-----BEGIN SYNTHETIC-----',
+		"abc",
+		'-----END SYNTHETIC-----"',
+		"EMPTY=",
+		"REFERENCE=${OPENAI_API_KEY}/synthetic",
+		"BARE_HASH=synthetic#def",
+		"my.var=synthetic-dotted",
+		"DUPLICATE=first-synthetic",
+		"DUPLICATE=second-synthetic",
+		"  SPACED  =  synthetic-spaced  ",
+	];
+	const sample = `${lines.join("\r\n")}\r\n`;
+	const kept = "﻿# Settings for the app\r\nNEXT_PUBLIC_SITE_URL=https://example.invalid\r\nEMPTY=\r\nREFERENCE=${OPENAI_API_KEY}/synthetic\r\nBARE_HASH=synthetic#def\r\nmy.var=synthetic-dotted\r\n";
+	const secretFree = (text: string) => {
+		for (const word of ["synthetic", "SYNTHETIC", "example.invalid", "line two"]) expect(text).not.toContain(word);
+	};
+	const setup = (entries: Record<string, string> = {}) => {
+		const files = fixture(entries);
+		writeFileSync(join(files.root, ".env.local"), sample);
+		return files;
+	};
+	const read = (files: Fixture, name: string) => readFileSync(join(files.root, name), "utf8");
+	// The error is the last stderr line; warnings may come first.
+	const error = (stderr: string) => stderr.trimEnd().split("\n").pop()!;
+
+	test("parses dotenv rules, stores secrets exactly, keeps public names and explains skips without printing values", () => {
+		const files = setup();
+		const result = invoke(files, ["import", ".env.local", "--prefix", "app"]);
+		expect(result.status).toBe(0);
+		secretFree(result.stdout + result.stderr);
+		expect(stored(files, "app/OPENAI_API_KEY")).toBe("sk-synthetic-openai\n");
+		expect(stored(files, "app/SINGLE")).toBe("literal-synthetic \\n kept #not-a-comment\n");
+		expect(stored(files, "app/ESCAPED")).toBe("synthetic line one\nline two");
+		expect(stored(files, "app/PEM")).toBe("-----BEGIN SYNTHETIC-----\nabc\n-----END SYNTHETIC-----");
+		expect(stored(files, "app/DUPLICATE")).toBe("second-synthetic\n");
+		expect(stored(files, "app/SPACED")).toBe("synthetic-spaced\n");
+		for (const name of ["NEXT_PUBLIC_SITE_URL", "EMPTY", "REFERENCE", "BARE_HASH", "my.var"]) expect(existsSync(join(files.store, `app/${name}.gpg`))).toBe(false);
+		expect(result.stdout).toMatch(/NEXT_PUBLIC_SITE_URL\s+kept public/);
+		expect(result.stdout).toMatch(/PEM\s+stored as app\/PEM \(multiline\)/);
+		expect(result.stdout).toMatch(/EMPTY\s+skipped: empty value/);
+		expect(result.stdout).toMatch(/REFERENCE\s+skipped: references another variable/);
+		expect(result.stdout).toMatch(/BARE_HASH\s+skipped: unquoted #/);
+		expect(result.stdout).toMatch(/my\.var\s+skipped: not a valid variable name/);
+		expect(result.stdout).toContain("pass-env import .env.local --prefix app --remove");
+		expect(result.stderr).toContain("DUPLICATE is set more than once");
+		expect(read(files, ".env.pass")).toBe("# Imported from .env.local\nOPENAI_API_KEY=app/OPENAI_API_KEY\nSINGLE=app/SINGLE\nESCAPED=multiline:app/ESCAPED\nPEM=multiline:app/PEM\nDUPLICATE=app/DUPLICATE\nSPACED=app/SPACED\n");
+		expect(read(files, ".env.local")).toBe(sample);
+	});
+
+	test("multi-line values round-trip exactly through run", () => {
+		const files = setup();
+		invoke(files, ["import", ".env.local", "--prefix", "app"]);
+		const result = invoke(files, ["run", "--", process.execPath, "-e", "process.stdout.write(JSON.stringify([process.env.PEM, process.env.ESCAPED, process.env.SINGLE]))"]);
+		expect(JSON.parse(result.stdout)).toEqual(["-----BEGIN SYNTHETIC-----\nabc\n-----END SYNTHETIC-----", "synthetic line one\nline two", "literal-synthetic \\n kept #not-a-comment"]);
+	});
+
+	test("--dry-run prints names only and stores or writes nothing", () => {
+		const files = setup({ "app/SPACED": "x" });
+		const result = invoke(files, ["import", ".env.local", "--prefix", "app", "--dry-run", "--skip", "SINGLE,ESCAPED"]);
+		expect(result.status).toBe(0);
+		secretFree(result.stdout + result.stderr);
+		expect(result.stdout).toContain("dry run");
+		expect(result.stdout).toMatch(/SINGLE\s+skipped: --skip/);
+		expect(result.stdout).toMatch(/SPACED\s+stored as app\/SPACED \(already exists: needs --force\)/);
+		expect(existsSync(files.calls)).toBe(false);
+		expect(existsSync(join(files.root, ".env.pass"))).toBe(false);
+	});
+
+	test("refuses before storing anything if an entry exists, and --force replaces", () => {
+		const files = setup({ "app/PEM": "old" });
+		const result = invoke(files, ["import", ".env.local", "--prefix", "app"]);
+		expect(result.status).toBe(1);
+		expect(error(result.stderr)).toStartWith("EXISTS: already in the store: app/PEM;");
+		expect(existsSync(files.calls)).toBe(false);
+		expect(existsSync(join(files.root, ".env.pass"))).toBe(false);
+		expect(invoke(files, ["import", ".env.local", "--prefix", "app", "--force"]).status).toBe(0);
+		expect(stored(files, "app/PEM")).toBe("-----BEGIN SYNTHETIC-----\nabc\n-----END SYNTHETIC-----");
+	});
+
+	test("merges into an existing .env.pass and stops on a conflicting mapping", () => {
+		const files = setup();
+		writeFileSync(join(files.root, ".env.pass"), "# mine\nOTHER=shared/OTHER\nSPACED=app/SPACED");
+		expect(invoke(files, ["import", ".env.local", "--prefix", "app"]).status).toBe(0);
+		const merged = read(files, ".env.pass");
+		expect(merged).toStartWith("# mine\nOTHER=shared/OTHER\nSPACED=app/SPACED\n\n# Imported from .env.local\nOPENAI_API_KEY=app/OPENAI_API_KEY\n");
+		expect(merged.match(/SPACED=/g)).toHaveLength(1);
+
+		const clash = setup();
+		writeFileSync(join(clash.root, ".env.pass"), "PEM=app/PEM\n");
+		const result = invoke(clash, ["import", ".env.local", "--prefix", "app"]);
+		expect(result.status).toBe(1);
+		expect(error(result.stderr)).toStartWith("CONFLICT: .env.pass already maps PEM");
+		expect(existsSync(clash.calls)).toBe(false);
+		expect(read(clash, ".env.pass")).toBe("PEM=app/PEM\n");
+	});
+
+	test("warns with the fix when git ignores .env.pass", () => {
+		const files = setup();
+		spawnSync("git", ["init", "-q"], { cwd: files.root });
+		writeFileSync(join(files.root, ".gitignore"), ".env*\n");
+		const result = invoke(files, ["import", ".env.local", "--prefix", "app"]);
+		expect(result.status).toBe(0);
+		expect(result.stderr).toContain("git ignores .env.pass (rule .env* in .gitignore)");
+		expect(result.stderr).toContain("!.env.pass");
+		writeFileSync(join(files.root, ".gitignore"), ".env*\n!.env.pass\n");
+		expect(invoke(files, ["import", ".env.local", "--prefix", "app", "--force"]).stderr).not.toContain("git ignores");
+	});
+
+	test("--remove checks every value, then rewrites the file keeping comments, public and skipped lines and its mode", () => {
+		const files = setup();
+		invoke(files, ["import", ".env.local", "--prefix", "app"]);
+		chmodSync(join(files.root, ".env.local"), 0o640);
+		const result = invoke(files, ["import", ".env.local", "--prefix", "app", "--remove"]);
+		expect(result.stderr).toContain("DUPLICATE is set more than once");
+		expect(result.status).toBe(0);
+		secretFree(result.stdout);
+		expect(result.stdout).toContain("Checked 6 stored values against .env.local: all match.");
+		expect(result.stdout).toMatch(/Still in \.env\.local:\n\s+NEXT_PUBLIC_SITE_URL\s+kept public/);
+		expect(read(files, ".env.local")).toBe(kept);
+		expect(statSync(join(files.root, ".env.local")).mode & 0o777).toBe(0o640);
+		expect(invoke(files, ["import", ".env.local", "--prefix", "app", "--remove"]).stdout).toContain("no secret lines left");
+	});
+
+	test("--remove changes nothing when a value differs, GPG is locked, or .env.pass lacks the mapping", () => {
+		const files = setup();
+		invoke(files, ["import", ".env.local", "--prefix", "app"]);
+		writeFileSync(join(files.store, "app/SPACED.gpg"), "rotated-synthetic\n");
+		const mismatch = invoke(files, ["import", ".env.local", "--prefix", "app", "--remove"]);
+		expect(mismatch.status).toBe(1);
+		expect(error(mismatch.stderr)).toStartWith("MISMATCH: the stored value differs from .env.local for SPACED; nothing was removed.");
+		secretFree(mismatch.stdout + mismatch.stderr);
+		expect(read(files, ".env.local")).toBe(sample);
+
+		files.env.TEST_PASS_LOCKED = "1";
+		const locked = invoke(files, ["import", ".env.local", "--prefix", "app", "--remove"]);
+		expect(error(locked.stderr)).toStartWith("LOCKED:");
+		expect(locked.stderr).toContain("pass-env unlock");
+		expect(read(files, ".env.local")).toBe(sample);
+		delete files.env.TEST_PASS_LOCKED;
+
+		writeFileSync(join(files.root, ".env.pass"), "OTHER=shared/OTHER\n");
+		const unmapped = invoke(files, ["import", ".env.local", "--prefix", "app", "--remove"]);
+		expect(error(unmapped.stderr)).toStartWith("REFERENCE_FILE: .env.pass does not map OPENAI_API_KEY");
+		expect(read(files, ".env.local")).toBe(sample);
+	});
+
+	test("--remove deletes a file left with only comments, and explains Wrangler for .dev.vars", () => {
+		const files = fixture({});
+		writeFileSync(join(files.root, ".dev.vars"), "# local\nAPI_KEY=synthetic-api\n\n");
+		invoke(files, ["import", ".dev.vars", "--prefix", "worker"]);
+		const result = invoke(files, ["import", ".dev.vars", "--prefix", "worker", "--remove"]);
+		expect(result.status).toBe(0);
+		expect(existsSync(join(files.root, ".dev.vars"))).toBe(false);
+		expect(result.stdout).toContain("Deleted .dev.vars");
+		expect(result.stdout).toContain("CLOUDFLARE_INCLUDE_PROCESS_ENV=true pass-env run -- npx wrangler dev");
+
+		mkdirSync(join(files.root, "sub"));
+		writeFileSync(join(files.root, "sub/.dev.vars"), "API_KEY=synthetic-api\nPUBLIC_MODE=dev\n");
+		const imported = invoke(files, ["import", "sub/.dev.vars", "--prefix", "worker", "--force"]);
+		expect(imported.stdout).toContain("cd sub && pass-env check");
+		expect(read(files, "sub/.env.pass")).toContain("API_KEY=worker/API_KEY");
+		const partial = invoke(files, ["import", "sub/.dev.vars", "--prefix", "worker", "--remove"]);
+		expect(partial.status).toBe(0);
+		expect(read(files, "sub/.dev.vars")).toBe("PUBLIC_MODE=dev\n");
+		expect(partial.stdout).toContain("Wrangler ignores environment variables while .dev.vars exists");
+		expect(partial.stdout).toContain('"vars" in wrangler.jsonc');
+	});
+
+	test("bad arguments and unparseable files fail clearly without echoing content", () => {
+		const files = setup();
+		for (const args of [["import", ".env.local"], ["import", ".env.local", "--prefix", "../x"], ["import", "--prefix", "app"],
+			["import", ".env.local", "--prefix", "app", "--remove", "--force"], ["import", ".env.local", "--prefix", "app", "--remove", "--dry-run"]]) {
+			expect(invoke(files, args).status).toBe(2);
+		}
+		writeFileSync(join(files.root, "broken.env"), "OK=1\nKEY=\"synthetic-unclosed\n");
+		const broken = invoke(files, ["import", "broken.env", "--prefix", "app"]);
+		expect(broken.status).toBe(1);
+		expect(broken.stderr).toBe("PARSE: broken.env, line 2: quoted value is never closed\n");
+		writeFileSync(join(files.root, "junk.env"), "synthetic-junk\n");
+		expect(invoke(files, ["import", "junk.env", "--prefix", "app"]).stderr).toBe("PARSE: junk.env, line 1: expected NAME=value\n");
+		expect(invoke(files, ["import", "missing.env", "--prefix", "app"]).stderr).toStartWith("REFERENCE_FILE: missing.env");
+		expect(existsSync(files.calls)).toBe(false);
+	});
+});
+
+describe("doctor", () => {
+	// A healthy setup: store with a usable key, terminal prompt configured.
+	const healthy = () => {
+		const files = fixture();
+		const gnupg = join(files.root, "gnupg");
+		mkdirSync(gnupg);
+		writeFileSync(join(files.store, ".gpg-id"), "synthetic@example.invalid\n");
+		writeFileSync(join(gnupg, "gpg-agent.conf"), `pinentry-program ${join(files.root, "bin", "fakeclip")}\ndefault-cache-ttl 3600\nmax-cache-ttl 28800\n`);
+		Object.assign(files.env, { GNUPGHOME: gnupg, GPG_TTY: "/dev/pts/synthetic", TEST_GPG_SECRET_KEYS: "synthetic@example.invalid" });
+		return files;
+	};
+	const line = (out: string, status: string, text: string) => expect(out).toMatch(new RegExp(`^${status}\\s+.*${text}`, "m"));
+
+	test("a healthy setup is all ok, and doctor never calls pass", () => {
+		const files = healthy();
+		const result = invoke(files, ["doctor"]);
+		expect(result.stdout).not.toMatch(/^(warn|FAIL)/m);
+		expect(result.status).toBe(0);
+		line(result.stdout, "ok", "private key for synthetic@example.invalid");
+		line(result.stdout, "ok", "no plaintext .env files");
+		expect(result.stdout).toContain("0 failed, 0 warnings");
+		expect(existsSync(files.calls)).toBe(false);
+	});
+
+	test("fails on a missing store, .gpg-id, private key, or prompt program", () => {
+		const files = healthy();
+		writeFileSync(join(files.env.GNUPGHOME!, "gpg-agent.conf"), "pinentry-program /nonexistent/pinentry\n");
+		files.env.TEST_GPG_SECRET_KEYS = "someone-else";
+		let result = invoke(files, ["doctor"]);
+		expect(result.status).toBe(1);
+		line(result.stdout, "FAIL", "no private key on this machine for synthetic@example.invalid");
+		line(result.stdout, "FAIL", "pinentry-program /nonexistent/pinentry does not exist");
+		expect(result.stdout).toContain("fix: gpg --list-secret-keys");
+
+		rmSync(join(files.store, ".gpg-id"));
+		line(invoke(files, ["doctor"]).stdout, "FAIL", "the store has no .gpg-id");
+		files.env.PASSWORD_STORE_DIR = join(files.root, "nowhere");
+		result = invoke(files, ["doctor"]);
+		line(result.stdout, "FAIL", "no password store at");
+		expect(result.stdout).toContain("fix: pass init <your-gpg-id>");
+	});
+
+	test("fails when pass and gpg are missing, and on a WSL store under /mnt", () => {
+		const files = healthy();
+		const empty = join(files.root, "empty-bin");
+		mkdirSync(empty);
+		files.env.PATH = empty;
+		files.env.WSL_DISTRO_NAME = "synthetic";
+		files.env.PASSWORD_STORE_DIR = "/mnt/c/Users/synthetic/store";
+		const result = invoke(files, ["doctor"]);
+		expect(result.status).toBe(1);
+		line(result.stdout, "FAIL", "pass is not installed");
+		line(result.stdout, "FAIL", "gpg is not installed");
+		line(result.stdout, "FAIL", "on the Windows drive");
+	});
+
+	test("warns about long caches, WSL prompts, plaintext .env files, an ignored .env.pass and Claude Code rules", () => {
+		const files = healthy();
+		writeFileSync(join(files.env.GNUPGHOME!, "gpg-agent.conf"), "default-cache-ttl 600\nmax-cache-ttl 999999\n");
+		files.env.WSL_DISTRO_NAME = "synthetic";
+		writeFileSync(join(files.root, ".env.local"), "SECRET_KEY=synthetic-secret\nNEXT_PUBLIC_X=synthetic-public\n");
+		writeFileSync(join(files.root, ".env"), "NEXT_PUBLIC_X=synthetic-public\n");
+		writeFileSync(join(files.root, ".env.example"), "SECRET_KEY=synthetic-placeholder\n");
+		spawnSync("git", ["init", "-q"], { cwd: files.root });
+		writeFileSync(join(files.root, ".gitignore"), ".env*\n");
+		mkdirSync(join(files.root, ".claude"));
+		const result = invoke(files, ["doctor"]);
+		expect(result.status).toBe(0);
+		expect(result.stdout).not.toContain("synthetic-");
+		line(result.stdout, "warn", "max-cache-ttl 999999s");
+		line(result.stdout, "warn", "no pinentry-program set; on WSL");
+		expect(result.stdout).toContain("pinentry-curses");
+		line(result.stdout, "warn", ".env.local holds 1 plaintext value");
+		expect(result.stdout).toMatch(/fix: pass-env import \.env\.local --prefix pass-env-test-\w+ --dry-run/);
+		line(result.stdout, "ok", ".env holds no secret-looking values");
+		expect(result.stdout).not.toContain(".env.example");
+		line(result.stdout, "warn", "git ignores .env.pass");
+		expect(result.stdout).toContain("fix: echo '!.env.pass' >> .gitignore");
+		line(result.stdout, "warn", "Claude Code may read .env files");
+
+		writeFileSync(join(files.root, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Read(**/.env.*)"] } }));
+		line(invoke(files, ["doctor"]).stdout, "ok", "Claude Code is denied reading .env files");
 	});
 });

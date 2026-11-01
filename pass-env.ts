@@ -3,8 +3,10 @@
 // showing them. Fork of misty-step/mistystack's bin/pass-env.ts (MIT).
 
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import {
+	appendFileSync, chmodSync, existsSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 class CliError extends Error {
 	constructor(readonly code: string, message: string, readonly exitCode = 1) {
@@ -24,10 +26,16 @@ type Options =
 	| { command: "generate"; entry: string; length: number; charset: Charset; force: boolean; copy: boolean }
 	| { command: "copy"; entry: string; multiline: boolean }
 	| { command: "pipe"; entry: string; multiline: boolean; argv: string[] }
-	| { command: "unlock"; entry?: string };
+	| { command: "unlock"; entry?: string }
+	| ImportOptions
+	| { command: "doctor" };
+type ImportOptions = { command: "import"; file: string; prefix: string; skip: Set<string>; dryRun: boolean; force: boolean; remove: boolean };
 
 const DEFAULT_FILE = ".env.pass";
 const MULTILINE = "multiline:";
+const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// Frameworks compile these into the browser bundle, so they are not secret.
+const PUBLIC_PREFIXES = ["NEXT_PUBLIC_", "VITE_", "PUBLIC_", "EXPO_PUBLIC_", "REACT_APP_"];
 const CHARSETS: Record<Charset, string> = {
 	alnum: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
 	hex: "0123456789abcdef",
@@ -54,7 +62,18 @@ Use a secret
   pass-env copy <entry> [--multiline]
       Put one secret on your clipboard, cleared after 45s.
 
+Move an existing .env file into pass
+  pass-env import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--force]
+      Store each secret as <prefix>/<NAME> and add it to .env.pass next to
+      the file. Public names (NEXT_PUBLIC_*, VITE_*, ...) stay. The file is
+      not changed. --dry-run shows the plan, names only.
+  pass-env import <file> --prefix <prefix> [--skip NAME,NAME] --remove
+      After testing with run: check every stored value against the file,
+      then delete those lines from it. Needs GPG unlocked.
+
 Check and set up
+  pass-env doctor
+      Check pass, GPG, the store and this folder. Decrypts nothing.
   pass-env check [-f file]... [-e NAME=entry]...
       Show each mapping as ok or MISSING. Decrypts nothing.
   pass-env list [prefix] [--json]
@@ -80,11 +99,13 @@ Examples
   pass-env pipe myapp/STRIPE_SECRET_KEY -- gh secret set STRIPE_SECRET_KEY
   pass-env pipe myapp/STRIPE_SECRET_KEY -- vercel env add STRIPE_SECRET_KEY production
   pass-env pipe myapp/STRIPE_SECRET_KEY -- npx wrangler secret put STRIPE_SECRET_KEY
+  pass-env import .env.local --prefix myapp --dry-run
 
 Notes
   The store is PASSWORD_STORE_DIR or ~/.password-store. Entry names are
   visible file names: never put a secret in a name.
   set and generate only encrypt, so they work while GPG is locked.
+  Piped input with several lines is stored exactly, byte for byte.
   run, pipe and copy never prompt: if GPG is locked they say so.
   Clipboard clear time: PASSWORD_STORE_CLIP_TIME (default 45 seconds).
   pass-env never prints a secret, but the commands you run can, and
@@ -105,7 +126,7 @@ function mapping(input: string, location: string): Mapping {
 	const equals = input.indexOf("=");
 	const name = input.slice(0, equals).trim();
 	let entry = input.slice(equals + 1).trim();
-	if (equals < 1 || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+	if (equals < 1 || !NAME.test(name)) {
 		throw new CliError("USAGE", `${location}: expected NAME=entry`, 2);
 	}
 	const multiline = entry.startsWith(MULTILINE);
@@ -215,31 +236,62 @@ function parseArgs(args: string[]): Options {
 			if (rest.length > 1) throw new CliError("USAGE", "expected unlock [entry]", 2);
 			return { command: "unlock", entry: rest[0] === undefined ? undefined : checkedEntry(rest[0]) };
 		}
+		case "import":
+			return parseImport(rest);
+		case "doctor":
+			if (rest.length) throw new CliError("USAGE", "expected doctor", 2);
+			return { command: "doctor" };
 		default:
 			throw new CliError("USAGE", "unknown command; run pass-env help", 2);
 	}
 }
 
+function parseImport(args: string[]): ImportOptions {
+	const options: ImportOptions = { command: "import", file: "", prefix: "", skip: new Set(), dryRun: false, force: false, remove: false };
+	const expected = "expected import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--force] [--remove]";
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index];
+		if (arg === "--dry-run") options.dryRun = true;
+		else if (arg === "--force") options.force = true;
+		else if (arg === "--remove") options.remove = true;
+		else if (arg === "--prefix" || arg === "--skip") {
+			const value = args[++index];
+			if (!value || value.startsWith("-")) throw new CliError("USAGE", `${arg} requires a value`, 2);
+			if (arg === "--prefix") options.prefix = checkedEntry(value.replace(/\/$/, ""), "prefix");
+			else value.split(",").filter(Boolean).forEach((name) => options.skip.add(name));
+		} else if (arg.startsWith("-") || options.file) throw new CliError("USAGE", expected, 2);
+		else options.file = arg;
+	}
+	if (!options.file || !options.prefix) throw new CliError("USAGE", expected, 2);
+	if (options.remove && (options.dryRun || options.force)) throw new CliError("USAGE", "--remove cannot be combined with --dry-run or --force", 2);
+	return options;
+}
+
+function readText(path: string, what: string): string {
+	try {
+		if (!statSync(path).isFile()) throw new Error();
+		return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(readFileSync(path));
+	} catch {
+		throw new CliError("REFERENCE_FILE", `${what}: cannot read regular UTF-8 file`);
+	}
+}
+
+function referenceFile(path: string, location: string): Mapping[] {
+	const items: Mapping[] = [];
+	for (const [lineIndex, raw] of readText(path, location).split("\n").entries()) {
+		const line = raw.trim();
+		if (!line || line.startsWith("#")) continue;
+		const item = mapping(line, `${location}, line ${lineIndex + 1}`);
+		if (items.some((other) => other.name === item.name)) throw new CliError("USAGE", `${location}: duplicate mapping ${item.name}`, 2);
+		items.push(item);
+	}
+	return items;
+}
+
 function readMappings(sources: Sources): Mapping[] {
 	const result = new Map<string, Mapping>();
 	for (let index = 0; index < sources.files.length; index += 1) {
-		const location = `reference file ${index + 1}`;
-		let text: string;
-		try {
-			if (!statSync(sources.files[index]).isFile()) throw new Error();
-			text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(readFileSync(sources.files[index]));
-		} catch {
-			throw new CliError("REFERENCE_FILE", `${location}: cannot read regular UTF-8 file`);
-		}
-		const seen = new Set<string>();
-		for (const [lineIndex, raw] of text.split("\n").entries()) {
-			const line = raw.trim();
-			if (!line || line.startsWith("#")) continue;
-			const item = mapping(line, `${location}, line ${lineIndex + 1}`);
-			if (seen.has(item.name)) throw new CliError("USAGE", `${location}: duplicate mapping ${item.name}`, 2);
-			seen.add(item.name);
-			result.set(item.name, item);
-		}
+		for (const item of referenceFile(sources.files[index], `reference file ${index + 1}`)) result.set(item.name, item);
 	}
 	for (const item of sources.explicit) result.set(item.name, item);
 	if (!result.size) throw new CliError("USAGE", "no mappings found", 2);
@@ -344,7 +396,9 @@ async function decrypt(root: string, item: Mapping): Promise<string> {
 	return (end === -1 ? value : value.slice(0, end)).replace(/\r$/, "");
 }
 
-async function store(root: string, entry: string, value: string, force: boolean): Promise<void> {
+// pass stores single-line values as "value\n"; exact writes the bytes as given,
+// so multiline: mappings get back exactly what was stored.
+async function store(root: string, entry: string, value: string, force: boolean, exact = false): Promise<void> {
 	if (!force && entryExists(root, entry)) {
 		throw new CliError("EXISTS", `${entry} already exists; add --force to replace it`);
 	}
@@ -355,7 +409,7 @@ async function store(root: string, entry: string, value: string, force: boolean)
 		stdout: "ignore",
 		stderr: "pipe",
 	}));
-	backend.stdin.write(value.endsWith("\n") ? value : `${value}\n`);
+	backend.stdin.write(exact || value.endsWith("\n") ? value : `${value}\n`);
 	await backend.stdin.end();
 	const [errors, status] = await Promise.all([new Response(backend.stderr).text(), backend.exited]);
 	if (status !== 0) {
@@ -378,17 +432,16 @@ function randomSecret(length: number, charset: Charset): string {
 	return out;
 }
 
-async function readStdin(): Promise<string> {
-	const text = await Bun.stdin.text();
-	return text.replace(/\r?\n$/, "");
-}
-
-async function setEntry(root: string, entry: string, force: boolean): Promise<void> {
+// Returns the number of lines stored from piped input (0 for the prompt).
+async function setEntry(root: string, entry: string, force: boolean): Promise<number> {
 	if (!process.stdin.isTTY) {
-		const value = await readStdin();
+		// One line loses its trailing newline; several lines are kept exactly.
+		const input = await Bun.stdin.text();
+		const value = input.replace(/\r?\n$/, "");
 		if (!value) throw new CliError("VALUE", "nothing was piped in");
-		await store(root, entry, value, force);
-		return;
+		const multiline = /[\r\n]/.test(value);
+		await store(root, entry, multiline ? input : value, force, multiline);
+		return multiline ? value.split(/\r?\n|\r/).length : 1;
 	}
 	if (!force && entryExists(root, entry)) throw new CliError("EXISTS", `${entry} already exists; add --force to replace it`);
 	// Interactive: pass shows its own hidden, confirmed prompt.
@@ -400,18 +453,22 @@ async function setEntry(root: string, entry: string, force: boolean): Promise<vo
 		stderr: "inherit",
 	}));
 	if (await backend.exited !== 0) throw new CliError("STORE", `${entry} was not stored`);
+	return 0;
 }
 
 type Clipboard = { write: string[]; read?: string[] };
+
+function isWsl(): boolean {
+	if (process.env.WSL_DISTRO_NAME) return true;
+	try { return /microsoft/i.test(readFileSync("/proc/version", "utf8")); } catch { return false; }
+}
 
 function clipboard(): Clipboard {
 	const words = (value: string | undefined) => value?.split(" ").filter(Boolean);
 	if (process.env.PASS_ENV_CLIPBOARD) {
 		return { write: words(process.env.PASS_ENV_CLIPBOARD)!, read: words(process.env.PASS_ENV_CLIPBOARD_READ) };
 	}
-	let wsl = false;
-	try { wsl = /microsoft/i.test(readFileSync("/proc/version", "utf8")); } catch { /* Not Linux. */ }
-	if (wsl && Bun.which("clip.exe")) {
+	if (isWsl() && Bun.which("clip.exe")) {
 		return { write: ["clip.exe"], read: Bun.which("powershell.exe") ? ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"] : undefined };
 	}
 	if (Bun.which("pbcopy")) return { write: ["pbcopy"], read: ["pbpaste"] };
@@ -518,12 +575,385 @@ async function runChild(argv: string[], env: NodeJS.ProcessEnv, input?: string):
 	return code;
 }
 
+// A dotenv line or quoted block: lines first..last of the file.
+type DotenvRecord = { name: string; value: string; first: number; last: number; ambiguous: boolean };
+type Dotenv = { lines: string[]; bom: boolean; records: DotenvRecord[] };
+type Planned = { name: string; value: string; entry: string; multiline: boolean; action: "store" | "public" | "skip"; reason?: string };
+
+// Mirrors dotenv (used by Next.js, Vite and Wrangler). Errors name lines, never content.
+function parseDotenv(text: string, label: string): Dotenv {
+	const bom = text.startsWith("﻿");
+	const lines = (bom ? text.slice(1) : text).split("\n");
+	const line = (index: number) => lines[index].replace(/\r$/, "");
+	const records: DotenvRecord[] = [];
+	for (let index = 0; index < lines.length; index += 1) {
+		const raw = line(index);
+		if (!raw.trim() || raw.trim().startsWith("#")) continue;
+		const match = /^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*)$/.exec(raw);
+		if (!match) throw new CliError("PARSE", `${label}, line ${index + 1}: expected NAME=value`);
+		const [, name, rest] = match;
+		const first = index;
+		const quote = rest[0];
+		if (quote !== '"' && quote !== "'" && quote !== "`") {
+			// Unquoted: a # starts a comment only after whitespace; dotenv also cuts
+			// at a bare #, so that case is flagged rather than guessed.
+			const hash = rest.search(/(^|\s)#/);
+			const value = (hash === -1 ? rest : rest.slice(0, hash)).trim();
+			records.push({ name, value, first, last: index, ambiguous: value.includes("#") });
+			continue;
+		}
+		let body = rest.slice(1);
+		let value = "";
+		for (;;) {
+			const end = closingQuote(body, quote);
+			if (end !== -1) {
+				value += body.slice(0, end);
+				break;
+			}
+			value += `${body}\n`;
+			index += 1;
+			if (index >= lines.length) throw new CliError("PARSE", `${label}, line ${first + 1}: quoted value is never closed`);
+			body = line(index);
+		}
+		if (quote === '"') value = value.replace(/\\n/g, "\n").replace(/\\r/g, "\r");
+		records.push({ name, value, first, last: index, ambiguous: false });
+	}
+	return { lines, bom, records };
+}
+
+// The first quote followed by only whitespace or a comment; \" does not close "...".
+function closingQuote(body: string, quote: string): number {
+	for (let index = 0; index < body.length; index += 1) {
+		if (quote === '"' && body[index] === "\\") index += 1;
+		else if (body[index] === quote && /^\s*(#.*)?$/.test(body.slice(index + 1))) return index;
+	}
+	return -1;
+}
+
+function planImport(dotenv: Dotenv, prefix: string, skip: Set<string>): { items: Planned[]; duplicates: string[] } {
+	const latest = new Map<string, DotenvRecord>();
+	const duplicates = new Set<string>();
+	for (const record of dotenv.records) {
+		if (latest.has(record.name)) duplicates.add(record.name);
+		latest.set(record.name, record);
+	}
+	const items = [...latest.values()].map((record): Planned => {
+		const { name, value } = record;
+		const plan = (action: Planned["action"], reason?: string): Planned => ({
+			name, value, entry: `${prefix}/${name}`, multiline: /[\r\n]/.test(value), action, reason,
+		});
+		if (skip.has(name)) return plan("skip", "--skip");
+		if (PUBLIC_PREFIXES.some((public_) => name.startsWith(public_))) return plan("public");
+		if (!NAME.test(name)) return plan("skip", "not a valid variable name");
+		if (!value) return plan("skip", "empty value");
+		if (record.ambiguous) return plan("skip", "unquoted # (quote the value)");
+		// Next.js expands $NAME and ${NAME}, and turns \$ into $.
+		if (/\$[{A-Za-z_]|\\\$/.test(value)) return plan("skip", "references another variable");
+		return plan("store");
+	});
+	return { items, duplicates: [...duplicates] };
+}
+
+function readDotenv(options: ImportOptions): { dotenv: Dotenv; items: Planned[] } {
+	const dotenv = parseDotenv(readText(options.file, options.file), options.file);
+	const { items, duplicates } = planImport(dotenv, options.prefix, options.skip);
+	for (const name of duplicates) console.error(`warning: ${name} is set more than once in ${options.file}; the last value is used`);
+	return { dotenv, items };
+}
+
+function describePlan(items: Planned[], note: (item: Planned) => string = () => ""): string {
+	const width = Math.max(...items.map((item) => item.name.length));
+	return items.map((item) => {
+		const what = item.action === "store" ? `stored as ${item.entry}${item.multiline ? " (multiline)" : ""}`
+			: item.action === "public" ? "kept public" : `skipped: ${item.reason}`;
+		return `  ${item.name.padEnd(width)}  ${what}${note(item)}`;
+	}).join("\n");
+}
+
+const sameMapping = (mapping: Mapping, item: Planned) => mapping.entry === item.entry && mapping.multiline === item.multiline;
+const mappingLine = (item: Planned) => `${item.name}=${item.multiline ? MULTILINE : ""}${item.entry}`;
+const shown = (path: string) => relative(process.cwd(), path) || ".";
+
+// Where .gitignore rules hide the file: "pattern (source)", or undefined.
+function gitIgnoreRule(path: string): string | undefined {
+	if (!Bun.which("git")) return undefined;
+	const result = Bun.spawnSync({ cmd: ["git", "check-ignore", "-v", "--", basename(path)], cwd: dirname(path), stdout: "pipe", stderr: "ignore" });
+	if (result.exitCode !== 0) return undefined;
+	// With -v, a matching !pattern is reported too; it means "not ignored".
+	const match = /^(.+?):\d+:(.*)\t/.exec(result.stdout.toString());
+	if (match?.[2].startsWith("!")) return undefined;
+	return match ? `rule ${match[2]} in ${match[1]}` : "a .gitignore rule";
+}
+
+async function importFile(root: string, options: ImportOptions): Promise<number> {
+	const { items } = readDotenv(options);
+	const secrets = items.filter((item) => item.action === "store");
+	const reference = join(dirname(options.file), DEFAULT_FILE);
+	const existing = existsSync(reference) ? referenceFile(reference, shown(reference)) : [];
+	const conflicts = secrets.filter((item) => existing.some((mapping) => mapping.name === item.name && !sameMapping(mapping, item)));
+	const taken = new Set(secrets.filter((item) => entryExists(root, item.entry)).map((item) => item.name));
+	if (!items.length) {
+		console.log(`${options.file} has no variables.`);
+		return 0;
+	}
+	if (options.dryRun) {
+		console.log(`Plan for ${options.file} (dry run, nothing stored or changed):`);
+		console.log(describePlan(items, (item) => taken.has(item.name) ? options.force ? " (replaces the existing entry)" : " (already exists: needs --force)" : ""));
+		for (const item of conflicts) console.log(`problem: ${shown(reference)} already maps ${item.name} to another entry`);
+		return 0;
+	}
+	if (conflicts.length) {
+		throw new CliError("CONFLICT", `${shown(reference)} already maps ${conflicts.map((item) => item.name).join(", ")} to other entries; change those lines or use --skip`);
+	}
+	if (taken.size && !options.force) throw new CliError("EXISTS", `already in the store: ${[...taken].map((name) => `${options.prefix}/${name}`).join(", ")}; add --force to replace them`);
+	let count = 0;
+	for (const item of secrets) {
+		try {
+			await store(root, item.entry, item.value, true, item.multiline);
+		} catch (error) {
+			const stored = count ? `; ${count} of ${secrets.length} were stored, so re-run with --force` : "";
+			throw new CliError(error instanceof CliError ? error.code : "STORE", `${error instanceof CliError ? error.message : `could not store ${item.entry}`}${stored}`);
+		}
+		count += 1;
+	}
+	const added = secrets.filter((item) => !existing.some((mapping) => mapping.name === item.name));
+	if (added.length) {
+		const before = existsSync(reference) ? readFileSync(reference, "utf8") : "";
+		const separator = before && !before.endsWith("\n") ? "\n" : "";
+		appendFileSync(reference, `${separator}${before.trim() ? "\n" : ""}# Imported from ${basename(options.file)}\n${added.map(mappingLine).join("\n")}\n`);
+	}
+	console.log(`Imported ${options.file}:`);
+	console.log(describePlan(items));
+	console.log(`\nStored ${count} ${count === 1 ? "entry" : "entries"}; added ${added.length} ${added.length === 1 ? "line" : "lines"} to ${shown(reference)}. ${options.file} was not changed.`);
+	const rule = gitIgnoreRule(reference);
+	if (rule && count) console.error(`warning: git ignores ${shown(reference)} (${rule}). To commit it, add this line to .gitignore:\n  !.env.pass`);
+	if (!count) return 0;
+	const here = dirname(options.file) === "." ? "" : `cd ${dirname(options.file)} && `;
+	const remove = `pass-env import ${options.file} --prefix ${options.prefix}${options.skip.size ? ` --skip ${[...options.skip].join(",")}` : ""} --remove`;
+	console.log(`\nNext:
+  1. ${here}pass-env check
+  2. ${here}pass-env run -- <your dev command>    (if it says LOCKED, run pass-env unlock first)
+  3. ${remove}
+     checks every stored value, then deletes those lines from ${options.file}`);
+	if (isDevVars(options.file)) console.log(`\nWrangler reads ${basename(options.file)} instead of the environment until that file is gone; see --remove.`);
+	return 0;
+}
+
+const isDevVars = (file: string) => basename(file) === ".dev.vars" || basename(file).startsWith(".dev.vars.");
+
+// Rewrites via a temporary file and rename, keeping the mode.
+function replaceFile(path: string, text: string): void {
+	const mode = statSync(path).mode & 0o7777;
+	const temp = join(dirname(path), `.${basename(path)}.pass-env-${process.pid}.tmp`);
+	try {
+		writeFileSync(temp, text, { mode, flag: "wx" });
+		chmodSync(temp, mode);
+		renameSync(temp, path);
+	} catch {
+		rmSync(temp, { force: true });
+		throw new CliError("WRITE", `could not rewrite ${path}; it was not changed`);
+	}
+}
+
+async function removeImported(root: string, options: ImportOptions): Promise<number> {
+	const { dotenv, items } = readDotenv(options);
+	const secrets = items.filter((item) => item.action === "store");
+	if (!secrets.length) {
+		console.log(`${options.file} has no secret lines left to remove.`);
+		return 0;
+	}
+	if (lstatSync(options.file).isSymbolicLink()) throw new CliError("USAGE", `${options.file} is a symlink; run this on the real file`, 2);
+	const reference = join(dirname(options.file), DEFAULT_FILE);
+	const existing = existsSync(reference) ? referenceFile(reference, shown(reference)) : [];
+	const unmapped = secrets.filter((item) => !existing.some((mapping) => mapping.name === item.name && sameMapping(mapping, item)));
+	if (unmapped.length) {
+		throw new CliError("REFERENCE_FILE", `${shown(reference)} does not map ${unmapped.map((item) => item.name).join(", ")} to ${options.prefix}/; run the import without --remove first. Nothing was removed`);
+	}
+	const missing = secrets.filter((item) => !entryExists(root, item.entry));
+	if (missing.length) throw new CliError("ENTRY", `not in the store: ${missing.map((item) => item.entry).join(", ")}; nothing was removed`);
+	const differ: string[] = [];
+	for (const item of secrets) {
+		if (await decrypt(root, item) !== item.value) differ.push(item.name);
+	}
+	if (differ.length) {
+		throw new CliError("MISMATCH", `the stored value differs from ${options.file} for ${differ.join(", ")}; nothing was removed. To store the file's values, run the import again with --force`);
+	}
+	const names = new Set(secrets.map((item) => item.name));
+	const drop = new Set<number>();
+	for (const record of dotenv.records) {
+		if (names.has(record.name)) for (let index = record.first; index <= record.last; index += 1) drop.add(index);
+	}
+	const kept = dotenv.lines.filter((_, index) => !drop.has(index));
+	const empty = kept.every((line) => !line.trim() || line.trim().startsWith("#"));
+	console.log(`Checked ${secrets.length} stored ${secrets.length === 1 ? "value" : "values"} against ${options.file}: all match.`);
+	if (empty) {
+		unlinkSync(options.file);
+		console.log(`Deleted ${options.file}: only comments and blank lines were left.`);
+	} else {
+		replaceFile(options.file, `${dotenv.bom ? "﻿" : ""}${kept.join("\n")}`);
+		console.log(`Removed ${secrets.map((item) => item.name).join(", ")} from ${options.file}.`);
+		const left = items.filter((item) => item.action !== "store");
+		if (left.length) console.log(`Still in ${options.file}:\n${describePlan(left)}`);
+	}
+	if (isDevVars(options.file)) {
+		console.log(empty
+			? "\nWrangler can now read the environment: CLOUDFLARE_INCLUDE_PROCESS_ENV=true pass-env run -- npx wrangler dev"
+			: `\nWrangler ignores environment variables while ${basename(options.file)} exists, so pass-env run cannot reach wrangler dev yet.
+Move the remaining values into "vars" in wrangler.jsonc (or [vars] in wrangler.toml), then delete ${basename(options.file)}.`);
+	}
+	return 0;
+}
+
+type Check = { status: "ok" | "warn" | "FAIL"; text: string; fix?: string };
+const ok = (text: string): Check => ({ status: "ok", text });
+const warn = (text: string, fix: string): Check => ({ status: "warn", text, fix });
+const fail = (text: string, fix: string): Check => ({ status: "FAIL", text, fix });
+const DAY = 86_400;
+
+function tilde(path: string): string {
+	const home = process.env.HOME;
+	return home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;
+}
+
+function installFix(what: string): string {
+	return process.platform === "darwin" ? `brew install ${what === "pass" ? "pass gnupg" : "gnupg"}` : `sudo apt install ${what === "pass" ? "pass" : "gnupg"}`;
+}
+
+function toolChecks(): Check[] {
+	// A compiled binary carries its own Bun runtime.
+	const bun = Bun.main.startsWith("/$bunfs/") ? ok(`standalone binary (Bun ${Bun.version} built in)`) : ok(`Bun ${Bun.version}`);
+	return [
+		Bun.which("pass") ? ok("pass is installed") : fail("pass is not installed", installFix("pass")),
+		Bun.which("gpg") ? ok("gpg is installed") : fail("gpg is not installed", installFix("gpg")),
+		bun,
+	];
+}
+
+function storeChecks(): Check[] {
+	const configured = process.env.PASSWORD_STORE_DIR;
+	const home = process.env.HOME;
+	if (!configured && !home) return [fail("no password store: neither PASSWORD_STORE_DIR nor HOME is set", "export HOME, or PASSWORD_STORE_DIR=<store folder>")];
+	const root = resolve(configured || join(home!, ".password-store"));
+	if (isWsl() && /^\/mnt\/[a-z]\//i.test(`${root}/`)) {
+		return [fail(`store ${root} is on the Windows drive, where Linux file permissions do not protect it`,
+			"keep it inside WSL: unset PASSWORD_STORE_DIR, pass init <your-gpg-id>, then move the entries into ~/.password-store")];
+	}
+	try {
+		storePath();
+	} catch {
+		return [fail(`no password store at ${tilde(root)} (it must be a real folder, not a symlink)`, "pass init <your-gpg-id>")];
+	}
+	const checks = [ok(`store ${tilde(root)}`)];
+	let ids: string[];
+	try {
+		ids = readFileSync(join(root, ".gpg-id"), "utf8").split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+	} catch {
+		ids = [];
+	}
+	if (!ids.length) return [...checks, fail("the store has no .gpg-id, so pass cannot encrypt", "pass init <your-gpg-id>")];
+	if (!Bun.which("gpg")) return checks;
+	const missing = ids.filter((id) => {
+		const result = Bun.spawnSync({ cmd: ["gpg", "--batch", "--list-secret-keys", "--with-colons", "--", id], stdout: "pipe", stderr: "ignore" });
+		return result.exitCode !== 0 || !/^sec:/m.test(result.stdout.toString());
+	});
+	checks.push(missing.length
+		? fail(`no private key on this machine for ${missing.join(", ")} (from .gpg-id), so entries cannot be decrypted here`,
+			"gpg --list-secret-keys shows the keys you have; import yours with gpg --import <key.asc>, or pass init <a key you have>")
+		: ok(`private key for ${ids.join(", ")} is on this machine`));
+	return checks;
+}
+
+function gpgChecks(): Check[] {
+	const home = process.env.GNUPGHOME || (process.env.HOME ? join(process.env.HOME, ".gnupg") : undefined);
+	const conf = home ? join(home, "gpg-agent.conf") : "gpg-agent.conf";
+	let lines: string[] = [];
+	try { lines = readFileSync(conf, "utf8").split("\n").map((line) => line.trim()); } catch { /* No config: GPG defaults. */ }
+	const option = (name: string) => lines.filter((line) => line.split(/\s+/)[0] === name).map((line) => line.slice(name.length).trim()).pop();
+	const checks: Check[] = [];
+	const pinentry = option("pinentry-program");
+	const curses = `echo 'pinentry-program ${Bun.which("pinentry-curses") ?? "/usr/bin/pinentry-curses"}' >> ${tilde(conf)} && gpgconf --kill gpg-agent`;
+	if (pinentry && !existsSync(pinentry)) checks.push(fail(`pinentry-program ${pinentry} does not exist, so GPG cannot ask for your passphrase`, curses));
+	else if (pinentry) checks.push(ok(`passphrase prompt: ${pinentry}`));
+	else if (isWsl()) checks.push(warn("no pinentry-program set; on WSL the default prompt may never appear", curses));
+	else checks.push(ok("passphrase prompt: GPG's default pinentry"));
+
+	const profile = process.env.SHELL?.endsWith("zsh") ? "~/.zshrc" : "~/.bashrc";
+	if (process.env.GPG_TTY) checks.push(ok("GPG_TTY is set"));
+	else if (process.stdin.isTTY) checks.push(warn("GPG_TTY is not set, so a terminal passphrase prompt may not appear", `echo 'export GPG_TTY=$(tty)' >> ${profile}`));
+	else checks.push(ok("GPG_TTY not checked (not run from a terminal)"));
+
+	const ttl = (name: string, fallback: number) => {
+		const value = Number(option(name));
+		return Number.isInteger(value) && value >= 0 ? value : fallback;
+	};
+	const [cache, max] = [ttl("default-cache-ttl", 600), ttl("max-cache-ttl", 7200)];
+	checks.push(cache > DAY || max > DAY
+		? warn(`GPG stays unlocked too long (default-cache-ttl ${cache}s, max-cache-ttl ${max}s)`, `set default-cache-ttl 3600 and max-cache-ttl 28800 in ${tilde(conf)}, then gpgconf --kill gpg-agent`)
+		: ok(`GPG unlock lasts ${cache}s after use, at most ${max}s`));
+	return checks;
+}
+
+function clipboardCheck(): Check {
+	try {
+		return ok(`clipboard: ${clipboard().write[0]}`);
+	} catch {
+		const fix = process.platform === "darwin" ? "pbcopy ships with macOS" : process.env.WAYLAND_DISPLAY ? "sudo apt install wl-clipboard" : "sudo apt install xclip";
+		return warn("no clipboard tool, so copy and --copy will not work (optional)", fix);
+	}
+}
+
+function folderChecks(): Check[] {
+	const checks: Check[] = [];
+	const folder = basename(process.cwd());
+	const prefix = /^[\w.-]+$/.test(folder) ? folder.toLowerCase() : "<project>";
+	const plaintext = readdirSync(".").filter((name) => /^(\.env(\..+)?|\.dev\.vars(\..+)?)$/.test(name)
+		&& name !== DEFAULT_FILE && !/\.(example|sample|template|dist)$/.test(name)
+		&& lstatSync(name).isFile()).sort();
+	for (const name of plaintext) {
+		try {
+			const { items } = planImport(parseDotenv(readText(name, name), name), "x", new Set());
+			const secrets = items.filter((item) => item.action === "store").length;
+			checks.push(secrets
+				? warn(`${name} holds ${secrets} plaintext ${secrets === 1 ? "value" : "values"} that may be secret`, `pass-env import ${name} --prefix ${prefix} --dry-run`)
+				: ok(`${name} holds no secret-looking values`));
+		} catch {
+			checks.push(warn(`${name} could not be read as a dotenv file`, `check ${name} by hand`));
+		}
+	}
+	if (!plaintext.length) checks.push(ok("no plaintext .env files in this folder"));
+	const rule = gitIgnoreRule(resolve(DEFAULT_FILE));
+	if (rule) checks.push(warn(`git ignores ${DEFAULT_FILE} (${rule}), so it will not be committed`, "echo '!.env.pass' >> .gitignore"));
+	return checks;
+}
+
+function claudeCheck(): Check[] {
+	const home = process.env.HOME;
+	if (!home || !existsSync(join(home, ".claude"))) return [];
+	let deny: unknown;
+	try { deny = JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8"))?.permissions?.deny; } catch { /* Missing or invalid. */ }
+	const covered = Array.isArray(deny) && deny.some((rule) => typeof rule === "string" && /^Read\(.*\.env/.test(rule));
+	return [covered ? ok("Claude Code is denied reading .env files") : warn("Claude Code may read .env files (hint)",
+		`add to "permissions": { "deny": [...] } in ~/.claude/settings.json: "Read(**/.env)", "Read(**/.env.*)", "Read(**/.dev.vars)"`)];
+}
+
+function doctor(): number {
+	const checks = [...toolChecks(), ...storeChecks(), ...gpgChecks(), clipboardCheck(), ...folderChecks(), ...claudeCheck()];
+	for (const check of checks) {
+		console.log(`${check.status.padEnd(4)}  ${check.text}`);
+		if (check.fix) console.log(`      fix: ${check.fix}`);
+	}
+	const count = (status: Check["status"]) => checks.filter((check) => check.status === status).length;
+	console.log(`\n${count("FAIL")} failed, ${count("warn")} ${count("warn") === 1 ? "warning" : "warnings"}, ${count("ok")} ok.`);
+	return count("FAIL") ? 1 : 0;
+}
+
 async function main(args: string[]): Promise<number> {
 	const options = parseArgs(args);
 	if (options.command === "help") {
 		console.log(usage());
 		return 0;
 	}
+	if (options.command === "doctor") return doctor();
 	const root = storePath();
 	switch (options.command) {
 		case "list": {
@@ -544,10 +974,11 @@ async function main(args: string[]): Promise<number> {
 			if (missing) console.error(`${missing} missing; add with: pass-env set <entry>  or  pass-env generate <entry>`);
 			return missing ? 1 : 0;
 		}
-		case "set":
-			await setEntry(root, options.entry, options.force);
-			console.log(`Stored ${options.entry}.`);
+		case "set": {
+			const lines = await setEntry(root, options.entry, options.force);
+			console.log(lines > 1 ? `Stored ${options.entry} exactly as piped (${lines} lines); map it with multiline:${options.entry}.` : `Stored ${options.entry}.`);
 			return 0;
+		}
 		case "generate": {
 			const board = options.copy ? clipboard() : undefined;
 			const secret = randomSecret(options.length, options.charset);
@@ -571,6 +1002,8 @@ async function main(args: string[]): Promise<number> {
 			console.log(`Copied ${options.entry} to the clipboard; it clears in ${seconds}s.`);
 			return 0;
 		}
+		case "import":
+			return options.remove ? removeImported(root, options) : importFile(root, options);
 		case "unlock": {
 			const entry = await unlock(root, options.entry);
 			console.log(`Unlocked (checked with ${entry}). Runs can decrypt until GPG's cache expires.`);
