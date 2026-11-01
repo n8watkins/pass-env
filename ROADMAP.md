@@ -21,8 +21,13 @@ Each step keeps the existing rule: pass-env never prints a secret value.
 - A line that is not `NAME=value`, or a quote that is never closed, stops the import with the line number, instead of being ignored as dotenv does.
 - `--remove` also requires that `.env.pass` maps each name to `<prefix>/<NAME>`, so removing a line can never leave the app without the variable.
 - `--remove` cannot be combined with `--dry-run` or `--force`.
+- From the audit of real projects: placeholders are skipped, secret-looking public names get a warning, files committed to git are refused, `--map NAME=entry` points a name at a shared entry, and an existing entry with the same value is reused without `--force`.
+  The same-value check needs GPG unlocked; while locked, an existing entry still needs `--force`, and `--dry-run` never decrypts, so it only says the entry exists.
+- `doctor` reports file permissions and "neither committed nor ignored" only for dotenv files that hold secret-looking values, so a plain `.env` of public defaults stays quiet.
 
 ## Next
+
+Nothing from the audit of real projects was skipped.
 
 1. **Publish the first release.**
    The owner pushes a tag (`git tag v1.1.0 && git push origin v1.1.0`); the workflow does the rest.

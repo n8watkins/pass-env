@@ -90,6 +90,7 @@ Options:
 - `run -f file` or `run -e NAME=entry` uses other mappings instead of `./.env.pass`.
 - `--dry-run` on `import` shows the plan, names only.
 - `--skip NAME,NAME` on `import` leaves those names in the file, and `--force` replaces existing entries.
+- `--map NAME=entry` on `import` (repeatable) stores a name in an existing or shared entry, such as `--map GEMINI_API_KEY=shared/GEMINI_API_KEY`.
 
 An **entry** is just a name you choose, like `myapp/STRIPE_SECRET_KEY`.
 Names are visible file names, so never put a secret in a name.
@@ -267,7 +268,13 @@ Plan for .env.local (dry run, nothing stored or changed):
 
 Everything is stored except names that are public by design (`NEXT_PUBLIC_*`, `VITE_*`, `PUBLIC_*`, `EXPO_PUBLIC_*`, `REACT_APP_*`).
 Empty values and values that use `$OTHER` or `${OTHER}` are skipped, and so is an unquoted value containing `#` (dotenv would cut it there; quote it and re-run).
+Placeholders are skipped too: values containing `your`, `xxx`, `changeme`, `example`, `placeholder` or `replace`, and values equal to the same name in a `.env.example` or `.env.sample` next to the file.
 Add `--skip NAME,NAME` to leave other names in the file.
+
+A public name that looks like a secret, such as `NEXT_PUBLIC_GEMINI_API_KEY`, gets a warning and is not stored.
+Anything with a public prefix is built into the browser bundle, so if it holds a real key, rotate it, delete the line, and use the key only on the server under a name without the prefix.
+
+A file that is committed to git (a shared `.env` with defaults, say) is refused: deploys and teammates use it, so it is not a local secret file.
 
 **2. Store the secrets.**
 
@@ -276,7 +283,9 @@ pass-env import .env.local --prefix myapp
 ```
 
 This stores each secret as `myapp/<NAME>` and adds the mappings to `.env.pass` next to the file.
-It stops before storing anything if an entry already exists (add `--force` to replace) or if `.env.pass` already maps a name somewhere else.
+It stops before storing anything if `.env.pass` already maps a name somewhere else, or if an entry already exists with a different value (add `--force` to replace it).
+An existing entry with the same value is simply reused, which needs GPG unlocked to compare.
+So you can import `.env.local` and then `.dev.vars` from the same folder, and point a key several projects share at one entry with `--map GEMINI_API_KEY=shared/GEMINI_API_KEY`.
 It warns if git ignores `.env.pass` and prints the line to add to `.gitignore`.
 `.env.local` is not changed.
 
@@ -299,7 +308,7 @@ Only if every value matches, it rewrites the file without those lines, keeping c
 If nothing but comments is left, it deletes the file.
 There is no backup copy on purpose: it would be one more plaintext copy of your secrets.
 
-For Cloudflare Workers, Wrangler ignores environment variables while `.dev.vars` exists.
+For Cloudflare Workers, `wrangler dev`, the Cloudflare Vite plugin and OpenNext's `next dev` ignore environment variables while `.dev.vars` exists.
 Move any values left in it into `vars` in `wrangler.jsonc`, delete it, and start Wrangler with `CLOUDFLARE_INCLUDE_PROCESS_ENV=true pass-env run -- npx wrangler dev`.
 
 An agent can run all of this.
@@ -309,7 +318,8 @@ Values go from the file into pass without being printed, and `--remove` only wor
 
 Start with `pass-env doctor`.
 It checks that `pass`, `gpg` and Bun are installed, that the store exists (and on WSL is not under `/mnt/c`), that this machine has the private key for the store's `.gpg-id`, the passphrase prompt (`pinentry-curses` on WSL), `GPG_TTY`, GPG's cache times and the clipboard.
-In the current folder it looks for plaintext `.env` files that hold secrets and for a `.env.pass` that git ignores.
+In the current folder it looks for plaintext `.env` files that hold secrets, and warns if such a file can be read by other users (fix: `chmod 600`), is committed to git, or is neither committed nor ignored (so `git add .` would commit it).
+It also warns about secret-looking public names such as `NEXT_PUBLIC_GEMINI_API_KEY`, and about a `.env.pass` that git ignores.
 If you use Claude Code, it also checks that `~/.claude/settings.json` blocks reading `.env` files.
 It decrypts nothing and exits with 1 if any check failed.
 
@@ -328,13 +338,14 @@ Errors are one line, start with a code, and never include secret values or GPG o
 | `MISMATCH` | `import --remove` found a stored value that differs from the file, so it removed nothing |
 | `CONFLICT` | `import` found a name that `.env.pass` already maps to another entry |
 | `PARSE` | `import` could not read a line of the file (the line number is given) |
+| `TRACKED` | `import` was given a file committed to git; it only moves local secret files |
 | `REFERENCE_FILE`, `WRITE` | A file could not be read, or could not be rewritten |
 | `USAGE`, `STORE`, `PASS_MISSING` | Wrong arguments, no store yet (`pass init`), or `pass` not installed |
 
 ## Tests
 
 ```sh
-bun test           # 42 tests with a fake pass, gpg and clipboard, including a real-terminal Ctrl-C test
+bun test           # 46 tests with a fake pass, gpg and clipboard, including a real-terminal Ctrl-C test
 ./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder, including import and --remove
 ```
 

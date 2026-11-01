@@ -30,7 +30,8 @@ The first commit in this repository is that file unchanged.
 - `unlock [entry]`: one place to type the GPG passphrase; refuses without a terminal so an agent cannot trigger a prompt.
 - `check`: report each mapping as ok or missing without decrypting.
 - `import <file> --prefix <prefix>`: move the secrets in a `.env` file into pass and write `.env.pass`, in two steps. `--dry-run` shows the plan (names only); `--remove` deletes the imported lines only after every stored value matches the file.
-- `doctor`: check pass, GPG, the store, the passphrase prompt, cache times, the clipboard and the current folder, without decrypting.
+  It skips placeholders, warns about secrets under public names such as `NEXT_PUBLIC_GEMINI_API_KEY`, refuses files committed to git, and with `--map NAME=entry` can point a name at a shared entry; an existing entry with the same value is reused without `--force`.
+- `doctor`: check pass, GPG, the store, the passphrase prompt, cache times, the clipboard and the current folder (plaintext secrets, file permissions, git status), without decrypting.
 - Standalone binaries for Linux and macOS (x64 and arm64), built with `bun build --compile` by a release workflow on each `v*` tag. CI runs the tests and the e2e walk-through against a compiled binary.
 - `run` and `check` default to `./.env.pass`.
 - Errors name a cause (`LOCKED`, `ENTRY`, `DECRYPT` for a missing key) by classifying GPG's stderr, which is still never printed.
