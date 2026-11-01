@@ -2,6 +2,10 @@
 
 Use secrets from [`pass`](https://www.passwordstore.org/) in your apps, your deploys and your AI coding agents, without the secrets ever showing up in files, terminals or chat transcripts.
 
+> **Created by Phaedrus Raznikov ([@moomooskycow](https://github.com/moomooskycow)) at [Misty Step](https://github.com/misty-step).**
+> pass-env started as part of his agent toolkit, [mistystack](https://github.com/misty-step/mistystack) (MIT).
+> This fork, maintained by [Nathan Watkins](https://github.com/n8watkins), adds import, generate, doctor and other commands, and fixes three bugs; see [CHANGES.md](CHANGES.md).
+
 ```sh
 pass-env set myapp/STRIPE_SECRET_KEY                      # paste the key once, it gets encrypted
 echo 'STRIPE_SECRET_KEY=myapp/STRIPE_SECRET_KEY' >> .env.pass

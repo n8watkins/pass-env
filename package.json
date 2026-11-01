@@ -4,13 +4,46 @@
   "description": "Run programs with secrets from pass, without the secrets landing in files, terminals or AI agent transcripts.",
   "license": "MIT",
   "type": "module",
-  "bin": { "pass-env": "./pass-env.ts" },
-  "files": ["pass-env.ts", "README.md", "LICENSE", "CHANGES.md"],
-  "engines": { "bun": ">=1.2" },
-  "os": ["linux", "darwin"],
-  "keywords": ["pass", "password-store", "gpg", "secrets", "dotenv", "env", "ai-agents"],
-  "scripts": { "test": "bun test", "e2e": "./demo/e2e.sh" },
+  "bin": {
+    "pass-env": "./pass-env.ts"
+  },
+  "files": [
+    "pass-env.ts",
+    "README.md",
+    "LICENSE",
+    "CHANGES.md"
+  ],
+  "engines": {
+    "bun": ">=1.2"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "keywords": [
+    "pass",
+    "password-store",
+    "gpg",
+    "secrets",
+    "dotenv",
+    "env",
+    "ai-agents"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "e2e": "./demo/e2e.sh"
+  },
   "homepage": "https://github.com/n8watkins/pass-env#readme",
-  "bugs": { "url": "https://github.com/n8watkins/pass-env/issues" },
-  "repository": { "type": "git", "url": "git+https://github.com/n8watkins/pass-env.git" }
+  "bugs": {
+    "url": "https://github.com/n8watkins/pass-env/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/n8watkins/pass-env.git"
+  },
+  "author": "Phaedrus Raznikov (Misty Step), forked and maintained by Nathan Watkins",
+  "contributors": [
+    "Phaedrus Raznikov (https://github.com/moomooskycow)",
+    "Nathan Watkins (https://github.com/n8watkins)"
+  ]
 }
