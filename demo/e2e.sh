@@ -92,5 +92,37 @@ cat .env.local
 expect "secrets gone from .env.local" "$(grep -c synthetic .env.local)" 0
 expect "public and skipped lines kept" "$(grep -c -e NEXT_PUBLIC_SITE_URL -e DIRECT_URL .env.local)" 2
 
+step "scrub: count the secrets agents saved in their logs (fake logs in a temp HOME); counts only"
+home="$work/home"
+log="$home/.claude/projects/-demo/session.jsonl"
+rollout="$home/.codex/sessions/2026/11/01/rollout.jsonl"
+mkdir -p "$(dirname "$log")" "$(dirname "$rollout")"
+body=$(printf 'Ab3dE5gH7j%.0s' 1 2 3 4)
+ghtoken="gh""p_${body:0:36}" # split so no token-shaped text is committed
+printf '{"type":"user","message":{"content":"my token is %s"}}\n' "$ghtoken" > "$log"
+printf '{"type":"tool","output":"STRIPE_SECRET_KEY=sk_test_synthetic\\nDB_PASSWORD=Zk3mQ9pL2xV7nR4t"}\n' >> "$log"
+printf '{"type":"assistant","text":"nothing secret here"}\n' >> "$log"
+touch -d '1 hour ago' "$log"
+printf '{"text":"%s"}\n' "$ghtoken" > "$rollout" # just written: an active session
+secrets_in() { grep -c -e "$ghtoken" -e Zk3mQ9pL2xV7nR4t -e sk_test_synthetic "$@"; }
+out=$(HOME="$home" pe scrub); code=$?; printf '%s\n' "$out"
+expect "dry run exits 1 when it finds something" "$code" 1
+expect "dry run prints no secret" "$(printf '%s' "$out" | secrets_in)" 0
+expect "dry run changes nothing" "$(secrets_in "$log")" 2
+step "scrub --known while locked refuses"
+gpgconf --kill gpg-agent
+HOME="$home" pe scrub --known; expect "scrub --known while locked exits 1" "$?" 1
+step "after unlock, --known also finds stored values no pattern knows (sk_test_synthetic is too short for the Stripe pattern)"
+gpg --batch -q --pinentry-mode loopback --passphrase demo-pass -d "$PASSWORD_STORE_DIR/app/STRIPE_SECRET_KEY.gpg" >/dev/null 2>&1 && echo unlocked
+out=$(HOME="$home" pe scrub --known); printf '%s\n' "$out"
+expect "the stored Stripe value is found" "$(printf '%s' "$out" | grep -c 'session.jsonl: .*known-value 1')" 1
+expect "--known prints no secret" "$(printf '%s' "$out" | secrets_in)" 0
+step "scrub --fix rewrites the old log and skips the active one"
+HOME="$home" pe scrub --known --fix; expect "fix exit" "$?" 0
+cat "$log"
+expect "secrets gone from the log" "$(secrets_in "$log")" 0
+expect "every line is still JSON" "$(bun -e 'for (const line of require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n")) JSON.parse(line); console.log("valid")' "$log")" valid
+expect "the active file is untouched" "$(secrets_in "$rollout")" 1
+
 step "result"
 if [ "$failures" -eq 0 ]; then echo "all checks passed"; else echo "$failures checks failed"; exit 1; fi

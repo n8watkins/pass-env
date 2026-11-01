@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -436,7 +436,7 @@ describe("unlock and list", () => {
 	test("help lists every command", () => {
 		const files = fixture();
 		const out = invoke(files, ["help"]).stdout;
-		for (const command of ["run", "pipe", "copy", "check", "set", "generate", "unlock", "list", "import", "doctor"]) expect(out).toContain(`pass-env ${command}`);
+		for (const command of ["run", "pipe", "copy", "check", "set", "generate", "unlock", "list", "import", "scrub", "doctor"]) expect(out).toContain(`pass-env ${command}`);
 	});
 });
 
@@ -847,5 +847,180 @@ describe("doctor env drift", () => {
 
 		const bare = project({ "index.js": "process.env.ANYTHING;" });
 		expect(doctorOut(bare)).not.toContain("env vars");
+	});
+});
+
+describe("scrub", () => {
+	// Built at runtime so no realistic-looking key is ever committed to this repo.
+	const body = "Ab3dE5gH7jK9mN1pQ3sT5vW7xY9zA1bC3dE5fG7h";
+	const pem = `-----BEGIN ${"PRIVATE"} KEY-----\n${"MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ".repeat(2)}\nQ2xpZW50IGtleQ==\n-----END PRIVATE KEY-----`;
+	const samples: Record<string, string> = {
+		"aws-access-key": `${"AK"}IAQ3XAMPL7ZZ9W2XY4`,
+		"github-token": `${"gh"}p_${body.slice(0, 36)}`,
+		"anthropic-key": `${"sk"}-ant-api03-${body}`,
+		"openai-key": `${"sk"}-proj-${body}`,
+		"stripe-key": `${"sk"}_live_${body.slice(0, 24)}`,
+		"stripe-webhook-secret": `${"wh"}sec_${body.slice(0, 32)}`,
+		"slack-token": `${"xo"}xb-123456789012-1234567890123-${body.slice(0, 24)}`,
+		"google-api-key": `${"AI"}za${body.slice(0, 35)}`,
+		"resend-key": `${"re"}_${body.slice(0, 8)}_${body.slice(8, 32)}`,
+		jwt: `${"ey"}JhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U`,
+	};
+	const contexts: Record<string, [string, string]> = {
+		"bearer-token": ["curl -H 'Authorization: Bearer ", "Zk3mQ9pL2xV7nR4tY8wB1cD6'"],
+		"secret-assignment": ["DB_PASSWORD=", "Zk3mQ9pL2xV7nR4t"],
+	};
+	const secretTexts = [...Object.values(samples), pem.split("\n")[1], "Zk3mQ9pL2xV7nR4t"];
+	// Things that look close but are not secrets, and must not be touched.
+	const decoys = [
+		"risk-assessment-framework-docs-version-two", "const apiKey = process.env.OPENAI_API_KEY_2;", 'if (pem.startsWith("-----BEGIN PRIVATE KEY-----")) {',
+		"password=your-password-12345", "token: ${API_TOKEN_2}", "secret_file=/etc/app/secret2.txt", "Bearer authentication_middleware_layer",
+		"re_render_component_after_update_x", "sk-short", `${"AK"}IAlowercase0123456789`, "task-dispatcher-for-background-jobs-queue", "max_tokens: 123456789012345",
+	];
+	const old = (path: string) => utimesSync(path, new Date(Date.now() - 3600_000), new Date(Date.now() - 3600_000));
+	const session = (fx: Fixture, lines: string[], name = ".claude/projects/-home-me-app/session.jsonl") => {
+		const path = join(fx.root, name);
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, `${lines.join("\n")}\n`);
+		old(path);
+		return path;
+	};
+	const noSecrets = (text: string) => {
+		for (const secret of secretTexts) expect(text).not.toContain(secret);
+	};
+
+	test("finds every kind, also JSON-escaped and inside escaped JSON, and prints only counts", () => {
+		const fx = fixture({});
+		const lines = [
+			...Object.values(samples).map((secret) => JSON.stringify({ type: "user", message: { content: `here:\n${secret} and more` } })),
+			...Object.values(contexts).map(([before, secret]) => JSON.stringify({ type: "tool", output: `${before}${secret}` })),
+			JSON.stringify({ type: "tool", output: `cat key.pem\n${pem}\n` }),
+			JSON.stringify({ text: JSON.stringify({ config: JSON.stringify({ private_key: pem }) }) }),
+		];
+		session(fx, lines);
+		session(fx, [JSON.stringify({ display: `export STRIPE_SECRET_KEY=${samples["stripe-key"]}` })], ".claude/history.jsonl");
+		const result = invoke(fx, ["scrub"]);
+		expect(result.status).toBe(1);
+		noSecrets(result.stdout + result.stderr);
+		const kinds = Object.keys({ ...samples, ...contexts }).sort().map((kind) => `${kind} 1`);
+		const projectLine = result.stdout.split("\n").find((line) => line.startsWith("~/.claude/projects/"))!;
+		expect(projectLine).toBe(`~/.claude/projects/-home-me-app/session.jsonl: ${[...kinds, "private-key 2"].sort().join(", ")}`);
+		expect(result.stdout).toContain("~/.claude/history.jsonl: stripe-key 1\n");
+		expect(result.stdout).toContain("Found 15 suspected secrets in 2 files");
+		expect(result.stdout).toContain("Nothing was changed. To replace them with [REDACTED:<kind>]: pass-env scrub --fix");
+	});
+
+	test("lookalikes do not match, and a clean scan exits 0", () => {
+		const fx = fixture({});
+		const path = session(fx, decoys.map((text) => JSON.stringify({ type: "assistant", text })));
+		session(fx, [JSON.stringify({ usage: { input_tokens: 123456, output_tokens: 99 } })], ".codex/sessions/2026/11/01/rollout.jsonl");
+		const before = readFileSync(path, "utf8");
+		const result = invoke(fx, ["scrub"]);
+		expect(result.stdout).toContain("Scanned 2 files");
+		expect(result.stdout).toContain("No suspected secrets found.");
+		expect(result.status).toBe(0);
+		expect(invoke(fx, ["scrub", "--fix"]).status).toBe(0);
+		expect(readFileSync(path, "utf8")).toBe(before);
+	});
+
+	test("--fix redacts in place, keeps JSONL valid, mode and times, and leaves a line it cannot fix", () => {
+		const fx = fixture({});
+		// A PEM BEGIN in one JSON field and END in another: redacting would break the line.
+		const broken = JSON.stringify({ a: pem.split("-----END")[0], list: ["x", "-----END PRIVATE KEY-----"] });
+		const lines = [JSON.stringify({ text: `token ${samples["github-token"]}` }), broken, JSON.stringify({ text: `cat\n${pem}` }), "not json DB_PASSWORD=Zk3mQ9pL2xV7nR4t"];
+		const path = session(fx, lines);
+		chmodSync(path, 0o600);
+		old(path);
+		const mtime = statSync(path).mtimeMs;
+		const result = invoke(fx, ["scrub", "--fix"]);
+		expect(result.status).toBe(0);
+		noSecrets(result.stdout + result.stderr);
+		expect(result.stdout).toContain("session.jsonl: redacted github-token 1, private-key 1, secret-assignment 1; 1 line left as is (would not stay valid JSON)");
+		expect(result.stdout).toContain("Left 1 line as it was: redacting would have broken its JSON.");
+		expect(result.stdout).toContain("There are no backups");
+		const after = readFileSync(path, "utf8").split("\n");
+		expect(after[0]).toBe(JSON.stringify({ text: "token [REDACTED:github-token]" }));
+		expect(after[1]).toBe(broken);
+		expect(after[2]).toBe(JSON.stringify({ text: "cat\n[REDACTED:private-key]" }));
+		expect(after[3]).toBe("not json DB_PASSWORD=[REDACTED:secret-assignment]");
+		expect(after[4]).toBe("");
+		for (const line of after.slice(0, 3)) expect(() => JSON.parse(line)).not.toThrow();
+		expect(statSync(path).mode & 0o777).toBe(0o600);
+		expect(statSync(path).mtimeMs).toBe(mtime);
+		expect(readFileSync(path, "utf8")).not.toContain(".pass-env-");
+		// Running again finds only the line it could not fix.
+		const again = invoke(fx, ["scrub"]);
+		expect(again.stdout).toContain("session.jsonl: private-key 1\n");
+		expect(again.status).toBe(1);
+	});
+
+	test("skips files changed in the last 10 minutes unless --include-active", () => {
+		const fx = fixture({});
+		const path = session(fx, [JSON.stringify({ text: samples["openai-key"] })]);
+		utimesSync(path, new Date(), new Date());
+		const dry = invoke(fx, ["scrub"]);
+		expect(dry.stdout).toContain("session.jsonl: openai-key 1 (in use: --fix skips it)");
+		const fix = invoke(fx, ["scrub", "--fix"]);
+		expect(fix.status).toBe(0);
+		expect(fix.stdout).toContain("Skipped 1 file changed in the last 10 minutes");
+		expect(fix.stdout).toContain("--include-active");
+		expect(readFileSync(path, "utf8")).toContain(samples["openai-key"]);
+		expect(invoke(fx, ["scrub", "--fix", "--include-active"]).stdout).toContain("redacted openai-key 1");
+		expect(readFileSync(path, "utf8")).toBe(`${JSON.stringify({ text: "[REDACTED:openai-key]" })}\n`);
+	});
+
+	test("--path adds files and folders, joins a raw PEM block over lines, and skips binary files", () => {
+		const fx = fixture({});
+		const outside = join(fx.root, "elsewhere");
+		mkdirSync(join(outside, "deep"), { recursive: true });
+		writeFileSync(join(outside, "deep", "notes.txt"), `before\n${pem}\nafter`);
+		writeFileSync(join(outside, "image.bin"), new Uint8Array([0, 1, 2, 0xff]));
+		const single = join(fx.root, "one.log");
+		writeFileSync(single, `${samples.jwt}\r\n`);
+		for (const path of [join(outside, "deep", "notes.txt"), join(outside, "image.bin"), single]) old(path);
+		const result = invoke(fx, ["scrub", "--path", "elsewhere", "--path", "one.log"]);
+		expect(result.status).toBe(1);
+		expect(result.stdout).toContain("elsewhere/deep/notes.txt: private-key 1");
+		expect(result.stdout).toContain("one.log: jwt 1");
+		expect(result.stdout).toContain("Skipped 1 file that is not UTF-8 text or could not be read.");
+		expect(result.stdout).toContain("pass-env scrub --fix --path elsewhere --path one.log");
+		expect(invoke(fx, ["scrub", "--fix", "--path", "elsewhere", "--path", "one.log"]).status).toBe(0);
+		expect(readFileSync(join(outside, "deep", "notes.txt"), "utf8")).toBe("before\n[REDACTED:private-key]\nafter");
+		expect(readFileSync(single, "utf8")).toBe("[REDACTED:jwt]\r\n");
+	});
+
+	test("--known finds exact store values no pattern knows, raw and JSON-escaped; it needs GPG unlocked", () => {
+		const custom = 'plain"words\\no-pattern-knows';
+		const fx = fixture({ "app/CUSTOM": `${custom}\nuser: me\n`, "app/SHORT": "tiny-value\n", nokey: "x" });
+		const path = session(fx, [JSON.stringify({ text: `value is ${custom} here` }), "raw tiny-value", JSON.stringify({ text: "nothing" })]);
+		writeFileSync(join(fx.root, "raw.txt"), `copy: ${custom}\n`);
+		old(join(fx.root, "raw.txt"));
+		expect(invoke(fx, ["scrub"]).status).toBe(0);
+		const result = invoke(fx, ["scrub", "--known", "--path", "raw.txt"]);
+		expect(result.status).toBe(1);
+		expect(result.stdout + result.stderr).not.toContain("no-pattern-knows");
+		expect(result.stdout).toContain("session.jsonl: known-value 1");
+		expect(result.stdout).toContain("raw.txt: known-value 1");
+		expect(result.stderr).toBe("warning: could not decrypt nokey, so their values were not looked for\n");
+		expect(invoke(fx, ["scrub", "--known", "--fix", "--path", "raw.txt"]).status).toBe(0);
+		expect(readFileSync(path, "utf8")).toBe(`${JSON.stringify({ text: "value is [REDACTED:known-value] here" })}\nraw tiny-value\n${JSON.stringify({ text: "nothing" })}\n`);
+		expect(readFileSync(join(fx.root, "raw.txt"), "utf8")).toBe("copy: [REDACTED:known-value]\n");
+
+		fx.env.TEST_PASS_LOCKED = "1";
+		const locked = invoke(fx, ["scrub", "--known"]);
+		expect(locked.status).toBe(1);
+		expect(locked.stderr).toStartWith("LOCKED:");
+		expect(locked.stderr).toContain("pass-env unlock");
+		expect(locked.stdout).toBe("");
+	});
+
+	test("usage errors exit 2, and no logs at all is fine", () => {
+		const fx = fixture({});
+		for (const args of [["scrub", "--include-active"], ["scrub", "--path"], ["scrub", "--path", "missing"], ["scrub", "--bogus"]]) {
+			expect(invoke(fx, args).status).toBe(2);
+		}
+		const none = invoke(fx, ["scrub"]);
+		expect(none.status).toBe(0);
+		expect(none.stdout).toContain("No agent logs found");
 	});
 });

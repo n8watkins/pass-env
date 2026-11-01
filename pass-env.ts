@@ -4,7 +4,8 @@
 
 import { spawn } from "node:child_process";
 import {
-	appendFileSync, chmodSync, existsSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
+	appendFileSync, chmodSync, closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync,
+	statSync, unlinkSync, utimesSync, writeFileSync, writeSync, type Stats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
@@ -28,7 +29,9 @@ type Options =
 	| { command: "pipe"; entry: string; multiline: boolean; argv: string[] }
 	| { command: "unlock"; entry?: string }
 	| ImportOptions
+	| ScrubOptions
 	| { command: "doctor" };
+type ScrubOptions = { command: "scrub"; paths: string[]; known: boolean; fix: boolean; includeActive: boolean };
 type ImportOptions = {
 	command: "import"; file: string; prefix: string; skip: Set<string>; map: Map<string, string>; dryRun: boolean; force: boolean; remove: boolean;
 };
@@ -78,6 +81,17 @@ Move an existing .env file into pass
   pass-env import <file> --prefix <prefix> [--skip ...] [--map ...] --remove
       After testing with run: check every stored value against the file,
       then delete those lines from it. Needs GPG unlocked.
+
+Clean up keys agents already saw
+  pass-env scrub [--path <file-or-folder>]... [--known]
+      Coding agents keep chat logs (~/.claude, ~/.codex, ~/.pi, ~/.omp) with
+      everything they saw. Count the secrets in them per file, by kind.
+      Never prints them. Exits 1 if any are found. --known also finds the
+      exact values in your store, even ones no pattern knows (needs unlock).
+  pass-env scrub --fix [--include-active] [--path ...]... [--known]
+      Replace each one with [REDACTED:<kind>] in place. JSONL lines stay
+      valid. Skips files changed in the last 10 minutes (an agent may be
+      writing them) unless --include-active. No backups, on purpose.
 
 Check and set up
   pass-env doctor
@@ -247,6 +261,8 @@ function parseArgs(args: string[]): Options {
 		}
 		case "import":
 			return parseImport(rest);
+		case "scrub":
+			return parseScrub(rest);
 		case "doctor":
 			if (rest.length) throw new CliError("USAGE", "expected doctor", 2);
 			return { command: "doctor" };
@@ -276,6 +292,23 @@ function parseImport(args: string[]): ImportOptions {
 	}
 	if (!options.file || !options.prefix) throw new CliError("USAGE", expected, 2);
 	if (options.remove && (options.dryRun || options.force)) throw new CliError("USAGE", "--remove cannot be combined with --dry-run or --force", 2);
+	return options;
+}
+
+function parseScrub(args: string[]): ScrubOptions {
+	const options: ScrubOptions = { command: "scrub", paths: [], known: false, fix: false, includeActive: false };
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index];
+		if (arg === "--known") options.known = true;
+		else if (arg === "--fix") options.fix = true;
+		else if (arg === "--include-active") options.includeActive = true;
+		else if (arg === "--path") {
+			const value = args[++index];
+			if (!value) throw new CliError("USAGE", "--path requires a file or folder", 2);
+			options.paths.push(value);
+		} else throw new CliError("USAGE", "expected scrub [--path <file-or-folder>]... [--known] [--fix [--include-active]]", 2);
+	}
+	if (options.includeActive && !options.fix) throw new CliError("USAGE", "--include-active only applies to --fix (a dry run already reads every file)", 2);
 	return options;
 }
 
@@ -1193,6 +1226,333 @@ function doctor(): number {
 	return count("FAIL") ? 1 : 0;
 }
 
+// scrub: find and blank out secrets that coding agents already saved in
+// their chat logs. Where each agent keeps its transcripts, relative to HOME:
+// Claude Code (projects/**/*.jsonl, history.jsonl), Codex (sessions,
+// archived_sessions, history.jsonl) and pi and its fork OMP (agent/sessions).
+const AGENT_LOGS = [
+	".claude/projects", ".claude/history.jsonl",
+	".codex/sessions", ".codex/archived_sessions", ".codex/history.jsonl",
+	".pi/agent/sessions", ".omp/agent/sessions",
+];
+const ACTIVE_MS = 10 * 60_000;
+const CHUNK = 1 << 20;
+// A raw PEM block over several lines is joined before matching, up to this many lines.
+const PEM_MAX_LINES = 200;
+
+// Each regex has two groups: text to keep, then the secret to replace.
+// Adapted from Phaedrus Raznikov's redactor in misty-step/mistystack
+// (agent-config/system-one/redaction.ts, MIT), with more providers, stricter
+// lengths and checks against false positives, and JSON-escaped text in mind:
+// in a JSONL log a newline is the two characters \n, so a token can follow
+// "\n" and a PEM block is a single line.
+// hint: a literal the text must contain, a cheap test before the regex.
+type Pattern = { kind: string; regex: RegExp; check?: (secret: string) => boolean; boundary?: boolean; hint?: string };
+const SEP = String.raw`(?:\s|\\+[rn])+`;
+const PEM_KIND = String.raw`(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----`;
+// The marker, optional headers (Proc-Type: ...), then real base64, so code
+// that merely mentions "-----BEGIN PRIVATE KEY-----" does not match.
+const PEM_HEAD = String.raw`-----BEGIN ${PEM_KIND}${SEP}(?:[A-Za-z-]+: [^\n\\]*${SEP})*[A-Za-z0-9+/=]{40}`;
+const PEM_OPEN_LINE = new RegExp(String.raw`-----BEGIN ${PEM_KIND}\s*$`);
+const PEM_END = new RegExp(String.raw`-----END ${PEM_KIND}`);
+const hasDigitAndLetter = (value: string) => /[0-9]/.test(value) && /[A-Za-z]/.test(value);
+const mixedCase = (value: string) => /[0-9]/.test(value) && /[a-z]/.test(value) && /[A-Z]/.test(value);
+// A value after "token=" and the like that looks like a real secret rather than code.
+function plausibleSecret(value: string): boolean {
+	return hasDigitAndLetter(value) && !PLACEHOLDER.test(value)
+		&& !/^(?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*!?$/.test(value) // process.env.API_KEY, config.token2
+		&& !/^\$\{?[A-Za-z_]\w*\}?$/.test(value) // $API_KEY, ${API_KEY}
+		&& !/^(?:\.{0,2}\/|~\/)/.test(value); // file paths
+}
+// boundary: the token must not continue a word ("risk-assessment" is not "sk-..."),
+// except after an escaped \n, \r or \t. Checked outside the regex, which keeps
+// each regex starting with a literal and so fast on long lines.
+const pattern = (kind: string, source: string, options: Omit<Pattern, "kind" | "regex"> & { flags?: string } = {}): Pattern => (
+	{ ...options, kind, regex: new RegExp(source, options.flags ?? "g") }
+);
+const token = (kind: string, source: string, check?: Pattern["check"]) => pattern(kind, `()(${source})`, { check, boundary: true });
+const PATTERNS: Pattern[] = [
+	pattern("private-key", String.raw`()(${PEM_HEAD}[\s\S]*?-----END ${PEM_KIND})`, { hint: "-----BEGIN " }),
+	// No END marker (cut off): everything to the end of the string or line.
+	pattern("private-key", String.raw`()(${PEM_HEAD}(?:\\.|[^"\\])*)`, { hint: "-----BEGIN " }),
+	token("aws-access-key", String.raw`(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])`),
+	token("github-token", String.raw`gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}`),
+	token("anthropic-key", String.raw`sk-ant-[A-Za-z0-9_-]{32,}`, mixedCase),
+	token("openai-key", String.raw`sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}`, mixedCase),
+	token("stripe-key", String.raw`[sr]k_(?:live|test)_[A-Za-z0-9]{20,}`, mixedCase),
+	token("stripe-webhook-secret", String.raw`whsec_[A-Za-z0-9+/=]{24,}`, hasDigitAndLetter),
+	token("slack-token", String.raw`xox[abposr]-[A-Za-z0-9-]{10,}`, (value) => /[0-9]/.test(value)),
+	token("google-api-key", String.raw`AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])`),
+	token("resend-key", String.raw`re_[A-Za-z0-9]{8,}_[A-Za-z0-9]{16,}`, hasDigitAndLetter),
+	token("jwt", String.raw`eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`),
+	pattern("bearer-token", String.raw`([Bb]earer\s+)([A-Za-z0-9._~+/-]{20,}=*)`, { check: hasDigitAndLetter, boundary: true }),
+	// NAME=value, "name": "value", and the same inside JSON-escaped text. The
+	// match starts at the keyword, so STRIPE_ in STRIPE_SECRET_KEY stays as is.
+	pattern("secret-assignment", String.raw`((?:secret|token|password|passwd|api[_-]?key)[A-Za-z0-9_.-]{0,40}(?:\\*["'])?\s*[:=]\s*(?:\\*["'])?)([A-Za-z0-9_\-./+=~!@#$%^*]{12,})`, { check: plausibleSecret, flags: "gi" }),
+];
+
+const startsWord = (text: string, offset: number) => offset === 0 || !/[A-Za-z0-9]/.test(text[offset - 1]) || (offset > 1 && text[offset - 2] === "\\" && /[nrt]/.test(text[offset - 1]));
+
+// The exact values in the store, raw and as they appear inside JSON strings.
+function knownPattern(values: string[]): Pattern | undefined {
+	const variants = new Set<string>();
+	for (const value of values) {
+		variants.add(value);
+		variants.add(JSON.stringify(value).slice(1, -1));
+	}
+	if (!variants.size) return undefined;
+	const escaped = [...variants].sort((a, b) => b.length - a.length).map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+	return { kind: "known-value", regex: new RegExp(`()(${escaped.join("|")})`, "g") };
+}
+
+function redact(text: string, patterns: Pattern[], counts: Map<string, number>): string {
+	for (const { kind, regex, check, boundary, hint } of patterns) {
+		if (hint && !text.includes(hint)) continue;
+		text = text.replace(regex, (match: string, keep: string, secret: string, offset: number, whole: string) => {
+			if ((check && !check(secret)) || (boundary && !startsWord(whole, offset))) return match;
+			counts.set(kind, (counts.get(kind) ?? 0) + 1);
+			return `${keep}[REDACTED:${kind}]`;
+		});
+	}
+	return text;
+}
+
+const parsesAsJson = (text: string) => {
+	try {
+		JSON.parse(text);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+function addCounts(into: Map<string, number>, from: Map<string, number>): void {
+	for (const [kind, count] of from) into.set(kind, (into.get(kind) ?? 0) + count);
+}
+
+type Scanned = { counts: Map<string, number>; skippedLines: number };
+
+// Streams a file line by line, writing the redacted text to output if given.
+// Returns undefined for a file that is not UTF-8 text.
+function scanFile(path: string, patterns: Pattern[], output?: number): Scanned | undefined {
+	const result: Scanned = { counts: new Map(), skippedLines: 0 };
+	let pending: string[] = [];
+	let pendingSize = 0;
+	const write = (text: string) => {
+		if (output === undefined) return;
+		pending.push(text);
+		pendingSize += text.length;
+		if (pendingSize >= CHUNK) flush();
+	};
+	const flush = () => {
+		if (output !== undefined && pending.length) writeSync(output, pending.join(""));
+		pending = [];
+		pendingSize = 0;
+	};
+	const line = (text: string, newline: boolean) => {
+		const counts = new Map<string, number>();
+		const changed = redact(text, patterns, counts);
+		// A replacement that would break a JSONL line leaves that line as it was.
+		if (counts.size && output !== undefined && parsesAsJson(text) && !parsesAsJson(changed)) {
+			result.skippedLines += 1;
+			write(newline ? `${text}\n` : text);
+			return;
+		}
+		addCounts(result.counts, counts);
+		write(newline ? `${changed}\n` : changed);
+	};
+	// Lines of a raw (not JSON-escaped) PEM block, from its BEGIN line.
+	let block: string[] = [];
+	const endBlock = (newline: boolean, complete: boolean) => {
+		const lines = block;
+		block = [];
+		if (complete) line(lines.join("\n"), newline);
+		else lines.forEach((text, index) => line(text, index < lines.length - 1 || newline));
+	};
+	const handle = (text: string, newline: boolean) => {
+		if (!block.length && !PEM_OPEN_LINE.test(text)) return line(text, newline);
+		block.push(text);
+		if (block.length > 1 && PEM_END.test(text)) endBlock(newline, true);
+		else if (block.length >= PEM_MAX_LINES || !newline) endBlock(newline, false);
+	};
+	const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+	const buffer = Buffer.allocUnsafe(CHUNK);
+	const input = openSync(path, "r");
+	let partial: string[] = [];
+	try {
+		for (;;) {
+			const bytes = readSync(input, buffer, 0, CHUNK, null);
+			let text: string;
+			try {
+				text = bytes ? decoder.decode(buffer.subarray(0, bytes), { stream: true }) : decoder.decode();
+			} catch {
+				return undefined;
+			}
+			if (text.includes("\0")) return undefined;
+			let start = 0;
+			for (let end = text.indexOf("\n"); end !== -1; end = text.indexOf("\n", start)) {
+				handle(partial.join("") + text.slice(start, end), true);
+				partial = [];
+				start = end + 1;
+			}
+			if (start < text.length) partial.push(text.slice(start));
+			if (!bytes) break;
+		}
+		if (partial.length) handle(partial.join(""), false);
+		if (block.length) endBlock(false, false);
+		flush();
+		return result;
+	} finally {
+		closeSync(input);
+	}
+}
+
+// Every regular file under the given files and folders; symlinks inside are not followed.
+function logFiles(roots: string[]): string[] {
+	const files = new Set<string>();
+	const visit = (path: string) => {
+		let info: Stats;
+		try { info = lstatSync(path); } catch { return; }
+		if (info.isFile() && !/\.pass-env-\d+\.tmp$/.test(path)) files.add(path);
+		else if (info.isDirectory()) {
+			let names: string[];
+			try { names = readdirSync(path); } catch { return; }
+			for (const name of names) visit(join(path, name));
+		}
+	};
+	roots.forEach(visit);
+	return [...files].sort();
+}
+
+async function knownValues(): Promise<string[]> {
+	const root = storePath();
+	const values = new Set<string>();
+	const failed: string[] = [];
+	for (const entry of listEntries(root, "")) {
+		try {
+			const value = await decrypt(root, { name: entry, entry, multiline: false });
+			if (value.length >= 12) values.add(value);
+		} catch (error) {
+			if (error instanceof CliError && error.code === "LOCKED") throw error;
+			failed.push(entry);
+		}
+	}
+	if (failed.length) console.error(`warning: could not decrypt ${capped(failed)}, so their values were not looked for`);
+	return [...values];
+}
+
+const plural = (count: number, one: string, many = `${one}s`) => `${count} ${count === 1 ? one : many}`;
+const describeCounts = (counts: Map<string, number>) => [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([kind, count]) => `${kind} ${count}`).join(", ");
+const total = (counts: Map<string, number>) => [...counts.values()].reduce((sum, count) => sum + count, 0);
+const size = (bytes: number) => bytes < 1_000_000 ? `${Math.ceil(bytes / 1000)} KB` : `${(bytes / 1_000_000).toFixed(1)} MB`;
+
+// Writes the redacted copy next to the file and renames it over the original,
+// keeping mode and times. Gives up if the file changes meanwhile.
+function rewriteFile(path: string, patterns: Pattern[], before: Stats): Scanned | "changed" | "failed" {
+	const temp = join(dirname(path), `.${basename(path)}.pass-env-${process.pid}.tmp`);
+	const mode = before.mode & 0o7777;
+	let output: number | undefined;
+	try {
+		output = openSync(temp, "wx", mode);
+		const result = scanFile(path, patterns, output);
+		closeSync(output);
+		output = undefined;
+		const now = statSync(path);
+		if (!result || now.mtimeMs !== before.mtimeMs || now.size !== before.size) {
+			rmSync(temp, { force: true });
+			return "changed";
+		}
+		chmodSync(temp, mode);
+		utimesSync(temp, before.atime, before.mtime);
+		renameSync(temp, path);
+		return result;
+	} catch {
+		if (output !== undefined) closeSync(output);
+		rmSync(temp, { force: true });
+		return "failed";
+	}
+}
+
+async function scrub(options: ScrubOptions): Promise<number> {
+	const home = process.env.HOME;
+	if (!home) throw new CliError("USAGE", "HOME is not set, so the agent logs cannot be found", 2);
+	for (const path of options.paths) {
+		if (!existsSync(path)) throw new CliError("USAGE", `--path ${path}: no such file or folder`, 2);
+	}
+	const locations = [...AGENT_LOGS.map((path) => join(home, path)).filter((path) => existsSync(path)), ...options.paths.map((path) => resolve(path))];
+	const shownLocations = locations.map(tilde).join(", ");
+	if (!locations.length) {
+		console.log("No agent logs found (looked in ~/.claude, ~/.codex, ~/.pi and ~/.omp). Add --path <file-or-folder> to scan somewhere else.");
+		return 0;
+	}
+	const known = options.known ? knownPattern(await knownValues()) : undefined;
+	const patterns = known ? [known, ...PATTERNS] : PATTERNS;
+	const files = logFiles(locations.map((path) => realpathSync(path)));
+	const cutoff = Date.now() - ACTIVE_MS;
+	const found = new Map<string, number>();
+	const fixed = new Map<string, number>();
+	let bytes = 0;
+	let affected = 0;
+	let notText = 0;
+	let active = 0;
+	let skippedLines = 0;
+	const failed: string[] = [];
+	for (const path of files) {
+		let info: Stats;
+		try { info = statSync(path); } catch { continue; }
+		const busy = info.mtimeMs > cutoff;
+		if (options.fix && busy && !options.includeActive) {
+			active += 1;
+			continue;
+		}
+		bytes += info.size;
+		let scanned: Scanned | undefined;
+		try { scanned = scanFile(path, patterns); } catch { scanned = undefined; }
+		if (!scanned) {
+			notText += 1;
+			continue;
+		}
+		if (!scanned.counts.size) continue;
+		affected += 1;
+		addCounts(found, scanned.counts);
+		if (!options.fix) {
+			console.log(`${tilde(path)}: ${describeCounts(scanned.counts)}${busy ? " (in use: --fix skips it)" : ""}`);
+			continue;
+		}
+		const result = rewriteFile(path, patterns, info);
+		if (result === "changed" || result === "failed") {
+			failed.push(tilde(path));
+			console.log(`${tilde(path)}: ${result === "changed" ? "changed while scrubbing" : "could not be rewritten"}, so it was left as it was`);
+			continue;
+		}
+		addCounts(fixed, result.counts);
+		skippedLines += result.skippedLines;
+		const skipped = result.skippedLines ? `; ${plural(result.skippedLines, "line")} left as is (would not stay valid JSON)` : "";
+		console.log(`${tilde(path)}: redacted ${describeCounts(result.counts) || "nothing"}${skipped}`);
+	}
+	console.log(`${affected ? "\n" : ""}Scanned ${plural(files.length - active, "file")} (${size(bytes)}) in ${shownLocations}.`);
+	if (notText) console.log(`Skipped ${plural(notText, "file")} that ${notText === 1 ? "is" : "are"} not UTF-8 text or could not be read.`);
+	if (options.fix) {
+		const count = total(fixed);
+		const done = affected - failed.length;
+		console.log(count ? `Redacted ${plural(count, "suspected secret")} in ${plural(done, "file")}: ${describeCounts(fixed)}.` : "No suspected secrets were redacted.");
+		if (skippedLines) console.log(`Left ${plural(skippedLines, "line")} as ${skippedLines === 1 ? "it was" : "they were"}: redacting would have broken ${skippedLines === 1 ? "its" : "their"} JSON.`);
+		if (active) console.log(`Skipped ${plural(active, "file")} changed in the last 10 minutes (an agent may be writing ${active === 1 ? "it" : "them"}); close the session or add --include-active.`);
+		if (count) console.log("There are no backups: a backup would be one more plaintext copy. Rotate any real key that was found: blanking a log does not un-send it.");
+		return failed.length ? 1 : 0;
+	}
+	const count = total(found);
+	if (!count) {
+		console.log("No suspected secrets found.");
+		return 0;
+	}
+	const flags = [...options.paths.map((path) => ` --path ${path}`), options.known ? " --known" : ""].join("");
+	console.log(`Found ${plural(count, "suspected secret")} in ${plural(affected, "file")}: ${describeCounts(found)}.`);
+	console.log(`Nothing was changed. To replace them with [REDACTED:<kind>]: pass-env scrub --fix${flags}`);
+	console.log("Rotate any real key in this list: it was also sent to the agent's model provider.");
+	return 1;
+}
+
 async function main(args: string[]): Promise<number> {
 	const options = parseArgs(args);
 	if (options.command === "help") {
@@ -1200,6 +1560,7 @@ async function main(args: string[]): Promise<number> {
 		return 0;
 	}
 	if (options.command === "doctor") return doctor();
+	if (options.command === "scrub") return scrub(options);
 	const root = storePath();
 	switch (options.command) {
 		case "list": {
