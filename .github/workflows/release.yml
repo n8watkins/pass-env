@@ -1,0 +1,32 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.18
+      - run: sudo apt-get update && sudo apt-get install -y pass
+      - run: bun test
+      - run: ./demo/e2e.sh
+      - name: Build standalone binaries
+        run: |
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            bun build --compile --target="bun-$target" pass-env.ts --outfile "dist/pass-env-$target"
+          done
+      - name: Test the linux-x64 binary like the script
+        run: |
+          PASS_ENV_BIN=dist/pass-env-linux-x64 bun test
+          PASS_ENV_BIN=dist/pass-env-linux-x64 ./demo/e2e.sh
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && sha256sum pass-env-* > SHA256SUMS && cd ..
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
