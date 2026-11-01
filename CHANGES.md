@@ -17,6 +17,10 @@ The first commit in this repository is that file unchanged.
   SIGTERM and SIGHUP are still forwarded.
   Covered by a test that types Ctrl-C into a real pseudo-terminal.
 
+- **Multi-line values gained a newline.**
+  Values were always stored with a newline added, so a `multiline:` value without one came back changed.
+  Piped `set` input with several lines, and multi-line values from `import`, are now stored exactly.
+
 ## Added
 
 - `set <entry>`: store a pasted (hidden, confirmed prompt) or piped value.
@@ -25,6 +29,9 @@ The first commit in this repository is that file unchanged.
 - `copy <entry>`: put one secret on the clipboard. Like `pass -c`, it is cleared after `PASSWORD_STORE_CLIP_TIME` seconds (default 45), but only if the clipboard still holds it. Uses `clip.exe` on WSL, then `pbcopy`, `wl-copy` or `xclip`.
 - `unlock [entry]`: one place to type the GPG passphrase; refuses without a terminal so an agent cannot trigger a prompt.
 - `check`: report each mapping as ok or missing without decrypting.
+- `import <file> --prefix <prefix>`: move the secrets in a `.env` file into pass and write `.env.pass`, in two steps. `--dry-run` shows the plan (names only); `--remove` deletes the imported lines only after every stored value matches the file.
+- `doctor`: check pass, GPG, the store, the passphrase prompt, cache times, the clipboard and the current folder, without decrypting.
+- Standalone binaries for Linux and macOS (x64 and arm64), built with `bun build --compile` by a release workflow on each `v*` tag. CI runs the tests and the e2e walk-through against a compiled binary.
 - `run` and `check` default to `./.env.pass`.
 - Errors name a cause (`LOCKED`, `ENTRY`, `DECRYPT` for a missing key) by classifying GPG's stderr, which is still never printed.
 

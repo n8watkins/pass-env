@@ -25,7 +25,7 @@ For a hard boundary, run agents as a different OS user or in a container, and ke
 
 ## Install
 
-Needs [Bun](https://bun.sh), `gpg` and `pass`.
+Needs `gpg` and `pass`.
 Works on Linux, macOS and Windows through WSL.
 
 ```sh
@@ -33,15 +33,35 @@ Works on Linux, macOS and Windows through WSL.
 sudo apt install pass                 # macOS: brew install pass gnupg
 gpg --full-generate-key               # choose a passphrase you can type daily
 pass init you@example.com             # the email on that key
+```
 
-# pass-env
+Then install pass-env one of two ways.
+
+**A standalone binary** (no Bun needed), from the [releases page](https://github.com/n8watkins/pass-env/releases) once a release is published.
+Pick the file for your system: `pass-env-linux-x64`, `pass-env-linux-arm64`, `pass-env-darwin-x64` (Intel Mac) or `pass-env-darwin-arm64` (Apple silicon).
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/n8watkins/pass-env/releases/latest/download/pass-env-linux-x64 -o ~/.local/bin/pass-env
+chmod +x ~/.local/bin/pass-env
+```
+
+**The script**, if you have [Bun](https://bun.sh):
+
+```sh
 mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/n8watkins/pass-env/main/pass-env.ts -o ~/.local/bin/pass-env
 chmod +x ~/.local/bin/pass-env
-pass-env help
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
+Then check the setup:
+
+```sh
+pass-env doctor
+```
+
+It prints one line per check (ok, warn or FAIL) and a command to fix each problem.
 Back up your GPG private key once (`gpg --export-secret-keys --armor you@example.com > key.asc`), store it offline, and delete the file.
 Lose that key and every stored secret is gone.
 
@@ -57,6 +77,9 @@ Lose that key and every stored secret is gone.
 | `pass-env copy <entry>` | Put one stored secret on your clipboard (cleared after 45s) | Yes |
 | `pass-env check` | Show each line of `./.env.pass` as ok or MISSING | No |
 | `pass-env list [prefix]` | Show the names in your store | No |
+| `pass-env import <file> --prefix <prefix>` | Move the secrets in a `.env` file into pass and write `.env.pass`. The file is not changed | No |
+| `pass-env import <file> --prefix <prefix> --remove` | After testing: check every stored value, then delete those lines from the file | Yes |
+| `pass-env doctor` | Check pass, GPG, the store and the current folder. Decrypts nothing | No |
 | `pass-env unlock` | Type your GPG passphrase for this session. Only works in your own terminal | |
 | `pass-env help` | Everything here, with examples | |
 
@@ -65,6 +88,8 @@ Options:
 - `generate <entry> 64 --charset hex` sets the length (16 to 512, default 48) and characters (`alnum`, `hex`, `base64url`).
 - `--multiline` on `pipe` or `copy` uses the whole entry instead of its first line.
 - `run -f file` or `run -e NAME=entry` uses other mappings instead of `./.env.pass`.
+- `--dry-run` on `import` shows the plan, names only.
+- `--skip NAME,NAME` on `import` leaves those names in the file, and `--force` replaces existing entries.
 
 An **entry** is just a name you choose, like `myapp/STRIPE_SECRET_KEY`.
 Names are visible file names, so never put a secret in a name.
@@ -79,6 +104,16 @@ pass-env set myapp/OPENAI_API_KEY
 
 Paste it, then paste it again to confirm.
 Nothing is echoed or saved in your shell history.
+
+For a value that spans lines, such as a PEM key or JSON, pipe it in:
+
+```sh
+pass-env set myapp/FIREBASE_ADMIN_KEY < service-account.json
+```
+
+Piped input with several lines is stored exactly, byte for byte.
+Map it with `multiline:` (see below).
+Piped input with one line loses its trailing newline, so `echo` works.
 
 ### Make up a new secret
 
@@ -182,6 +217,7 @@ Paste this into `CLAUDE.md`, `AGENTS.md` or your agent's equivalent:
 - Never open .env, .env.*, .dev.vars or ~/.password-store, and never print secret variables (env, printenv, echo).
 - Each project lists its secrets by name in .env.pass. Run things with `pass-env run -- <command>`; check with `pass-env check`.
 - To create a secret we control: `pass-env generate <project>/<NAME>`, then add `NAME=<project>/<NAME>` to .env.pass.
+- To move a plaintext .env file into pass: `pass-env import <file> --prefix <project> --dry-run`, then without --dry-run; after I have tested the app, the same command with --remove.
 - To send a secret somewhere: `pass-env pipe <entry> -- <command that reads stdin>`.
 - To rotate one we control: `pass-env generate <entry> --force`, re-send it to production with pipe, then tell me every other place that still holds the old value.
 - For keys a provider issues (Stripe, OpenAI, Resend...), ask me to run `pass-env set <entry>`. Never ask me to paste a key into chat.
@@ -209,17 +245,73 @@ Use the terminal passphrase prompt (`pinentry-program /usr/bin/pinentry-curses` 
 `--copy` and `copy` use the Windows clipboard (`clip.exe`), so you can paste straight into a browser.
 For a GUI to browse entries, QtPass runs inside WSL (`sudo apt install qtpass`) and uses the same store.
 
-## Migrating from .env files
+## Migrate an existing project
 
-For each secret in an old `.env.local`:
+`import` moves the secrets in an existing `.env.local` (or `.env`, `.dev.vars`) into pass in two steps.
+No value is ever printed.
+
+**1. Look at the plan.**
 
 ```sh
-pass-env set myapp/STRIPE_SECRET_KEY                       # paste the value from the old file
-echo 'STRIPE_SECRET_KEY=myapp/STRIPE_SECRET_KEY' >> .env.pass
+pass-env import .env.local --prefix myapp --dry-run
 ```
 
-Then `pass-env check`, run the app once, and delete the old file.
-Keep public settings in a committed `.env`.
+```
+Plan for .env.local (dry run, nothing stored or changed):
+  NEXT_PUBLIC_SITE_URL  kept public
+  OPENAI_API_KEY        stored as myapp/OPENAI_API_KEY
+  DATABASE_URL          stored as myapp/DATABASE_URL
+  PRIVATE_KEY           stored as myapp/PRIVATE_KEY (multiline)
+  DIRECT_URL            skipped: references another variable
+```
+
+Everything is stored except names that are public by design (`NEXT_PUBLIC_*`, `VITE_*`, `PUBLIC_*`, `EXPO_PUBLIC_*`, `REACT_APP_*`).
+Empty values and values that use `$OTHER` or `${OTHER}` are skipped, and so is an unquoted value containing `#` (dotenv would cut it there; quote it and re-run).
+Add `--skip NAME,NAME` to leave other names in the file.
+
+**2. Store the secrets.**
+
+```sh
+pass-env import .env.local --prefix myapp
+```
+
+This stores each secret as `myapp/<NAME>` and adds the mappings to `.env.pass` next to the file.
+It stops before storing anything if an entry already exists (add `--force` to replace) or if `.env.pass` already maps a name somewhere else.
+It warns if git ignores `.env.pass` and prints the line to add to `.gitignore`.
+`.env.local` is not changed.
+
+**3. Test the app.**
+
+```sh
+pass-env check
+pass-env unlock
+pass-env run -- pnpm dev
+```
+
+**4. Remove the plaintext secrets.**
+
+```sh
+pass-env import .env.local --prefix myapp --remove
+```
+
+This decrypts each stored value and compares it with the file.
+Only if every value matches, it rewrites the file without those lines, keeping comments, public values and skipped lines.
+If nothing but comments is left, it deletes the file.
+There is no backup copy on purpose: it would be one more plaintext copy of your secrets.
+
+For Cloudflare Workers, Wrangler ignores environment variables while `.dev.vars` exists.
+Move any values left in it into `vars` in `wrangler.jsonc`, delete it, and start Wrangler with `CLOUDFLARE_INCLUDE_PROCESS_ENV=true pass-env run -- npx wrangler dev`.
+
+An agent can run all of this.
+Values go from the file into pass without being printed, and `--remove` only works while you have GPG unlocked.
+
+## Troubleshooting
+
+Start with `pass-env doctor`.
+It checks that `pass`, `gpg` and Bun are installed, that the store exists (and on WSL is not under `/mnt/c`), that this machine has the private key for the store's `.gpg-id`, the passphrase prompt (`pinentry-curses` on WSL), `GPG_TTY`, GPG's cache times and the clipboard.
+In the current folder it looks for plaintext `.env` files that hold secrets and for a `.env.pass` that git ignores.
+If you use Claude Code, it also checks that `~/.claude/settings.json` blocks reading `.env` files.
+It decrypts nothing and exits with 1 if any check failed.
 
 ## Errors
 
@@ -233,17 +325,24 @@ Errors are one line, start with a code, and never include secret values or GPG o
 | `DECRYPT` | This machine's GPG key cannot open the entry |
 | `CLIPBOARD` | No clipboard tool found (`clip.exe`, `pbcopy`, `wl-copy` or `xclip`) |
 | `TTY` | `unlock` was run without a terminal (for example by an agent) |
+| `MISMATCH` | `import --remove` found a stored value that differs from the file, so it removed nothing |
+| `CONFLICT` | `import` found a name that `.env.pass` already maps to another entry |
+| `PARSE` | `import` could not read a line of the file (the line number is given) |
+| `REFERENCE_FILE`, `WRITE` | A file could not be read, or could not be rewritten |
 | `USAGE`, `STORE`, `PASS_MISSING` | Wrong arguments, no store yet (`pass init`), or `pass` not installed |
 
 ## Tests
 
 ```sh
-bun test           # 27 tests with a fake pass and clipboard, including a real-terminal Ctrl-C test
-./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder
+bun test           # 42 tests with a fake pass, gpg and clipboard, including a real-terminal Ctrl-C test
+./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder, including import and --remove
 ```
+
+Set `PASS_ENV_BIN=path/to/binary` to run both against a compiled binary.
+CI does this on every push.
 
 ## Credits
 
 pass-env was written by Phaedrus Raznikov at [Misty Step](https://github.com/misty-step) as part of [mistystack](https://github.com/misty-step/mistystack) (MIT).
-This fork fixes three bugs and adds `set`, `generate`, `pipe`, `copy`, `unlock` and `check`.
+This fork fixes three bugs and adds `set`, `generate`, `pipe`, `copy`, `unlock`, `check`, `import` and `doctor`.
 See [CHANGES.md](CHANGES.md).
