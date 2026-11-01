@@ -11,6 +11,9 @@ Each step keeps the existing rule: pass-env never prints a secret value.
 - **Standalone binaries** built with `bun build --compile` for Linux and macOS (x64 and arm64).
   A `v*` tag runs `.github/workflows/release.yml`, which tests the compiled binary with the full test suite and the e2e walk-through before attaching all four to a GitHub release.
 - **Multi-line values stored exactly**, so `multiline:` mappings round-trip byte for byte.
+- **`scrub`**: find and blank out keys that coding agents already saved in their chat logs.
+  See "Clean up keys agents already saw" in the README.
+- **Env drift in `doctor`**: names the code reads but nothing declares, and `.env.pass` names the code never reads.
 
 ### Decisions that differ from the original plan
 
@@ -24,6 +27,13 @@ Each step keeps the existing rule: pass-env never prints a secret value.
 - From the audit of real projects: placeholders are skipped, secret-looking public names get a warning, files committed to git are refused, `--map NAME=entry` points a name at a shared entry, and an existing entry with the same value is reused without `--force`.
   The same-value check needs GPG unlocked; while locked, an existing entry still needs `--force`, and `--dry-run` never decrypts, so it only says the entry exists.
 - `doctor` reports file permissions and "neither committed nor ignored" only for dotenv files that hold secret-looking values, so a plain `.env` of public defaults stays quiet.
+- `scrub` scans every UTF-8 text file in the agent log folders, not only `.jsonl`, so transcripts saved in other formats are covered; binary files are skipped and counted.
+- pi and OMP are covered through their session folders (`~/.pi/agent/sessions`, `~/.omp/agent/sessions`); other agent data such as Codex's SQLite databases is left to `--path` or not scanned, since it cannot be rewritten line by line.
+- An assigned value (`token=...`) must contain letters and digits and must not look like code, a path or a placeholder, so passwords made only of words are missed; `--known` finds those.
+- A dry run reads files an agent is still writing and marks them "in use", while `--fix` skips them, so the dry run shows everything there is.
+- `--fix` keeps each file's modification time, so tools that sort sessions by time (such as `claude --resume`) keep their order, and gives up on a file that changes while it is being rewritten.
+- A line that would stop being valid JSON is left whole rather than partly redacted; the summary counts it, and a later dry run still reports it.
+- The drift check also reads `Bun.env.X`, `const { X } = process.env` and Prisma's `env("X")`, skips Python virtual environments and common build folders besides the requested ones, and runs only when there is a declaration file to compare with.
 
 ## Next
 

@@ -32,6 +32,10 @@ The first commit in this repository is that file unchanged.
 - `import <file> --prefix <prefix>`: move the secrets in a `.env` file into pass and write `.env.pass`, in two steps. `--dry-run` shows the plan (names only); `--remove` deletes the imported lines only after every stored value matches the file.
   It skips placeholders, warns about secrets under public names such as `NEXT_PUBLIC_GEMINI_API_KEY`, refuses files committed to git, and with `--map NAME=entry` can point a name at a shared entry; an existing entry with the same value is reused without `--force`.
 - `doctor`: check pass, GPG, the store, the passphrase prompt, cache times, the clipboard and the current folder (plaintext secrets, file permissions, git status), without decrypting.
+  It also reports env drift: variable names the code reads that nothing declares, and names in `.env.pass` the code never reads (names only).
+- `scrub`: find the secrets coding agents already saved in their chat logs (Claude Code, Codex, pi and OMP), counted per file by kind, without printing them; `--fix` replaces each with `[REDACTED:<kind>]` in place, keeping JSONL lines valid, file modes and times, and skipping files an agent may still be writing.
+  `--known` also matches the exact values in the store.
+  The patterns started from Phaedrus Raznikov's redactor in mistystack (`agent-config/system-one/redaction.ts` before commit `b483332`, MIT), extended with more providers, stricter lengths, checks against false positives, JSON-escaped text, and regexes that stay fast on log lines of many megabytes.
 - Standalone binaries for Linux and macOS (x64 and arm64), built with `bun build --compile` by a release workflow on each `v*` tag. CI runs the tests and the e2e walk-through against a compiled binary.
 - `run` and `check` default to `./.env.pass`.
 - Errors name a cause (`LOCKED`, `ENTRY`, `DECRYPT` for a missing key) by classifying GPG's stderr, which is still never printed.

@@ -4,7 +4,7 @@ Use secrets from [`pass`](https://www.passwordstore.org/) in your apps, your dep
 
 > **Created by Phaedrus Raznikov ([@moomooskycow](https://github.com/moomooskycow)) at [Misty Step](https://github.com/misty-step).**
 > pass-env started as part of his agent toolkit, [mistystack](https://github.com/misty-step/mistystack) (MIT).
-> This fork, maintained by [Nathan Watkins](https://github.com/n8watkins), adds import, generate, doctor and other commands, and fixes three bugs; see [CHANGES.md](CHANGES.md).
+> This fork, maintained by [Nathan Watkins](https://github.com/n8watkins), adds import, generate, doctor, scrub and other commands, and fixes three bugs; see [CHANGES.md](CHANGES.md).
 
 ```sh
 pass-env set myapp/STRIPE_SECRET_KEY                      # paste the key once, it gets encrypted
@@ -83,7 +83,9 @@ Lose that key and every stored secret is gone.
 | `pass-env list [prefix]` | Show the names in your store | No |
 | `pass-env import <file> --prefix <prefix>` | Move the secrets in a `.env` file into pass and write `.env.pass`. The file is not changed | No |
 | `pass-env import <file> --prefix <prefix> --remove` | After testing: check every stored value, then delete those lines from the file | Yes |
-| `pass-env doctor` | Check pass, GPG, the store and the current folder. Decrypts nothing | No |
+| `pass-env scrub` | Count the secrets coding agents already saved in their chat logs, per file. Prints none of them | Only with `--known` |
+| `pass-env scrub --fix` | Replace those secrets in the logs with `[REDACTED:<kind>]` | Only with `--known` |
+| `pass-env doctor` | Check pass, GPG, the store and the current folder, including env variables the code reads but nothing declares. Decrypts nothing | No |
 | `pass-env unlock` | Type your GPG passphrase for this session. Only works in your own terminal | |
 | `pass-env help` | Everything here, with examples | |
 
@@ -95,6 +97,7 @@ Options:
 - `--dry-run` on `import` shows the plan, names only.
 - `--skip NAME,NAME` on `import` leaves those names in the file, and `--force` replaces existing entries.
 - `--map NAME=entry` on `import` (repeatable) stores a name in an existing or shared entry, such as `--map GEMINI_API_KEY=shared/GEMINI_API_KEY`.
+- `--path <file-or-folder>` on `scrub` (repeatable) scans more places; `--known` also looks for the exact values in your store (needs unlock); `--include-active` lets `--fix` rewrite files changed in the last 10 minutes.
 
 An **entry** is just a name you choose, like `myapp/STRIPE_SECRET_KEY`.
 Names are visible file names, so never put a secret in a name.
@@ -242,6 +245,47 @@ default-cache-ttl 3600
 max-cache-ttl 28800
 ```
 
+## Clean up keys agents already saw
+
+Coding agents save everything they see in chat logs on your machine.
+Claude Code keeps them in `~/.claude/projects/` and `~/.claude/history.jsonl`, Codex in `~/.codex/sessions/`, `~/.codex/archived_sessions/` and `~/.codex/history.jsonl`, and pi and OMP in `~/.pi/agent/sessions/` and `~/.omp/agent/sessions/`.
+Any key an agent ever printed or read stays there in plain text, where any program running as you can find it.
+pass-env stops new leaks; `scrub` finds and blanks out the ones already saved.
+It is a command you run on your own machine, not in CI.
+
+```sh
+pass-env scrub          # look first: counts per file, never the secrets
+pass-env scrub --fix    # replace each one with [REDACTED:<kind>]
+```
+
+```
+~/.claude/projects/-home-me-myapp/0b6f2c1e.jsonl: github-token 2, private-key 1
+~/.claude/history.jsonl: stripe-key 1
+
+Scanned 214 files (183.0 MB) in ~/.claude/projects, ~/.claude/history.jsonl, ~/.codex/sessions.
+Found 4 suspected secrets in 2 files: github-token 2, private-key 1, stripe-key 1.
+```
+
+It finds private keys (PEM blocks, also when written inside JSON as `\n` text), AWS access keys, GitHub tokens (`ghp_`, `gho_`, `github_pat_` and the other prefixes), OpenAI and Anthropic `sk-` keys, Stripe `sk_live_`, `sk_test_` and `rk_` keys and `whsec_` webhook secrets, Slack `xox` tokens, Google `AIza` keys, Resend `re_` keys, `Bearer` tokens, JWTs, and assignments such as `DB_PASSWORD=...` or `"api_key": "..."`.
+To keep false positives low, each pattern needs a realistic length, and an assigned value needs letters and digits and must not look like code (`process.env.API_KEY`), a path or a placeholder.
+`--known` also looks for the exact current value of every entry in your store (its first line, if 12 characters or longer), which catches keys no pattern recognises.
+It decrypts, so it needs GPG unlocked; the values are only held in memory.
+
+The dry run exits with 1 if it found anything and 0 if not, so scripts can use it.
+Add `--path <file-or-folder>` (repeatable) to scan other places as well.
+Files are read line by line, so logs of hundreds of megabytes are fine.
+
+`--fix` rewrites each affected file in place:
+
+- A line that was valid JSON stays valid JSON. If a replacement would break a line, that line is left as it was and counted as skipped.
+- Each file is replaced through a temporary file and a rename, keeping its permissions and its modification time, so session lists keep their order.
+- Files changed in the last 10 minutes are skipped, because an agent may still be writing them. Close the session first, or add `--include-active`.
+- There is no backup on purpose: a backup would be one more plaintext copy.
+
+Blanking a log does not un-leak a key, because the agent already sent it to its model provider.
+Rotate every real key it finds (see "Rotate a secret").
+Other places agents keep data, such as Codex's SQLite databases or Claude Code's `file-history` folder, are not scanned by default; add text folders with `--path`.
+
 ## Windows (WSL)
 
 Install and use everything inside WSL.
@@ -327,6 +371,15 @@ It checks that `pass`, `gpg` and Bun are installed, that the store exists (and o
 In the current folder it looks for plaintext `.env` files that hold secrets, and warns if such a file can be read by other users (fix: `chmod 600`), is committed to git, or is neither committed nor ignored (so `git add .` would commit it).
 It also warns about secret-looking public names such as `NEXT_PUBLIC_GEMINI_API_KEY`, and about a `.env.pass` that git ignores.
 If you use Claude Code, it also checks that `~/.claude/settings.json` blocks reading `.env` files.
+
+It also compares the environment variables the code reads with the names the project declares, and warns about names used in code but declared nowhere, and names in `.env.pass` that the code never reads.
+Reads are found in `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs` and `.py` files (`process.env.X`, `process.env["X"]`, `const { X } = process.env`, `import.meta.env.X`, `Bun.env.X`, `Deno.env.get("X")`, `os.environ["X"]`, `os.getenv("X")`, `os.environ.get("X")`) and in Prisma schemas (`env("X")`).
+It skips `node_modules`, `.next`, `dist`, `build`, `out`, `coverage`, `.git`, `.worktrees`, Python virtual environments (`.venv`, `venv`, `__pycache__`) and the build folders of Wrangler, Vercel, Turborepo, SvelteKit and Nuxt.
+Declared names come from `.env.pass`, `.env`, `.env.*` (including `.env.example` and `.env.sample`), `.dev.vars` and `vars` in `wrangler.jsonc` or `wrangler.toml`; only names are read.
+Names that the runtime or platform sets are ignored: `NODE_ENV`, `PORT`, `HOST`, `HOSTNAME`, `CI`, `HOME`, `PATH`, `PWD`, `USER`, `SHELL`, `TERM`, `TMPDIR`, `TZ`, `LANG`, `DEBUG`, `NEXT_RUNTIME`, `NEXT_PHASE`, Vite's `MODE`, `DEV`, `PROD`, `SSR` and `BASE_URL`, and names starting with `VERCEL`, `GITHUB_`, `CF_PAGES` or `npm_`.
+The check runs only when the code reads at least one variable and the folder has a file to compare with, and each warning lists at most 10 names.
+Libraries and tools can read variables your code never mentions (Prisma's CLI, Auth.js), so a "never read" warning is a hint, not an error.
+
 It decrypts nothing and exits with 1 if any check failed.
 
 ## Errors
@@ -351,8 +404,8 @@ Errors are one line, start with a code, and never include secret values or GPG o
 ## Tests
 
 ```sh
-bun test           # 46 tests with a fake pass, gpg and clipboard, including a real-terminal Ctrl-C test
-./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder, including import and --remove
+bun test           # 55 tests with a fake pass, gpg and clipboard, including a real-terminal Ctrl-C test
+./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder, including import, --remove and scrub
 ```
 
 Set `PASS_ENV_BIN=path/to/binary` to run both against a compiled binary.
@@ -361,5 +414,6 @@ CI does this on every push.
 ## Credits
 
 pass-env was written by Phaedrus Raznikov at [Misty Step](https://github.com/misty-step) as part of [mistystack](https://github.com/misty-step/mistystack) (MIT).
-This fork fixes three bugs and adds `set`, `generate`, `pipe`, `copy`, `unlock`, `check`, `import` and `doctor`.
+This fork fixes three bugs and adds `set`, `generate`, `pipe`, `copy`, `unlock`, `check`, `import`, `scrub` and `doctor`.
+`scrub`'s patterns started from Phaedrus's redactor in mistystack (`agent-config/system-one/redaction.ts`, MIT).
 See [CHANGES.md](CHANGES.md).
