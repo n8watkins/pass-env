@@ -3,30 +3,117 @@ on:
   push:
     tags: ["v*"]
 permissions:
-  contents: write
+  contents: read
+# Release artifacts are built only here, from a tag on main, and get SHA-256
+# sums and Sigstore build provenance. See docs/windows-hello.md.
 jobs:
-  release:
+  verify:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag is on main and matches every version
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
+          version="${GITHUB_REF_NAME#v}"
+          grep -qx "const VERSION = \"$version\";" pass-env.ts || { echo "::error::pass-env.ts VERSION is not $version"; exit 1; }
+          grep -q "\"version\": \"$version\"" package.json || { echo "::error::package.json is not $version"; exit 1; }
+          grep -qx "version = \"$version\"" hello/Cargo.toml || { echo "::error::hello/Cargo.toml is not $version"; exit 1; }
+      - run: cd hello && rustup toolchain install
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+      - run: cd hello && cargo deny check && cargo audit
+
+  helper:
+    needs: verify
+    runs-on: windows-latest
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: hello
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo test --locked
+      - name: Build twice in two folders; the hashes must match
+        id: build
+        run: |
+          $hashes = foreach ($name in "a", "b") {
+            $dir = Join-Path $env:RUNNER_TEMP $name
+            New-Item -ItemType Directory -Path $dir | Out-Null
+            Get-ChildItem -Force -Exclude target | Copy-Item -Recurse -Destination $dir
+            & (Join-Path $dir "build-release.ps1") | Select-Object -Last 1
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          if ($hashes[0] -ne $hashes[1]) { Write-Error "builds differ: $hashes"; exit 1 }
+          $sha = ($hashes[0] -split " ")[0]
+          New-Item -ItemType Directory -Path out | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP "a\target\release\pass-env-hello.exe") out/
+          ./out/pass-env-hello.exe version
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pass-env-hello-exe
+          path: hello/out/pass-env-hello.exe
+          retention-days: 7
+
+  release:
+    needs: helper
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.2.18
       - run: sudo apt-get update && sudo apt-get install -y pass
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pass-env-hello-exe
+          path: dist
+      - name: Check the helper and pin its hash into pass-env
+        env:
+          HELPER_SHA256: ${{ needs.helper.outputs.sha256 }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "$HELPER_SHA256  dist/pass-env-hello.exe" | sha256sum --check
+          [[ "$HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad helper hash"; exit 1; }
+          sed -i "s|^const PINNED_HELPER_SHA256 = \"\";\$|const PINNED_HELPER_SHA256 = \"$HELPER_SHA256\";|; s|^const RELEASE_REPO = \"n8watkins/pass-env\";\$|const RELEASE_REPO = \"$REPO\";|" pass-env.ts
+          [ "$(grep -cx "const PINNED_HELPER_SHA256 = \"$HELPER_SHA256\";" pass-env.ts)" = 1 ] || { echo "::error::pin not applied"; exit 1; }
+          [ "$(grep -cx "const RELEASE_REPO = \"$REPO\";" pass-env.ts)" = 1 ] || { echo "::error::repo not applied"; exit 1; }
+          git diff --stat
       - run: bun test
       - run: ./demo/e2e.sh
-      - name: Build standalone binaries
+      - name: Build standalone binaries from the pinned script
         run: |
           for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
             bun build --compile --target="bun-$target" pass-env.ts --outfile "dist/pass-env-$target"
           done
+          cp pass-env.ts dist/pass-env.ts
       - name: Test the linux-x64 binary like the script
         run: |
           PASS_ENV_BIN=dist/pass-env-linux-x64 bun test
           PASS_ENV_BIN=dist/pass-env-linux-x64 ./demo/e2e.sh
+          dist/pass-env-linux-x64 version | grep -q "pins pass-env-hello.exe SHA-256 ${{ needs.helper.outputs.sha256 }}"
+      - run: cd dist && sha256sum pass-env-* pass-env.ts > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/pass-env-*
+            dist/pass-env.ts
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          cd dist && sha256sum pass-env-* > SHA256SUMS && cd ..
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
