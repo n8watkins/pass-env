@@ -176,7 +176,7 @@ The existing baseline: while gpg-agent's cache is warm, anything running as the 
 
 - `.github/workflows/release.yml` runs on a `v*` tag, first checking that the tagged commit is on `main`.
 - A `windows-latest` job runs `cargo test`, `cargo deny check` and `cargo audit`, builds `pass-env-hello.exe` twice in two folders and requires identical hashes (a reproducibility check), and uploads it with its SHA-256.
-- The toolchain is pinned (`hello/rust-toolchain.toml`), the CRT is linked statically, `/Brepro` removes linker timestamps and `--remap-path-prefix` removes local paths (`hello/build-release.ps1`), so the same commit gives the same SHA-256; CI builds twice in two folders and compares.
+- The toolchain is pinned (`hello/rust-toolchain.toml`), the CRT is linked statically, `/Brepro` removes linker timestamps and `--remap-path-prefix` removes local paths (`hello/build-release.ps1`), so the same commit gives the same SHA-256 with the same toolchain and MSVC linker; CI builds twice in two folders on the runner and compares. A build on another PC can differ when its Visual Studio linker version differs, so users verify releases by provenance, not by rebuilding.
 - The Linux job pins that hash into `pass-env.ts` (`PINNED_HELPER_SHA256`, and `RELEASE_REPO`), checks the pin was applied exactly once, builds the binaries from the pinned file, runs the tests, attaches the pinned `pass-env.ts`, the binaries, `pass-env-hello.exe` and `SHA256SUMS`, and creates build provenance attestations for all of them.
 - Third-party actions are pinned to commit SHAs.
 - Forks: without a release, nothing about Hello runs; `hello install <file>` with a self-built helper records its hash locally.
