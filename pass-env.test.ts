@@ -1396,7 +1396,10 @@ describe("Windows Hello unlock (fake helper)", () => {
 		delete files.env.PASS_ENV_HELLO_HELPER;
 		files.env.PASS_ENV_HELLO_TEST_DIR = join(files.root, "windows-local");
 		let result = inTty(files, ["unlock", "--hello"]);
-		expect(result.output).toContain("Unlocked with Windows Hello");
+		// A release build pins the real helper's hash, which the fake can never match.
+		const pinned = invoke(files, ["version"]).stdout.includes("pins pass-env-hello.exe SHA-256");
+		expect(result.output).toContain(pinned ? "the installed helper is not the one pass-env" : "Unlocked with Windows Hello");
+		if (pinned) return;
 		writeFileSync(helper, `${readFileSync(fakeHelper, "utf8")}\n// tampered\n`);
 		Bun.spawnSync({ cmd: ["rm", "-f", join(files.env.TEST_GPG_STATE!, "unlocked"), files.env.FAKE_HELLO_LOG!] });
 		result = inTty(files, ["unlock", "--hello"]);
@@ -1452,11 +1455,11 @@ describe("Windows Hello unlock (fake helper)", () => {
 
 	test("version matches package.json and the helper's Cargo.toml", () => {
 		const files = hello();
-		const version = invoke(files, ["version"]).stdout.trim();
+		const version = invoke(files, ["version"]).stdout.split("\n")[0];
 		const pkg = JSON.parse(readFileSync(join(import.meta.dir, "package.json"), "utf8")).version;
 		const cargo = readFileSync(join(import.meta.dir, "hello", "Cargo.toml"), "utf8").match(/^version = "(.+)"$/m)?.[1];
 		expect(version).toBe(`pass-env ${pkg}`);
 		expect(cargo).toBe(pkg);
-		expect(invoke(files, ["--version"]).stdout.trim()).toBe(version);
+		expect(invoke(files, ["--version"]).stdout.split("\n")[0]).toBe(version);
 	});
 });

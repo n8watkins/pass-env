@@ -2560,6 +2560,7 @@ async function main(args: string[]): Promise<number> {
 	}
 	if (options.command === "version") {
 		console.log(`pass-env ${VERSION}`);
+		if (PINNED_HELPER_SHA256) console.log(`pins ${HELPER_NAME} SHA-256 ${PINNED_HELPER_SHA256} (${RELEASE_REPO})`);
 		return 0;
 	}
 	if (options.command === "doctor") return doctor();
