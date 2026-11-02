@@ -3,9 +3,9 @@
 // showing them. Fork of misty-step/mistystack's bin/pass-env.ts (MIT).
 
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
-	appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync,
+	appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync,
 	statSync, unlinkSync, utimesSync, writeFileSync, writeSync, type Stats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
@@ -28,7 +28,11 @@ type Options =
 	| { command: "generate"; entry: string; length: number; charset: Charset; force: boolean; copy: boolean }
 	| { command: "copy"; entry: string; multiline: boolean }
 	| { command: "pipe"; entry: string; multiline: boolean; argv: string[] }
-	| { command: "unlock"; entry?: string }
+	| { command: "unlock"; entry?: string; hello: boolean }
+	| { command: "hello"; action: "enrol"; entry?: string }
+	| { command: "hello"; action: "install"; file?: string; yes: boolean }
+	| { command: "hello"; action: "status" | "forget" }
+	| { command: "version" }
 	| ImportOptions
 	| ScrubOptions
 	| { command: "doctor" };
@@ -37,6 +41,13 @@ type ImportOptions = {
 	command: "import"; file: string; prefix: string; skip: Set<string>; map: Map<string, string>; dryRun: boolean; force: boolean; remove: boolean;
 };
 
+const VERSION = "1.2.0";
+// The release workflow replaces these two lines (exactly once each) with the
+// SHA-256 of the pass-env-hello.exe built from the same tagged commit, and the
+// repository it was released from. Empty in source: then the hash recorded by
+// pass-env hello install is used.
+const PINNED_HELPER_SHA256 = "";
+const RELEASE_REPO = "n8watkins/pass-env";
 const DEFAULT_FILE = ".env.pass";
 const MULTILINE = "multiline:";
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -109,6 +120,21 @@ Check and set up
       Show entry names. Decrypts nothing.
   pass-env unlock [entry]
       Type your GPG passphrase once per session. Terminal only.
+  pass-env version
+
+Windows Hello unlock (experimental, WSL on Windows only, opt-in)
+  pass-env hello install [<pass-env-hello.exe>] [--yes]
+      Put the Windows helper in %LOCALAPPDATA%\\pass-env and record its
+      SHA-256. With no file, downloads this release's helper and checks
+      its hash and build provenance. Never updates itself.
+  pass-env hello enrol [entry]
+      Check your GPG passphrase, then save it encrypted with a TPM-backed
+      Windows Hello key. Terminal only.
+  pass-env unlock --hello [entry]
+      Unlock with face, fingerprint or PIN. Terminal only. Any problem
+      falls back to typing the passphrase, which always keeps working.
+  pass-env hello status | hello forget
+      Show the setup (no prompt), or delete the saved passphrase and key.
   pass-env help
 
 Reference files (.env.pass)
@@ -194,6 +220,7 @@ function withDefaultFile(sources: Sources): Sources {
 
 function parseArgs(args: string[]): Options {
 	const [command, ...rest] = args;
+	if (command === "--version") return { command: "version" };
 	if (!command || ["help", "--help", "-h"].includes(command) || rest.some((arg) => arg === "--help" || arg === "-h") && !rest.includes("--")) {
 		return { command: "help" };
 	}
@@ -262,9 +289,16 @@ function parseArgs(args: string[]): Options {
 			return { command: "pipe", entry: checkedEntry(positional[0]), multiline, argv };
 		}
 		case "unlock": {
-			if (rest.length > 1) throw new CliError("USAGE", "expected unlock [entry]", 2);
-			return { command: "unlock", entry: rest[0] === undefined ? undefined : checkedEntry(rest[0]) };
+			const hello = rest.includes("--hello");
+			const positional = rest.filter((arg) => arg !== "--hello");
+			if (positional.length > 1) throw new CliError("USAGE", "expected unlock [entry] [--hello]", 2);
+			return { command: "unlock", entry: positional[0] === undefined ? undefined : checkedEntry(positional[0]), hello };
 		}
+		case "hello":
+			return parseHello(rest);
+		case "version":
+			if (rest.length) throw new CliError("USAGE", "expected version", 2);
+			return { command: "version" };
 		case "import":
 			return parseImport(rest);
 		case "scrub":
@@ -274,6 +308,29 @@ function parseArgs(args: string[]): Options {
 			return { command: "doctor" };
 		default:
 			throw new CliError("USAGE", "unknown command; run pass-env help", 2);
+	}
+}
+
+function parseHello(args: string[]): Options {
+	const [action, ...rest] = args;
+	const expected = "expected hello install [<pass-env-hello.exe>] [--yes] | hello enrol [entry] | hello status | hello forget";
+	switch (action) {
+		case "install": {
+			const yes = rest.includes("--yes");
+			const positional = rest.filter((arg) => arg !== "--yes");
+			if (positional.length > 1 || positional.some((arg) => arg.startsWith("-"))) throw new CliError("USAGE", expected, 2);
+			return { command: "hello", action, file: positional[0], yes };
+		}
+		case "enrol":
+		case "enroll":
+			if (rest.length > 1) throw new CliError("USAGE", expected, 2);
+			return { command: "hello", action: "enrol", entry: rest[0] === undefined ? undefined : checkedEntry(rest[0]) };
+		case "status":
+		case "forget":
+			if (rest.length) throw new CliError("USAGE", expected, 2);
+			return { command: "hello", action };
+		default:
+			throw new CliError("USAGE", expected, 2);
 	}
 }
 
@@ -569,20 +626,674 @@ function terminalTty(): string | undefined {
 	return result.exitCode === 0 && name.startsWith("/") ? name : undefined;
 }
 
-async function unlock(root: string, entry: string | undefined): Promise<string> {
+function requireTty(what: string): string {
 	const tty = process.stdin.isTTY ? terminalTty() : undefined;
-	if (!tty) throw new CliError("TTY", "unlock needs your terminal; run it yourself, not through an agent", 2);
+	if (!tty) throw new CliError("TTY", `${what} needs your terminal; run it yourself, not through an agent`, 2);
+	return tty;
+}
+
+// The entry an unlock decrypts: the one given, else the first mapping in
+// ./.env.pass, else the first entry in the store.
+function canaryEntry(root: string, entry: string | undefined): string {
 	let target = entry;
 	if (!target && existsSync(DEFAULT_FILE)) target = readMappings({ files: [DEFAULT_FILE], explicit: [] })[0]?.entry;
 	target ??= listEntries(root, "")[0];
-	if (!target) throw new CliError("ENTRY", "the store is empty; add something first with pass-env set or generate");
+	if (!target) throw new CliError("ENTRY", "the store is empty; add something first, for example pass-env generate workstation/UNLOCK_CANARY");
 	if (!entryExists(root, target)) throw new CliError("ENTRY", `${target}: entry does not exist`);
+	return target;
+}
+
+async function typedUnlock(root: string, target: string, tty: string): Promise<void> {
 	const env: Record<string, string | undefined> = { ...process.env, PASSWORD_STORE_DIR: root, GPG_TTY: tty };
 	delete env.PASSWORD_STORE_GPG_OPTS;
 	const backend = guardSpawn(() => Bun.spawn({ cmd: ["pass", "show", "--", target], env, stdin: "inherit", stdout: "ignore", stderr: "pipe" }));
 	const [errors, status] = await Promise.all([new Response(backend.stderr).text(), backend.exited]);
 	if (status !== 0) throw decryptFailure(target, errors);
+}
+
+async function unlock(root: string, entry: string | undefined): Promise<string> {
+	const tty = requireTty("unlock");
+	const target = canaryEntry(root, entry);
+	await typedUnlock(root, target, tty);
 	return target;
+}
+
+// Windows Hello unlock (experimental, WSL only). Design and threat model:
+// docs/windows-hello.md. The passphrase only ever lives in byte buffers that
+// are zeroed after use; it is never printed, logged, put in argv or env, or
+// written to disk. Every failure of unlock --hello falls back to the typed
+// passphrase.
+const BLOB_MAGIC = "PEH1";
+const BLOB_HEADER_MIN = 4 + 2;
+const BLOB_SALT = 32;
+const BLOB_NONCE = 12;
+const BLOB_TAG = 16;
+const MAX_KEY_NAME = 64;
+const MAX_PASSPHRASE = 4096;
+const MAX_BLOB = BLOB_HEADER_MIN + MAX_KEY_NAME + BLOB_SALT + BLOB_NONCE + MAX_PASSPHRASE + BLOB_TAG;
+const MAX_HELPER_BYTES = 20_000_000;
+const HELPER_NAME = "pass-env-hello.exe";
+const HELPER_TIMEOUT_MS = 120_000;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+// The helper's exit codes (the protocol; see docs/windows-hello.md).
+const HELPER_EXIT: Record<number, string> = {
+	2: "the helper did not understand the request",
+	3: "Windows Hello is not available for pass-env (see pass-env hello status)",
+	4: "Windows Hello was cancelled",
+	5: "Windows Hello or the Windows session is locked",
+	6: "the saved passphrase does not open with this Windows Hello key; run pass-env hello enrol",
+	7: "Windows Hello failed",
+};
+
+type HelperRecord = { path: string; sha256: string; version: string; installed: string };
+type HelperResult = { code: number; out: Buffer };
+type ResolvedHelper = { path: string; override: boolean; sha256?: string } | { problem: string; fix: string; severity: "warn" | "FAIL" };
+
+// Tests only: install into this folder and treat the machine as WSL with interop.
+const helloTestDir = () => process.env.PASS_ENV_HELLO_TEST_DIR;
+
+function configDir(): string {
+	const base = process.env.XDG_CONFIG_HOME || (process.env.HOME ? join(process.env.HOME, ".config") : undefined);
+	if (!base) throw new CliError("CONFIG", "set HOME or XDG_CONFIG_HOME");
+	return join(resolve(base), "pass-env");
+}
+const blobPath = () => join(configDir(), "hello.blob");
+const recordPath = () => join(configDir(), "hello-helper.json");
+
+// ~/.config/pass-env: a real folder owned by us, mode 700.
+function privateDir(): string {
+	const dir = configDir();
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const info = lstatSync(dir);
+	if (!info.isDirectory() || (process.getuid && info.uid !== process.getuid())) {
+		throw new CliError("CONFIG", `${tilde(dir)} must be a real folder owned by you, not a symlink`);
+	}
+	if (info.mode & 0o077) chmodSync(dir, 0o700);
+	return dir;
+}
+
+// Atomic write, mode 600; O_EXCL on the temporary file refuses symlinks.
+function writePrivate(path: string, data: Uint8Array): void {
+	privateDir();
+	const temporary = `${path}.${process.pid}.tmp`;
+	let fd: number | undefined;
+	try {
+		fd = openSync(temporary, "wx", 0o600);
+		writeSync(fd, data);
+		fsyncSync(fd);
+		closeSync(fd);
+		fd = undefined;
+		renameSync(temporary, path);
+	} catch {
+		if (fd !== undefined) closeSync(fd);
+		rmSync(temporary, { force: true });
+		throw new CliError("WRITE", `could not write ${tilde(path)}`);
+	}
+}
+
+// A regular file (not a symlink) of at most max bytes, or undefined if absent.
+function readRegular(path: string, max: number): Buffer | undefined {
+	let info: Stats;
+	try {
+		info = lstatSync(path);
+	} catch {
+		return undefined;
+	}
+	if (!info.isFile()) throw new CliError("CONFIG", `${tilde(path)} must be a regular file, not a symlink`);
+	if (info.size > max) throw new CliError("CONFIG", `${tilde(path)} is too large`);
+	return readFileSync(path);
+}
+
+// Mirrors the helper's strict parser, so a bad blob never reaches Windows.
+function blobProblem(bytes: Uint8Array): string | undefined {
+	if (bytes.length > MAX_BLOB) return "too long";
+	if (bytes.length < BLOB_HEADER_MIN || Buffer.from(bytes.subarray(0, 4)).toString("latin1") !== BLOB_MAGIC) return "not a pass-env Hello blob";
+	if (bytes[4] !== 1) return `format version ${bytes[4]} is not supported`;
+	const nameLength = bytes[5];
+	if (nameLength < 1 || nameLength > MAX_KEY_NAME) return "bad key name length";
+	const header = BLOB_HEADER_MIN + nameLength + BLOB_SALT + BLOB_NONCE;
+	if (bytes.length < header) return "truncated";
+	if (!/^[A-Za-z0-9._-]+$/.test(Buffer.from(bytes.subarray(6, 6 + nameLength)).toString("latin1"))) return "bad key name";
+	const ciphertext = bytes.length - header;
+	if (ciphertext < BLOB_TAG + 1 || ciphertext > MAX_PASSPHRASE + BLOB_TAG) return "bad ciphertext length";
+	return undefined;
+}
+
+function readRecord(): HelperRecord | undefined {
+	const raw = readRegular(recordPath(), 64_000);
+	if (!raw) return undefined;
+	try {
+		const record = JSON.parse(raw.toString("utf8")) as HelperRecord;
+		if (typeof record.path === "string" && isAbsolute(record.path) && typeof record.sha256 === "string" && SHA256_HEX.test(record.sha256)
+			&& typeof record.version === "string") return record;
+	} catch { /* Invalid below. */ }
+	throw new CliError("CONFIG", `${tilde(recordPath())} is not valid; run pass-env hello install`);
+}
+
+const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+
+function sameHash(a: string, b: string): boolean {
+	return a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+function interopAvailable(): boolean {
+	return Boolean(helloTestDir()) || ["WSLInterop", "WSLInterop-late"].some((name) => existsSync(`/proc/sys/fs/binfmt_misc/${name}`));
+}
+
+// Finds the helper and checks its hash immediately before it is used. The
+// helper is only ever run by its recorded absolute path, never from PATH.
+function resolveHelper(): ResolvedHelper {
+	const override = process.env.PASS_ENV_HELLO_HELPER;
+	if (override) return { path: resolve(override), override: true };
+	if (!isWsl() && !helloTestDir()) return { problem: "Windows Hello unlock needs WSL on Windows", fix: "use the typed pass-env unlock", severity: "warn" };
+	if (!interopAvailable()) {
+		return { problem: "WSL interop is off, so Windows programs cannot run", fix: "enable [interop] in /etc/wsl.conf, then wsl --shutdown", severity: "warn" };
+	}
+	let record: HelperRecord | undefined;
+	try {
+		record = readRecord();
+	} catch (error) {
+		return { problem: (error as CliError).message, fix: "pass-env hello install", severity: "FAIL" };
+	}
+	if (!record) return { problem: "the Windows Hello helper is not installed", fix: "pass-env hello install", severity: "warn" };
+	if (PINNED_HELPER_SHA256 && !sameHash(record.sha256, PINNED_HELPER_SHA256)) {
+		return { problem: `the installed helper is not the one pass-env ${VERSION} ships`, fix: "pass-env hello install", severity: "FAIL" };
+	}
+	let actual: string;
+	try {
+		const bytes = readRegular(record.path, MAX_HELPER_BYTES);
+		if (!bytes) return { problem: `the helper is missing at ${record.path}`, fix: "pass-env hello install", severity: "FAIL" };
+		actual = sha256(bytes);
+	} catch {
+		return { problem: `the helper at ${record.path} cannot be read`, fix: "pass-env hello install", severity: "FAIL" };
+	}
+	if (!sameHash(actual, record.sha256)) {
+		return { problem: `the helper at ${record.path} changed since it was installed (SHA-256 mismatch), so it was not run`, fix: "pass-env hello install", severity: "FAIL" };
+	}
+	return { path: record.path, override: false, sha256: actual };
+}
+
+// Runs the helper with stdin from input and collects at most max bytes of
+// stdout; stderr goes to the terminal (the helper's notices). Chunks are
+// zeroed once joined; callers zero the result when it may hold a secret.
+function runHelper(path: string, args: string[], input: Uint8Array | undefined, max: number, timeout = HELPER_TIMEOUT_MS): Promise<HelperResult> {
+	return new Promise((done) => {
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = spawn(path, args, { stdio: ["pipe", "pipe", "inherit"] });
+		} catch {
+			done({ code: -1, out: Buffer.alloc(0) });
+			return;
+		}
+		const chunks: Buffer[] = [];
+		let size = 0;
+		let finished = false;
+		const finish = (code: number) => {
+			if (finished) return;
+			finished = true;
+			clearTimeout(timer);
+			const out = Buffer.concat(chunks);
+			for (const chunk of chunks) chunk.fill(0);
+			done({ code, out });
+		};
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			finish(7);
+		}, timeout);
+		child.on("error", () => finish(-1));
+		child.stdout!.on("data", (chunk: Buffer) => {
+			size += chunk.length;
+			if (size > max) {
+				chunk.fill(0);
+				child.kill("SIGKILL");
+				finish(7);
+				return;
+			}
+			chunks.push(chunk);
+		});
+		child.on("close", (code) => finish(code ?? 7));
+		child.stdin!.on("error", () => { /* The helper may exit before reading. */ });
+		child.stdin!.end(input ? Buffer.from(input.buffer, input.byteOffset, input.byteLength) : undefined);
+	});
+}
+
+const helperFailure = (result: HelperResult) => result.code === -1
+	? "the Windows Hello helper could not be started"
+	: HELPER_EXIT[result.code] ?? `the Windows Hello helper failed (exit ${result.code})`;
+
+// Best effort: no core dumps of this process, and no debugger attach by other
+// processes of the same user, while it holds the passphrase.
+async function hardenProcess(): Promise<void> {
+	if (process.platform !== "linux") return;
+	try {
+		const { dlopen, FFIType } = await import("bun:ffi");
+		const libc = dlopen("libc.so.6", { prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 } });
+		const PR_SET_DUMPABLE = 4;
+		libc.symbols.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+		libc.close();
+	} catch { /* Not available: carry on. */ }
+}
+
+const caller = () => `${process.env.WSL_DISTRO_NAME || "WSL"}: ${process.cwd()}`;
+
+function gpgSpawn(args: string[], extra: "pipe" | "ignore") {
+	return spawn("gpg", args, { stdio: ["ignore", "ignore", "pipe", extra] });
+}
+
+// True when gpg-agent can already decrypt the entry without asking.
+function gpgUnlocked(root: string, target: string): Promise<boolean> {
+	return new Promise((done) => {
+		const child = gpgSpawn(["--batch", "--quiet", "--no-tty", "--pinentry-mode", "error", "--decrypt", "--", join(root, `${target}.gpg`)], "ignore");
+		child.stderr!.resume();
+		child.on("error", () => done(false));
+		child.on("close", (code) => done(code === 0));
+	});
+}
+
+// Decrypts the entry with the passphrase given on fd 3, which warms gpg-agent's
+// cache under its normal TTL. The plaintext goes nowhere; stderr is only
+// classified, never shown.
+function loopbackDecrypt(root: string, target: string, passphrase: Uint8Array): Promise<"ok" | "bad" | "error"> {
+	return new Promise((done) => {
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = gpgSpawn(["--batch", "--quiet", "--no-tty", "--pinentry-mode", "loopback", "--passphrase-fd", "3", "--decrypt", "--", join(root, `${target}.gpg`)], "pipe");
+		} catch {
+			done("error");
+			return;
+		}
+		let errors = "";
+		child.stderr!.on("data", (chunk: Buffer) => { errors += chunk.toString("utf8"); });
+		child.on("error", () => done("error"));
+		child.on("close", (code) => done(code === 0 ? "ok" : /bad passphrase/i.test(errors) ? "bad" : "error"));
+		const input = child.stdio[3] as import("node:stream").Writable;
+		input.on("error", () => { /* gpg may exit first. */ });
+		input.write(Buffer.from(passphrase.buffer, passphrase.byteOffset, passphrase.byteLength));
+		input.end("\n");
+	});
+}
+
+function agentConf(): string {
+	const home = process.env.GNUPGHOME || (process.env.HOME ? join(process.env.HOME, ".gnupg") : undefined);
+	return home ? join(home, "gpg-agent.conf") : "gpg-agent.conf";
+}
+
+function agentOption(name: string): string | undefined {
+	let lines: string[] = [];
+	try { lines = readFileSync(agentConf(), "utf8").split("\n").map((line) => line.trim()); } catch { /* No config: GPG defaults. */ }
+	return lines.filter((line) => line.split(/\s+/)[0] === name).map((line) => line.slice(name.length).trim()).pop();
+}
+
+const isHelperPath = (path: string) => /pass-env-hello/i.test(basename(path));
+
+function pinentryProgram(): string | undefined {
+	const configured = process.env.PASS_ENV_PINENTRY || agentOption("pinentry-program");
+	if (configured && !isHelperPath(configured) && existsSync(configured)) return configured;
+	return Bun.which("pinentry-curses") ?? Bun.which("pinentry") ?? undefined;
+}
+
+const assuanEncode = (text: string) => text.replace(/[%\r\n\x00-\x1f]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+
+function assuanDecode(data: Uint8Array): Buffer {
+	const out = Buffer.alloc(data.length);
+	let length = 0;
+	for (let index = 0; index < data.length; index += 1) {
+		const hex = (code: number) => (code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102);
+		if (data[index] === 37 && index + 2 < data.length && hex(data[index + 1]) && hex(data[index + 2])) {
+			out[length++] = Number.parseInt(String.fromCharCode(data[index + 1], data[index + 2]), 16);
+			index += 2;
+		} else out[length++] = data[index];
+	}
+	const result = Buffer.from(out.subarray(0, length));
+	out.fill(0);
+	return result;
+}
+
+// Asks for the passphrase through pinentry's Assuan protocol, so it looks
+// like GPG's own prompt. The answer goes straight into a byte buffer.
+async function askPassphrase(tty: string, description: string): Promise<Buffer> {
+	const program = pinentryProgram();
+	if (!program) throw new CliError("PINENTRY", "no pinentry program found; sudo apt install pinentry-curses");
+	const args = ["--ttyname", tty, ...(process.env.TERM ? ["--ttytype", process.env.TERM] : [])];
+	const child = spawn(program, args, { stdio: ["pipe", "pipe", "ignore"] });
+	const lines: Buffer[] = [];
+	let partial = Buffer.alloc(0);
+	let ended = false;
+	let wake: (() => void) | undefined;
+	child.on("error", () => { ended = true; wake?.(); });
+	child.stdout!.on("data", (chunk: Buffer) => {
+		const data = Buffer.concat([partial, chunk]);
+		chunk.fill(0);
+		partial.fill(0);
+		let start = 0;
+		for (let index = 0; index < data.length; index += 1) {
+			if (data[index] === 10) {
+				lines.push(Buffer.from(data.subarray(start, index)));
+				start = index + 1;
+			}
+		}
+		partial = Buffer.from(data.subarray(start));
+		data.fill(0);
+		wake?.();
+	});
+	child.stdout!.on("end", () => { ended = true; wake?.(); });
+	const readLine = async (): Promise<Buffer | undefined> => {
+		while (!lines.length) {
+			if (ended) return undefined;
+			await new Promise<void>((resolve) => { wake = resolve; });
+			wake = undefined;
+		}
+		return lines.shift();
+	};
+	const send = async (command?: string): Promise<{ ok: boolean; data: Buffer[]; error?: string }> => {
+		if (command !== undefined) child.stdin!.write(`${command}\n`);
+		const data: Buffer[] = [];
+		for (;;) {
+			const line = await readLine();
+			if (!line) return { ok: false, data, error: "pinentry stopped" };
+			const head = line.subarray(0, 4).toString("latin1");
+			if (head.startsWith("OK")) return { ok: true, data };
+			if (head.startsWith("ERR")) return { ok: false, data, error: line.toString("latin1") };
+			if (head.startsWith("D ")) data.push(assuanDecode(line.subarray(2)));
+			line.fill(0);
+		}
+	};
+	const wipe = (parts: Buffer[]) => { for (const part of parts) part.fill(0); };
+	try {
+		const steps = [undefined, "SETTITLE pass-env", `SETDESC ${assuanEncode(description)}`, "SETPROMPT Passphrase:"];
+		for (const step of steps) {
+			const reply = await send(step);
+			wipe(reply.data);
+			if (!reply.ok) throw new CliError("PINENTRY", `${basename(program)} did not start (${reply.error ?? "no reply"})`);
+		}
+		const pin = await send("GETPIN");
+		if (!pin.ok) {
+			wipe(pin.data);
+			throw new CliError("CANCELLED", "no passphrase entered; nothing was saved");
+		}
+		const passphrase = Buffer.concat(pin.data);
+		wipe(pin.data);
+		return passphrase;
+	} finally {
+		try { child.stdin!.end("BYE\n"); } catch { /* Already gone. */ }
+		wipe(lines);
+		partial.fill(0);
+	}
+}
+
+async function tryHelloUnlock(root: string, target: string): Promise<string | undefined> {
+	if (process.env.SSH_CONNECTION || process.env.SSH_TTY) return "this is an SSH session, and the prompt would appear on the Windows desktop";
+	let blob: Buffer | undefined;
+	try {
+		blob = readRegular(blobPath(), MAX_BLOB + 1);
+	} catch (error) {
+		return (error as CliError).message;
+	}
+	if (!blob) return "not enrolled yet (pass-env hello enrol)";
+	const bad = blobProblem(blob);
+	if (bad) return `the saved blob is not valid (${bad}); run pass-env hello enrol`;
+	const helper = resolveHelper();
+	if ("problem" in helper) return `${helper.problem} (fix: ${helper.fix})`;
+	await hardenProcess();
+	console.error("pass-env: confirm with Windows Hello (face, fingerprint or PIN) to unlock GPG.");
+	const result = await runHelper(helper.path, ["unwrap", "--from", caller()], blob, MAX_PASSPHRASE);
+	if (result.code !== 0) {
+		result.out.fill(0);
+		return helperFailure(result);
+	}
+	const passphrase = result.out;
+	try {
+		if (!passphrase.length || passphrase.includes(0) || passphrase.includes(10)) return "the helper returned an unusable passphrase";
+		const outcome = await loopbackDecrypt(root, target, passphrase);
+		if (outcome === "ok") return undefined;
+		return outcome === "bad"
+			? "the passphrase saved with Windows Hello no longer opens GPG (was it changed?); run pass-env hello enrol"
+			: `gpg could not decrypt ${target} with it`;
+	} finally {
+		passphrase.fill(0);
+	}
+}
+
+async function helloUnlock(root: string, entry: string | undefined): Promise<{ target: string; how: "already" | "hello" | "typed" }> {
+	const tty = requireTty("unlock --hello");
+	const target = canaryEntry(root, entry);
+	if (await gpgUnlocked(root, target)) return { target, how: "already" };
+	const reason = await tryHelloUnlock(root, target);
+	if (reason === undefined) return { target, how: "hello" };
+	console.error(`pass-env: Windows Hello not used: ${reason}.`);
+	console.error("pass-env: falling back to your typed GPG passphrase.");
+	await typedUnlock(root, target, tty);
+	return { target, how: "typed" };
+}
+
+type HelloCheck = { hello?: string; tpm?: string; key?: string; attestation?: string; version?: string };
+
+async function helperCheck(path: string): Promise<{ code: number; status: HelloCheck }> {
+	const result = await runHelper(path, ["check"], undefined, 4096, 20_000);
+	let status: HelloCheck = {};
+	try { status = JSON.parse(result.out.toString("utf8")) as HelloCheck; } catch { /* Reported by the caller. */ }
+	return { code: result.code, status };
+}
+
+async function helloEnrol(entry: string | undefined): Promise<void> {
+	const tty = requireTty("hello enrol");
+	const missing = [...toolChecks(), ...storeChecks()].filter((check) => check.status === "FAIL");
+	if (missing.length) {
+		for (const check of missing) console.error(`FAIL  ${check.text}\n      fix: ${check.fix}`);
+		throw new CliError("SETUP", "set up pass and GPG first: run pass-env doctor, and see Install in the README (https://github.com/n8watkins/pass-env#install)");
+	}
+	const root = storePath();
+	const target = canaryEntry(root, entry);
+	const helper = resolveHelper();
+	if ("problem" in helper) throw new CliError("HELLO", `${helper.problem}; fix: ${helper.fix}`);
+	const check = await helperCheck(helper.path);
+	if (check.code !== 0) {
+		throw new CliError("HELLO", `Windows Hello is not usable here (hello ${check.status.hello ?? "unknown"}, TPM ${check.status.tpm ?? "unknown"}); run pass-env hello status`);
+	}
+	console.log(`Step 1 of 2: type your GPG passphrase. It is checked against ${target} before anything is saved.`);
+	const passphrase = await askPassphrase(tty, `pass-env hello enrol: your GPG passphrase, to save it behind Windows Hello. It must open ${target}.`);
+	try {
+		if (!passphrase.length) throw new CliError("CANCELLED", "no passphrase entered; nothing was saved");
+		if (passphrase.length > MAX_PASSPHRASE || passphrase.includes(0) || passphrase.includes(10) || passphrase.includes(13)) {
+			throw new CliError("PASSPHRASE", "that passphrase cannot be saved (too long, or contains a line break or NUL); nothing was saved");
+		}
+		// Forget cached passphrases so the check below really tests this one.
+		Bun.spawnSync({ cmd: ["gpgconf", "--reload", "gpg-agent"], stdout: "ignore", stderr: "ignore" });
+		const outcome = await loopbackDecrypt(root, target, passphrase);
+		if (outcome === "bad") throw new CliError("PASSPHRASE", `that passphrase does not open ${target}; nothing was saved`);
+		if (outcome !== "ok") throw new CliError("DECRYPT", `gpg could not decrypt ${target}; run pass-env doctor`);
+		console.log("Passphrase checked. GPG is unlocked now.");
+		console.log("Step 2 of 2: confirm with Windows Hello. There can be up to three prompts: create the key, use it, check it.");
+		await hardenProcess();
+		const result = await runHelper(helper.path, ["enrol", "--from", caller()], passphrase, MAX_BLOB);
+		if (result.code !== 0) throw new CliError("HELLO", `${helperFailure(result)}; nothing was saved`);
+		const bad = blobProblem(result.out);
+		if (bad) throw new CliError("HELLO", `the helper returned an invalid blob (${bad}); nothing was saved`);
+		const replaced = existsSync(blobPath());
+		writePrivate(blobPath(), result.out);
+		console.log(`${replaced ? "Replaced" : "Saved"} ${tilde(blobPath())} (encrypted, readable only by you).`);
+		console.log("To try it: gpgconf --reload gpg-agent && pass-env unlock --hello");
+	} finally {
+		passphrase.fill(0);
+	}
+}
+
+function cmdExe(): string | undefined {
+	return ["/mnt/c/Windows/System32/cmd.exe"].find((path) => existsSync(path)) ?? Bun.which("cmd.exe") ?? undefined;
+}
+
+// %LOCALAPPDATA%\pass-env as a WSL path.
+function helperDir(): string {
+	const test = helloTestDir();
+	if (test) return resolve(test);
+	const cmd = cmdExe();
+	if (!cmd) throw new CliError("HELLO", "cmd.exe not found, so %LOCALAPPDATA% cannot be found; is WSL interop on?");
+	const result = Bun.spawnSync({ cmd: [cmd, "/d", "/c", "echo %LOCALAPPDATA%"], cwd: existsSync("/mnt/c") ? "/mnt/c" : "/", stdout: "pipe", stderr: "ignore" });
+	const windows = result.stdout.toString().trim();
+	if (result.exitCode !== 0 || !/^[A-Za-z]:\\[^%\r\n"]+$/.test(windows)) throw new CliError("HELLO", "could not find %LOCALAPPDATA%");
+	const converted = Bun.spawnSync({ cmd: ["wslpath", "-u", windows], stdout: "pipe", stderr: "ignore" });
+	const path = converted.stdout.toString().trim();
+	if (converted.exitCode !== 0 || !isAbsolute(path)) throw new CliError("HELLO", "could not convert %LOCALAPPDATA% to a WSL path");
+	return join(path, "pass-env");
+}
+
+async function download(url: string): Promise<Buffer> {
+	let response: Response;
+	try {
+		response = await fetch(url, { redirect: "follow" });
+	} catch {
+		throw new CliError("DOWNLOAD", `could not download ${url}`);
+	}
+	if (!response.ok) throw new CliError("DOWNLOAD", `could not download ${url} (HTTP ${response.status})`);
+	const bytes = Buffer.from(await response.arrayBuffer());
+	if (bytes.length > MAX_HELPER_BYTES) throw new CliError("DOWNLOAD", `${url} is too large`);
+	return bytes;
+}
+
+// gh attestation verify: was this file built by this repository's release
+// workflow (Sigstore-signed GitHub build provenance)?
+function verifyProvenance(path: string, tag: string | undefined): "verified" | "failed" | "no-gh" {
+	const gh = Bun.which("gh");
+	if (!gh) return "no-gh";
+	const args = ["attestation", "verify", path, "--repo", RELEASE_REPO, "--signer-workflow", `${RELEASE_REPO}/.github/workflows/release.yml`, "--deny-self-hosted-runners"];
+	if (tag) args.push("--source-ref", `refs/tags/${tag}`);
+	const result = Bun.spawnSync({ cmd: [gh, ...args], stdout: "ignore", stderr: "ignore" });
+	return result.exitCode === 0 ? "verified" : "failed";
+}
+
+async function confirm(question: string): Promise<boolean> {
+	process.stdout.write(`${question} [y/N] `);
+	for await (const line of console) return /^y(es)?$/i.test(line.trim());
+	return false;
+}
+
+async function helloInstall(file: string | undefined, yes: boolean): Promise<void> {
+	if (!isWsl() && !helloTestDir()) throw new CliError("HELLO", "hello install runs in WSL on Windows");
+	if (!process.stdin.isTTY && !yes) throw new CliError("TTY", "hello install changes what runs at unlock: run it in your terminal, or add --yes", 2);
+	const tag = `v${VERSION}`;
+	let bytes: Buffer;
+	if (file) {
+		const read = readRegular(resolve(file), MAX_HELPER_BYTES);
+		if (!read) throw new CliError("HELLO", `${file} does not exist`);
+		bytes = read;
+	} else {
+		const base = `https://github.com/${RELEASE_REPO}/releases/download/${tag}`;
+		console.log(`Downloading ${HELPER_NAME} from ${base}`);
+		bytes = await download(`${base}/${HELPER_NAME}`);
+		const sums = (await download(`${base}/SHA256SUMS`)).toString("utf8");
+		const listed = sums.match(/^([0-9a-f]{64}) [ *]pass-env-hello\.exe$/m)?.[1];
+		if (!listed || !sameHash(listed, sha256(bytes))) throw new CliError("HELLO", "the download does not match the release's SHA256SUMS; nothing was installed");
+	}
+	if (bytes[0] !== 0x4d || bytes[1] !== 0x5a) throw new CliError("HELLO", "that file is not a Windows program; nothing was installed");
+	const hash = sha256(bytes);
+	if (PINNED_HELPER_SHA256 && !sameHash(hash, PINNED_HELPER_SHA256)) {
+		throw new CliError("HELLO", `this helper's SHA-256 is ${hash}, but pass-env ${VERSION} pins ${PINNED_HELPER_SHA256}; nothing was installed`);
+	}
+	const dir = helperDir();
+	mkdirSync(dir, { recursive: true });
+	if (!lstatSync(dir).isDirectory()) throw new CliError("HELLO", `${dir} must be a real folder`);
+	const destination = join(dir, HELPER_NAME);
+	const temporary = join(dir, `${HELPER_NAME}.${process.pid}.tmp`);
+	try {
+		writeFileSync(temporary, bytes, { flag: "wx", mode: 0o700 });
+		const provenance = helloTestDir() ? "no-gh" : verifyProvenance(temporary, file ? undefined : tag);
+		if (provenance === "failed" && (PINNED_HELPER_SHA256 || !file)) {
+			throw new CliError("HELLO", `gh attestation verify could not prove this file was built by ${RELEASE_REPO}'s release workflow; nothing was installed`);
+		}
+		if (provenance === "no-gh" && !PINNED_HELPER_SHA256 && !file) {
+			throw new CliError("HELLO", "without gh, this pass-env cannot check where the download was built: install gh, or verify the file yourself (docs/windows-hello.md) and run pass-env hello install <file>");
+		}
+		const note = provenance === "verified" ? `build provenance verified (${RELEASE_REPO} release workflow)`
+			: provenance === "failed" ? "not a release build of this repository (fine for your own build)"
+				: PINNED_HELPER_SHA256 ? "provenance not checked (gh not installed); the hash is pinned" : "provenance not checked";
+		let previous: HelperRecord | undefined;
+		try { previous = readRecord(); } catch { /* Replaced below. */ }
+		if (previous && !sameHash(previous.sha256, hash)) {
+			console.log(`Replacing the installed helper:\n  old SHA-256 ${previous.sha256}\n  new SHA-256 ${hash}`);
+			if (!yes && !(await confirm("Install the new helper?"))) throw new CliError("CANCELLED", "nothing was installed");
+		}
+		renameSync(temporary, destination);
+	} finally {
+		rmSync(temporary, { force: true });
+	}
+	const installed = readRegular(destination, MAX_HELPER_BYTES);
+	if (!installed || !sameHash(sha256(installed), hash)) throw new CliError("HELLO", `${destination} changed while it was installed; run pass-env hello install again`);
+	const version = await runHelper(destination, ["version"], undefined, 200, 20_000);
+	const reported = version.out.toString("utf8").trim().match(/^pass-env-hello (\S+)$/)?.[1];
+	if (version.code !== 0 || !reported) throw new CliError("HELLO", `${destination} did not run as pass-env-hello; is WSL interop on?`);
+	const record: HelperRecord = { path: destination, sha256: hash, version: reported, installed: new Date().toISOString() };
+	writePrivate(recordPath(), Buffer.from(`${JSON.stringify(record, null, 2)}\n`));
+	console.log(`Installed pass-env-hello ${reported} at ${destination}`);
+	console.log(`SHA-256 ${hash}`);
+	console.log("Next: pass-env hello enrol");
+}
+
+async function helloChecks(): Promise<Check[]> {
+	const checks: Check[] = [];
+	const helper = resolveHelper();
+	if ("problem" in helper) {
+		checks.push(helper.severity === "FAIL" ? fail(helper.problem, helper.fix) : warn(helper.problem, helper.fix));
+	} else {
+		const how = helper.override ? "set by PASS_ENV_HELLO_HELPER, not hash-checked"
+			: `SHA-256 ${helper.sha256!.slice(0, 16)}..., matches the hash ${PINNED_HELPER_SHA256 ? `pinned in pass-env ${VERSION}` : "recorded at install"}`;
+		const { code, status } = await helperCheck(helper.path);
+		if (!status.version) checks.push(fail(`the Windows Hello helper at ${tilde(helper.path)} did not answer`, "pass-env hello install"));
+		else {
+			checks.push(ok(`Windows Hello helper ${status.version} (${how})`));
+			if (status.hello !== "available") checks.push(warn("Windows Hello is not set up or not supported on this PC", "Windows Settings > Accounts > Sign-in options"));
+			else if (status.tpm !== "present") checks.push(warn("no TPM found, so Windows Hello keys are not hardware-backed and pass-env will not use them", "use the typed pass-env unlock"));
+			else if (status.attestation === "software") checks.push(fail("the pass-env Windows Hello key is a software key, not TPM-backed", "pass-env hello forget, then check the TPM in Windows Security"));
+			else checks.push(ok(`Windows Hello available, TPM present, pass-env key ${status.key}${status.attestation === "tpm" ? " (TPM-attested)" : ""}`));
+			if (code !== 0 && status.hello === "available" && status.tpm === "present" && status.attestation !== "software") {
+				checks.push(warn(`the helper's check exited with ${code}`, "pass-env hello status"));
+			}
+		}
+	}
+	let blob: Buffer | undefined;
+	try {
+		blob = readRegular(blobPath(), MAX_BLOB + 1);
+	} catch (error) {
+		checks.push(fail((error as CliError).message, `rm ${tilde(blobPath())} && pass-env hello enrol`));
+		return checks;
+	}
+	if (!blob) checks.push(warn("not enrolled for Windows Hello unlock (optional, experimental)", "pass-env hello enrol"));
+	else {
+		const bad = blobProblem(blob);
+		if (bad) checks.push(fail(`${tilde(blobPath())} is not valid (${bad})`, "pass-env hello enrol"));
+		else checks.push(ok(`enrolled: ${tilde(blobPath())} is well-formed (key ${blob.subarray(6, 6 + blob[5]).toString("latin1")})`));
+		const mode = statSync(blobPath()).mode & 0o777;
+		if (mode & 0o077) checks.push(warn(`${tilde(blobPath())} can be read by other users (mode ${mode.toString(8)})`, `chmod 600 ${tilde(blobPath())}`));
+	}
+	return checks;
+}
+
+// Whether doctor should show the Hello section: only once someone started using it.
+function helloConfigured(): boolean {
+	return Boolean(process.env.PASS_ENV_HELLO_HELPER) || existsSync(blobPath()) || existsSync(recordPath());
+}
+
+async function helloForget(): Promise<void> {
+	requireTty("hello forget");
+	const path = blobPath();
+	const had = existsSync(path);
+	rmSync(path, { force: true });
+	console.log(had ? `Deleted ${tilde(path)}.` : "No saved blob to delete.");
+	const helper = resolveHelper();
+	if ("problem" in helper) {
+		console.log(`The Windows Hello key was not deleted: ${helper.problem}. Without the blob it unlocks nothing.`);
+		return;
+	}
+	const result = await runHelper(helper.path, ["forget"], undefined, 0, 60_000);
+	console.log(result.code === 0 ? "Deleted the pass-env Windows Hello key." : `The Windows Hello key was not deleted: ${helperFailure(result)}. Without the blob it unlocks nothing.`);
+	console.log("Your typed GPG passphrase works as before.");
+}
+
+function printChecks(checks: Check[]): number {
+	for (const check of checks) {
+		console.log(`${check.status.padEnd(4)}  ${check.text}`);
+		if (check.fix) console.log(`      fix: ${check.fix}`);
+	}
+	return checks.some((check) => check.status === "FAIL") ? 1 : 0;
 }
 
 // True when the terminal itself sends Ctrl-C/Ctrl-\ to our process group,
@@ -979,15 +1690,15 @@ function storeChecks(): Check[] {
 }
 
 function gpgChecks(): Check[] {
-	const home = process.env.GNUPGHOME || (process.env.HOME ? join(process.env.HOME, ".gnupg") : undefined);
-	const conf = home ? join(home, "gpg-agent.conf") : "gpg-agent.conf";
-	let lines: string[] = [];
-	try { lines = readFileSync(conf, "utf8").split("\n").map((line) => line.trim()); } catch { /* No config: GPG defaults. */ }
-	const option = (name: string) => lines.filter((line) => line.split(/\s+/)[0] === name).map((line) => line.slice(name.length).trim()).pop();
+	const conf = agentConf();
+	const option = agentOption;
 	const checks: Check[] = [];
 	const pinentry = option("pinentry-program");
 	const curses = `echo 'pinentry-program ${Bun.which("pinentry-curses") ?? "/usr/bin/pinentry-curses"}' >> ${tilde(conf)} && gpgconf --kill gpg-agent`;
-	if (pinentry && !existsSync(pinentry)) checks.push(fail(`pinentry-program ${pinentry} does not exist, so GPG cannot ask for your passphrase`, curses));
+	if (pinentry && isHelperPath(pinentry)) {
+		checks.push(fail(`pinentry-program is the Windows Hello helper, so any gpg call (an agent's too) could ask for Windows Hello`,
+			`replace that line in ${tilde(conf)} with pinentry-program ${Bun.which("pinentry-curses") ?? "/usr/bin/pinentry-curses"}, then gpgconf --kill gpg-agent; use pass-env unlock --hello instead`));
+	} else if (pinentry && !existsSync(pinentry)) checks.push(fail(`pinentry-program ${pinentry} does not exist, so GPG cannot ask for your passphrase`, curses));
 	else if (pinentry) checks.push(ok(`passphrase prompt: ${pinentry}`));
 	else if (isWsl()) checks.push(warn("no pinentry-program set; on WSL the default prompt may never appear", curses));
 	else checks.push(ok("passphrase prompt: GPG's default pinentry"));
@@ -1002,9 +1713,11 @@ function gpgChecks(): Check[] {
 		return Number.isInteger(value) && value >= 0 ? value : fallback;
 	};
 	const [cache, max] = [ttl("default-cache-ttl", 600), ttl("max-cache-ttl", 7200)];
+	const span = (seconds: number) => seconds % 3600 === 0 ? `${seconds / 3600}h` : `${seconds}s`;
 	checks.push(cache > DAY || max > DAY
-		? warn(`GPG stays unlocked too long (default-cache-ttl ${cache}s, max-cache-ttl ${max}s)`, `set default-cache-ttl 3600 and max-cache-ttl 28800 in ${tilde(conf)}, then gpgconf --kill gpg-agent`)
-		: ok(`GPG unlock lasts ${cache}s after use, at most ${max}s`));
+		? warn(`GPG stays unlocked for more than a day (default-cache-ttl ${span(cache)}, max-cache-ttl ${span(max)}); anything running as you can decrypt in that window (hint)`,
+			`a day or less is usual, e.g. default-cache-ttl 3600 and max-cache-ttl 28800 (or 86400) in ${tilde(conf)}, then gpgconf --kill gpg-agent`)
+		: ok(`GPG unlock lasts ${span(cache)} after use, at most ${span(max)}`));
 	return checks;
 }
 
@@ -1224,12 +1937,10 @@ function driftChecks(): Check[] {
 	return checks;
 }
 
-function doctor(): number {
+async function doctor(): Promise<number> {
 	const checks = [...toolChecks(), ...storeChecks(), ...gpgChecks(), clipboardCheck(), ...folderChecks(), ...driftChecks(), ...claudeCheck()];
-	for (const check of checks) {
-		console.log(`${check.status.padEnd(4)}  ${check.text}`);
-		if (check.fix) console.log(`      fix: ${check.fix}`);
-	}
+	if (helloConfigured()) checks.push(...await helloChecks());
+	printChecks(checks);
 	const count = (status: Check["status"]) => checks.filter((check) => check.status === status).length;
 	console.log(`\n${count("FAIL")} failed, ${count("warn")} ${count("warn") === 1 ? "warning" : "warnings"}, ${count("ok")} ok.`);
 	return count("FAIL") ? 1 : 0;
@@ -1839,7 +2550,27 @@ async function main(args: string[]): Promise<number> {
 		console.log(usage());
 		return 0;
 	}
+	if (options.command === "version") {
+		console.log(`pass-env ${VERSION}`);
+		return 0;
+	}
 	if (options.command === "doctor") return doctor();
+	if (options.command === "hello") {
+		switch (options.action) {
+			case "install":
+				await helloInstall(options.file, options.yes);
+				return 0;
+			case "enrol":
+				await helloEnrol(options.entry);
+				return 0;
+			case "status":
+				console.log("Windows Hello unlock (experimental):");
+				return printChecks(await helloChecks());
+			case "forget":
+				await helloForget();
+				return 0;
+		}
+	}
 	if (options.command === "scrub") return scrub(options);
 	const root = storePath();
 	switch (options.command) {
@@ -1892,6 +2623,12 @@ async function main(args: string[]): Promise<number> {
 		case "import":
 			return options.remove ? removeImported(root, options) : importFile(root, options);
 		case "unlock": {
+			if (options.hello) {
+				const { target, how } = await helloUnlock(root, options.entry);
+				console.log(how === "already" ? `GPG is already unlocked (checked with ${target}); no prompt needed.`
+					: `Unlocked${how === "hello" ? " with Windows Hello" : ""} (checked with ${target}). Runs can decrypt until GPG's cache expires.`);
+				return 0;
+			}
 			const entry = await unlock(root, options.entry);
 			console.log(`Unlocked (checked with ${entry}). Runs can decrypt until GPG's cache expires.`);
 			return 0;

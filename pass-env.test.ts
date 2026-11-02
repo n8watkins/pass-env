@@ -37,6 +37,12 @@ if (args[0] === "insert") {
   process.exit(0);
 }
 if (args[0] !== "show" || args[1] !== "--" || args.length !== 3) process.exit(7);
+// The typed unlock (no --pinentry-mode error): succeeds only when a test allows it.
+if (process.env.PASSWORD_STORE_GPG_OPTS === undefined && process.env.TEST_PASS_ALLOW_TYPED) {
+  appendFileSync(process.env.TEST_PASS_CALLS, "typed unlock\\n");
+  writeFileSync(join(process.env.TEST_GPG_STATE, "unlocked"), "");
+  process.exit(0);
+}
 if (process.env.PASSWORD_STORE_GPG_OPTS !== "--batch --pinentry-mode error") process.exit(8);
 if (process.env.TEST_PASS_LOCKED) {
   process.stderr.write("gpg: decryption failed: No pinentry synthetic-locked");
@@ -59,18 +65,30 @@ process.stdout.write(readFileSync(file(args[2])));
 	// A fake clipboard backed by a file.
 	writeFileSync(join(bin, "fakeclip"), `#!/bin/sh\ncat > "$CLIP_FILE"\n`, { mode: 0o700 });
 	writeFileSync(join(bin, "fakepaste"), `#!/bin/sh\ncat "$CLIP_FILE"\n`, { mode: 0o700 });
-	// A fake gpg that only answers doctor's secret-key question.
+	// A fake gpg: doctor's secret-key question, and the decrypts unlock --hello
+	// makes (unlocked yet? / loopback with the passphrase on fd 3).
+	const state = join(root, "gpg-state");
+	mkdirSync(state);
 	writeFileSync(join(bin, "gpg"), `#!/bin/sh
+case " $* " in
+*" --pinentry-mode error "*) [ -e "$TEST_GPG_STATE/unlocked" ] && exit 0; echo "gpg: decryption failed: No secret key" >&2; exit 2;;
+*" --passphrase-fd 3 "*)
+	IFS= read -r given <&3
+	if [ "$given" = "$TEST_GPG_PASSPHRASE" ]; then echo "loopback ok" >> "$TEST_PASS_CALLS"; : > "$TEST_GPG_STATE/unlocked"; exit 0; fi
+	echo "loopback bad" >> "$TEST_PASS_CALLS"; echo "gpg: public key decryption failed: Bad passphrase" >&2; exit 2;;
+esac
 for id; do :; done
 case " $TEST_GPG_SECRET_KEYS " in *" $id "*) echo "sec:u:255:22:SYNTHETIC::::::::::"; exit 0;; esac
 exit 2
 `, { mode: 0o700 });
+	writeFileSync(join(bin, "gpgconf"), `#!/bin/sh\necho "gpgconf $*" >> "$TEST_PASS_CALLS"\nrm -f "$TEST_GPG_STATE/unlocked"\n`, { mode: 0o700 });
 	return {
 		root, store, calls,
 		env: {
 			// XDG_STATE_HOME keeps scrub's scan history inside the temp folder, never the real one.
 			...process.env, HOME: root, XDG_STATE_HOME: join(root, ".local", "state"), PASSWORD_STORE_DIR: store, PATH: `${bin}:${process.env.PATH}`, TEST_PASS_CALLS: calls,
 			PASS_ENV_CLIPBOARD: "fakeclip", PASS_ENV_CLIPBOARD_READ: "fakepaste", CLIP_FILE: join(root, "clipboard"), PASSWORD_STORE_CLIP_TIME: "1",
+			XDG_CONFIG_HOME: join(root, ".config"), TEST_GPG_STATE: state, GNUPGHOME: join(root, "no-gnupg"),
 		},
 	};
 }
@@ -1204,5 +1222,228 @@ describe("scrub", () => {
 		const none = invoke(fx, ["scrub"]);
 		expect(none.status).toBe(0);
 		expect(none.stdout).toContain("No agent logs found");
+	});
+});
+
+describe("Windows Hello unlock (fake helper)", () => {
+	const PASSPHRASE = "synthetic-gpg-passphrase";
+	const fakeHelper = join(import.meta.dir, "demo", "fake-hello-helper.ts");
+	const fakePinentry = join(import.meta.dir, "demo", "fake-pinentry.sh");
+	const ttyAvailable = Boolean(Bun.which("script"));
+
+	// A store that is set up and locked, with the fake helper and pinentry.
+	const hello = (mode = "ok") => {
+		const files = fixture({ token: "synthetic-value" });
+		writeFileSync(join(files.store, ".gpg-id"), "synthetic@example.invalid\n");
+		Object.assign(files.env, {
+			PASS_ENV_HELLO_HELPER: fakeHelper, FAKE_HELLO_MODE: mode, FAKE_HELLO_LOG: join(files.root, "helper-calls"),
+			PASS_ENV_PINENTRY: fakePinentry, FAKE_PIN: PASSPHRASE, TEST_GPG_PASSPHRASE: PASSPHRASE,
+			TEST_GPG_SECRET_KEYS: "synthetic@example.invalid", TEST_PASS_ALLOW_TYPED: "1", WSL_DISTRO_NAME: "Synthetic-WSL",
+		});
+		delete files.env.SSH_CONNECTION;
+		delete files.env.SSH_TTY;
+		return files;
+	};
+	const blob = (files: Fixture) => join(files.root, ".config", "pass-env", "hello.blob");
+	const helperCalls = (files: Fixture) => existsSync(files.env.FAKE_HELLO_LOG!) ? readFileSync(files.env.FAKE_HELLO_LOG!, "utf8") : "";
+	const passCalls = (files: Fixture) => existsSync(files.calls) ? readFileSync(files.calls, "utf8") : "";
+	const unlocked = (files: Fixture) => existsSync(join(files.env.TEST_GPG_STATE!, "unlocked"));
+	// Runs pass-env inside a pseudo-terminal, like a person in their own terminal.
+	const inTty = (files: Fixture, args: string[]) => {
+		const command = [...launcher, ...args].map((part) => `'${part.replace(/'/g, "'\\''")}'`).join(" ");
+		const result = spawnSync("script", ["-qec", command, "/dev/null"], { cwd: files.root, env: files.env, input: "", encoding: "utf8", timeout: 20_000 });
+		if (result.error) throw result.error;
+		const output = result.stdout.replace(/\r/g, "");
+		expect(output).not.toContain(PASSPHRASE);
+		return { status: result.status, output };
+	};
+	const enrolled = (mode = "ok") => {
+		const files = hello();
+		expect(inTty(files, ["hello", "enrol"]).status).toBe(0);
+		Bun.spawnSync({ cmd: ["rm", "-f", join(files.env.TEST_GPG_STATE!, "unlocked"), files.calls, files.env.FAKE_HELLO_LOG!] });
+		files.env.FAKE_HELLO_MODE = mode;
+		return files;
+	};
+
+	test("unlock --hello and hello enrol refuse without a terminal, and never start the helper", () => {
+		const files = hello();
+		for (const args of [["unlock", "--hello"], ["hello", "enrol"], ["hello", "forget"]]) {
+			const result = invoke(files, args);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("TTY:");
+		}
+		expect(helperCalls(files)).toBe("");
+		expect(passCalls(files)).toBe("");
+	});
+
+	test.skipIf(!ttyAvailable)("enrol checks the passphrase, then saves an encrypted blob readable only by you", () => {
+		const files = hello();
+		const result = inTty(files, ["hello", "enrol"]);
+		expect(result.status).toBe(0);
+		expect(result.output).toContain("Passphrase checked");
+		expect(result.output).toContain("Saved");
+		expect(passCalls(files)).toContain("gpgconf --reload gpg-agent\nloopback ok\n");
+		expect(helperCalls(files)).toMatch(/^check\nenrol --from Synthetic-WSL: /);
+		const saved = readFileSync(blob(files));
+		expect(saved.subarray(0, 4).toString()).toBe("PEH1");
+		expect(saved.includes(Buffer.from(PASSPHRASE))).toBe(false);
+		expect(statSync(blob(files)).mode & 0o777).toBe(0o600);
+		expect(statSync(dirname(blob(files))).mode & 0o777).toBe(0o700);
+	});
+
+	test.skipIf(!ttyAvailable)("enrol refuses a wrong or cancelled passphrase and saves nothing", () => {
+		const files = hello();
+		files.env.FAKE_PIN = "not-it";
+		let result = inTty(files, ["hello", "enrol"]);
+		expect(result.status).toBe(1);
+		expect(result.output).toContain("PASSPHRASE: that passphrase does not open token; nothing was saved");
+		expect(helperCalls(files)).toBe("check\n");
+		files.env.FAKE_PIN_CANCEL = "1";
+		result = inTty(files, ["hello", "enrol"]);
+		expect(result.output).toContain("CANCELLED:");
+		expect(existsSync(blob(files))).toBe(false);
+	});
+
+	test.skipIf(!ttyAvailable)("enrol needs pass, GPG and a store with an entry first, and Hello available", () => {
+		let files = hello();
+		rmSync(join(files.store, ".gpg-id"));
+		let result = inTty(files, ["hello", "enrol"]);
+		expect(result.output).toContain("FAIL  the store has no .gpg-id");
+		expect(result.output).toContain("SETUP: set up pass and GPG first: run pass-env doctor");
+		files = hello();
+		rmSync(join(files.store, "token.gpg"));
+		result = inTty(files, ["hello", "enrol"]);
+		expect(result.output).toContain("ENTRY: the store is empty; add something first");
+		files = hello("unavailable");
+		result = inTty(files, ["hello", "enrol"]);
+		expect(result.output).toContain("HELLO: Windows Hello is not usable here (hello unsupported");
+		expect(passCalls(files)).toBe("");
+		expect(existsSync(blob(files))).toBe(false);
+	});
+
+	test.skipIf(!ttyAvailable)("unlock --hello unlocks through the helper and gpg loopback, with no typed prompt", () => {
+		const files = enrolled();
+		const result = inTty(files, ["unlock", "--hello"]);
+		expect(result.status).toBe(0);
+		expect(result.output).toContain("Unlocked with Windows Hello (checked with token)");
+		expect(result.output).toContain("fake-hello: request from Synthetic-WSL: ");
+		expect(passCalls(files)).toBe("loopback ok\n");
+		expect(unlocked(files)).toBe(true);
+		// Already unlocked: no prompt at all.
+		const again = inTty(files, ["unlock", "--hello"]);
+		expect(again.output).toContain("GPG is already unlocked");
+		expect(helperCalls(files).match(/unwrap/g)?.length).toBe(1);
+	});
+
+	test.skipIf(!ttyAvailable)("every Hello failure falls back to the typed passphrase and says why", () => {
+		const cases: Record<string, string> = {
+			cancel: "Windows Hello was cancelled",
+			unavailable: "Windows Hello is not available for pass-env",
+			locked: "Windows Hello or the Windows session is locked",
+			corrupt: "the saved passphrase does not open with this Windows Hello key; run pass-env hello enrol",
+			other: "Windows Hello failed",
+			wrong: "the passphrase saved with Windows Hello no longer opens GPG (was it changed?); run pass-env hello enrol",
+		};
+		for (const [mode, reason] of Object.entries(cases)) {
+			const files = enrolled(mode);
+			const result = inTty(files, ["unlock", "--hello"]);
+			expect(result.status).toBe(0);
+			expect(result.output).toContain(`Windows Hello not used: ${reason}`);
+			expect(result.output).toContain("falling back to your typed GPG passphrase");
+			expect(result.output).toContain("Unlocked (checked with token)");
+			expect(passCalls(files)).toEndWith("typed unlock\n");
+		}
+	}, 30_000);
+
+	test.skipIf(!ttyAvailable)("no blob, a corrupt blob, or SSH: the helper is never started", () => {
+		let files = hello();
+		let result = inTty(files, ["unlock", "--hello"]);
+		expect(result.output).toContain("not enrolled yet (pass-env hello enrol)");
+		files = enrolled();
+		writeFileSync(blob(files), "PEH1\x02junk");
+		result = inTty(files, ["unlock", "--hello"]);
+		expect(result.output).toContain("the saved blob is not valid (format version 2 is not supported)");
+		files = enrolled();
+		files.env.SSH_CONNECTION = "192.0.2.1 22 192.0.2.2 22";
+		result = inTty(files, ["unlock", "--hello"]);
+		expect(result.output).toContain("this is an SSH session");
+		for (const output of [result.output]) expect(output).toContain("Unlocked (checked with token)");
+		expect(helperCalls(files)).toBe("");
+	});
+
+	test.skipIf(!ttyAvailable)("a helper whose hash changed since install is not run", () => {
+		const files = enrolled();
+		const dir = join(files.root, "windows-local", "pass-env");
+		mkdirSync(dir, { recursive: true });
+		const helper = join(dir, "pass-env-hello.exe");
+		writeFileSync(helper, readFileSync(fakeHelper), { mode: 0o700 });
+		const digest = (path: string) => new Bun.CryptoHasher("sha256").update(readFileSync(path)).digest("hex");
+		writeFileSync(join(files.root, ".config", "pass-env", "hello-helper.json"),
+			JSON.stringify({ path: helper, sha256: digest(helper), version: "0.0.0-fake", installed: "2026-11-02T00:00:00.000Z" }), { mode: 0o600 });
+		delete files.env.PASS_ENV_HELLO_HELPER;
+		files.env.PASS_ENV_HELLO_TEST_DIR = join(files.root, "windows-local");
+		let result = inTty(files, ["unlock", "--hello"]);
+		expect(result.output).toContain("Unlocked with Windows Hello");
+		writeFileSync(helper, `${readFileSync(fakeHelper, "utf8")}\n// tampered\n`);
+		Bun.spawnSync({ cmd: ["rm", "-f", join(files.env.TEST_GPG_STATE!, "unlocked"), files.env.FAKE_HELLO_LOG!] });
+		result = inTty(files, ["unlock", "--hello"]);
+		expect(result.output).toContain("changed since it was installed (SHA-256 mismatch), so it was not run");
+		expect(result.output).toContain("Unlocked (checked with token)");
+		expect(helperCalls(files)).toBe("");
+		const status = invoke(files, ["hello", "status"]);
+		expect(status.status).toBe(1);
+		expect(status.stdout).toMatch(/^FAIL\s+the helper at .* changed since it was installed/m);
+	});
+
+	test("hello install rejects files that are not Windows programs, and needs a terminal or --yes", () => {
+		const files = hello();
+		files.env.PASS_ENV_HELLO_TEST_DIR = join(files.root, "windows-local");
+		const fake = join(files.root, "not-a-program.exe");
+		writeFileSync(fake, "#!/bin/sh\n");
+		expect(invoke(files, ["hello", "install", fake]).stderr).toContain("TTY:");
+		const result = invoke(files, ["hello", "install", fake, "--yes"]);
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("not a Windows program; nothing was installed");
+		expect(existsSync(join(files.root, ".config", "pass-env", "hello-helper.json"))).toBe(false);
+	});
+
+	test.skipIf(!ttyAvailable)("hello status, doctor and forget", () => {
+		const files = enrolled();
+		const status = invoke(files, ["hello", "status"]);
+		expect(status.status).toBe(0);
+		expect(status.stdout).toMatch(/^ok\s+Windows Hello helper 0\.0\.0-fake \(set by PASS_ENV_HELLO_HELPER, not hash-checked\)/m);
+		expect(status.stdout).toMatch(/^ok\s+Windows Hello available, TPM present, pass-env key present \(TPM-attested\)/m);
+		expect(status.stdout).toMatch(/^ok\s+enrolled: .*hello\.blob is well-formed \(key pass-env\)/m);
+		expect(invoke(files, ["doctor"]).stdout).toContain("Windows Hello helper 0.0.0-fake");
+		chmodSync(blob(files), 0o644);
+		expect(invoke(files, ["hello", "status"]).stdout).toMatch(/^warn\s+.*hello\.blob can be read by other users/m);
+		writeFileSync(blob(files), "junk");
+		expect(invoke(files, ["hello", "status"]).stdout).toMatch(/^FAIL\s+.*hello\.blob is not valid \(not a pass-env Hello blob\)/m);
+		const forget = inTty(files, ["hello", "forget"]);
+		expect(forget.status).toBe(0);
+		expect(forget.output).toContain("Deleted the pass-env Windows Hello key.");
+		expect(existsSync(blob(files))).toBe(false);
+		expect(helperCalls(files)).toEndWith("forget\n");
+	});
+
+	test("doctor stays quiet about Hello until it is used, and flags the helper as pinentry", () => {
+		const files = hello();
+		delete files.env.PASS_ENV_HELLO_HELPER;
+		expect(invoke(files, ["doctor"]).stdout).not.toContain("Windows Hello");
+		mkdirSync(files.env.GNUPGHOME!);
+		writeFileSync(join(files.env.GNUPGHOME!, "gpg-agent.conf"), "pinentry-program /mnt/c/x/pass-env-hello.exe\ndefault-cache-ttl 86400\nmax-cache-ttl 86400\n");
+		const result = invoke(files, ["doctor"]);
+		expect(result.stdout).toMatch(/^FAIL\s+pinentry-program is the Windows Hello helper/m);
+		expect(result.stdout).toMatch(/^ok\s+GPG unlock lasts 24h after use, at most 24h/m);
+	});
+
+	test("version matches package.json and the helper's Cargo.toml", () => {
+		const files = hello();
+		const version = invoke(files, ["version"]).stdout.trim();
+		const pkg = JSON.parse(readFileSync(join(import.meta.dir, "package.json"), "utf8")).version;
+		const cargo = readFileSync(join(import.meta.dir, "hello", "Cargo.toml"), "utf8").match(/^version = "(.+)"$/m)?.[1];
+		expect(version).toBe(`pass-env ${pkg}`);
+		expect(cargo).toBe(pkg);
+		expect(invoke(files, ["--version"]).stdout.trim()).toBe(version);
 	});
 });
