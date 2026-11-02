@@ -53,8 +53,8 @@ chmod +x ~/.local/bin/pass-env
 To check that a binary was built by this repository's release workflow from that tag (recommended, and required for trusting Windows Hello's pinned helper), with [gh](https://cli.github.com):
 
 ```sh
-gh attestation verify ~/.local/bin/pass-env --repo n8watkins/pass-env \
-  --signer-workflow n8watkins/pass-env/.github/workflows/release.yml --deny-self-hosted-runners
+gh attestation verify ~/.local/bin/pass-env --repo n8watkins/pass-env --source-ref refs/tags/v1.2.0 \
+  --signer-workflow n8watkins/pass-env/.github/workflows/release.yml --deny-self-hosted-runners   # the tag you downloaded
 ```
 
 **The script**, if you have [Bun](https://bun.sh):

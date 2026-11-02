@@ -238,10 +238,15 @@ impl Signer for HelloSigner {
 				let signature = result.Result().map_err(other)?;
 				// A real RSA PKCS#1 v1.5 SHA-256 signature by this key, so it is
 				// deterministic and really came from the Hello key.
-				if !self.verify(&input, &signature)? {
+				// Copy and wipe first, so a rejected signature is wiped too.
+				let copy = take_buffer(&signature)?;
+				let check = CryptographicBuffer::CreateFromByteArray(&copy).map_err(other)?;
+				let verified = self.verify(&input, &check);
+				let _ = take_buffer(&check);
+				if !verified? {
 					return Err(SignerError::Other);
 				}
-				take_buffer(&signature)
+				Ok(copy)
 			}
 			status => Err(status_error(status)),
 		}

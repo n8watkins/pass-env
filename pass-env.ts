@@ -735,15 +735,17 @@ function writePrivate(path: string, data: Uint8Array): void {
 function readRegular(path: string, max: number): Buffer | undefined {
 	let fd: number;
 	try {
-		fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+		// O_NONBLOCK: a FIFO in its place must not block the open.
+		fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		throw new CliError("CONFIG", `${tilde(path)} must be a regular file, not a symlink`);
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return undefined;
+		throw new CliError("CONFIG", code === "ELOOP" ? `${tilde(path)} must be a regular file, not a symlink` : `${tilde(path)} cannot be opened`);
 	}
 	try {
 		// Checked on the open descriptor, so the file cannot be swapped in between.
 		const info = fstatSync(fd);
-		if (!info.isFile()) throw new CliError("CONFIG", `${tilde(path)} must be a regular file, not a symlink`);
+		if (!info.isFile()) throw new CliError("CONFIG", `${tilde(path)} must be a regular file`);
 		if (info.size > max) throw new CliError("CONFIG", `${tilde(path)} is too large`);
 		const data = Buffer.alloc(info.size);
 		let offset = 0;

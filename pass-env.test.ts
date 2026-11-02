@@ -1411,7 +1411,7 @@ describe("Windows Hello unlock (fake helper)", () => {
 		expect(status.stdout).toMatch(/^FAIL\s+the helper at .* changed since it was installed/m);
 	});
 
-	test("a release build refuses PASS_ENV_HELLO_HELPER unless PASS_ENV_HELLO_HELPER_UNPINNED=1, and warns on every use", () => {
+	test("a release build refuses PASS_ENV_HELLO_HELPER unless PASS_ENV_HELLO_HELPER_UNPINNED=1, and it warns when used", () => {
 		const files = hello();
 		const status = invoke(files, ["hello", "status"]);
 		expect(status.stderr).toContain(`pass-env: using PASS_ENV_HELLO_HELPER=${fakeHelper}, which is not hash-checked`);
@@ -1420,6 +1420,20 @@ describe("Windows Hello unlock (fake helper)", () => {
 		const result = invoke(files, ["hello", "status"]);
 		if (pinned) expect(result.stdout).toMatch(/^FAIL\s+PASS_ENV_HELLO_HELPER is set, but this pass-env release pins its helper/m);
 		else expect(result.status).toBe(0);
+	});
+
+	test("a FIFO or symlink in place of the blob is refused at once, never read", () => {
+		const files = hello();
+		const dir = join(files.root, ".config", "pass-env");
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		expect(spawnSync("mkfifo", [join(dir, "hello.blob")]).status).toBe(0);
+		let result = invoke(files, ["hello", "status"]);
+		expect(result.stdout).toMatch(/^FAIL\s+.*hello\.blob must be a regular file/m);
+		rmSync(join(dir, "hello.blob"));
+		symlinkSync(join(files.root, "elsewhere"), join(dir, "hello.blob"));
+		writeFileSync(join(files.root, "elsewhere"), "PEH1");
+		result = invoke(files, ["hello", "status"]);
+		expect(result.stdout).toMatch(/^FAIL\s+.*hello\.blob must be a regular file, not a symlink/m);
 	});
 
 	test("hello install rejects files that are not Windows programs, and needs a terminal or --yes", () => {
