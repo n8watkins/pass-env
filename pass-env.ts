@@ -876,41 +876,40 @@ async function hardenProcess(): Promise<void> {
 
 const caller = () => `${process.env.WSL_DISTRO_NAME || "WSL"}: ${process.cwd()}`;
 
-function gpgSpawn(args: string[], extra: "pipe" | "ignore") {
-	return spawn("gpg", args, { stdio: ["ignore", "ignore", "pipe", extra] });
-}
-
 // True when gpg-agent can already decrypt the entry without asking.
-function gpgUnlocked(root: string, target: string): Promise<boolean> {
-	return new Promise((done) => {
-		const child = gpgSpawn(["--batch", "--quiet", "--no-tty", "--pinentry-mode", "error", "--decrypt", "--", join(root, `${target}.gpg`)], "ignore");
-		child.stderr!.resume();
-		child.on("error", () => done(false));
-		child.on("close", (code) => done(code === 0));
-	});
+async function gpgUnlocked(root: string, target: string): Promise<boolean> {
+	try {
+		const child = Bun.spawn({
+			cmd: ["gpg", "--batch", "--quiet", "--no-tty", "--pinentry-mode", "error", "--decrypt", "--", join(root, `${target}.gpg`)],
+			stdin: "ignore", stdout: "ignore", stderr: "ignore",
+		});
+		return await child.exited === 0;
+	} catch {
+		return false;
+	}
 }
 
-// Decrypts the entry with the passphrase given on fd 3, which warms gpg-agent's
-// cache under its normal TTL. The plaintext goes nowhere; stderr is only
+// Decrypts the entry with the passphrase on gpg's stdin (--passphrase-fd 0;
+// the ciphertext comes from the file argument), which warms gpg-agent's cache
+// under its normal TTL. The plaintext goes nowhere; stderr is only
 // classified, never shown.
-function loopbackDecrypt(root: string, target: string, passphrase: Uint8Array): Promise<"ok" | "bad" | "error"> {
-	return new Promise((done) => {
-		let child: ReturnType<typeof spawn>;
-		try {
-			child = gpgSpawn(["--batch", "--quiet", "--no-tty", "--pinentry-mode", "loopback", "--passphrase-fd", "3", "--decrypt", "--", join(root, `${target}.gpg`)], "pipe");
-		} catch {
-			done("error");
-			return;
-		}
-		let errors = "";
-		child.stderr!.on("data", (chunk: Buffer) => { errors += chunk.toString("utf8"); });
-		child.on("error", () => done("error"));
-		child.on("close", (code) => done(code === 0 ? "ok" : /bad passphrase/i.test(errors) ? "bad" : "error"));
-		const input = child.stdio[3] as import("node:stream").Writable;
-		input.on("error", () => { /* gpg may exit first. */ });
-		input.write(Buffer.from(passphrase.buffer, passphrase.byteOffset, passphrase.byteLength));
-		input.end("\n");
-	});
+async function loopbackDecrypt(root: string, target: string, passphrase: Uint8Array): Promise<"ok" | "bad" | "error"> {
+	let child;
+	try {
+		child = Bun.spawn({
+			cmd: ["gpg", "--batch", "--quiet", "--no-tty", "--pinentry-mode", "loopback", "--passphrase-fd", "0", "--decrypt", "--", join(root, `${target}.gpg`)],
+			stdin: "pipe", stdout: "ignore", stderr: "pipe",
+		});
+	} catch {
+		return "error";
+	}
+	try {
+		child.stdin.write(passphrase);
+		child.stdin.write("\n");
+		await child.stdin.end();
+	} catch { /* gpg may exit first. */ }
+	const [errors, code] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+	return code === 0 ? "ok" : /bad passphrase/i.test(errors) ? "bad" : "error";
 }
 
 function agentConf(): string {

@@ -41,7 +41,7 @@ pass-env unlock --hello   (needs a TTY)
   |                                              decrypt blob, zeroize
   |  stdout: passphrase  <--------------------  (pipe, never disk)
   v
-gpg --batch --pinentry-mode loopback --passphrase-fd 3 --decrypt <canary entry>
+gpg --batch --pinentry-mode loopback --passphrase-fd 0 --decrypt <canary entry>
   -> gpg-agent caches the passphrase under its normal TTL
   -> pass-env run / pipe / copy work as after a typed unlock
 ```
@@ -112,7 +112,7 @@ Exit codes are the protocol between pass-env and the helper:
 | `pass-env hello enrol` | Needs a TTY. Checks pass, GPG, the store and the private key (pointing at `pass-env doctor` and the setup docs if anything is missing), asks for the GPG passphrase through pinentry, proves it decrypts a store entry, then has the helper wrap it and writes the blob. |
 | `pass-env hello status` | Shows the helper's path, version and hash check, what Windows reports about Hello and the TPM (no prompt), and whether the blob is present and well-formed. |
 | `pass-env hello forget` | Deletes the blob and asks the helper to delete the Hello key. The typed passphrase is unaffected. |
-| `pass-env unlock --hello [entry]` | Needs a TTY. If GPG is already unlocked, says so and stops. Otherwise runs the helper, feeds the passphrase to `gpg --pinentry-mode loopback --passphrase-fd 3` decrypting the canary entry (the same entry plain `unlock` uses), and forgets it. On any failure it explains why and falls back to the typed unlock. |
+| `pass-env unlock --hello [entry]` | Needs a TTY. If GPG is already unlocked, says so and stops. Otherwise runs the helper, feeds the passphrase to `gpg --pinentry-mode loopback --passphrase-fd 0` decrypting the canary entry (the same entry plain `unlock` uses), and forgets it. On any failure it explains why and falls back to the typed unlock. |
 
 `PASS_ENV_HELLO_HELPER=<path>` points pass-env at another helper; tests use it with a fake helper, and it skips the WSL and hash checks, so only set it yourself.
 
@@ -123,7 +123,7 @@ Its plaintext goes to `/dev/null`.
 
 ### Passphrase handling in pass-env
 
-- Read from the helper's stdout into a `Uint8Array`, never converted to a string, and written once to gpg on file descriptor 3, then overwritten with zeros.
+- Read from the helper's stdout into a `Uint8Array`, never converted to a string, and written once to gpg's stdin (`--passphrase-fd 0`; the ciphertext comes from the file argument), then overwritten with zeros.
 - The enrol prompt uses pinentry (the `pinentry-program` from `gpg-agent.conf`, else `pinentry-curses`) over its Assuan protocol, so it looks and behaves like GPG's own prompt; the reply is decoded straight into a byte buffer.
 - Before the Hello and enrol paths pass-env marks itself non-dumpable (`prctl(PR_SET_DUMPABLE, 0)` through `bun:ffi`, best effort), which also stops other processes of the same user from attaching a debugger to it.
 - The JavaScript runtime may still keep copies it does not expose (for example inside stream buffers); this is a limit of the runtime, noted under "Memory disclosure" below.

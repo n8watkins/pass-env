@@ -72,8 +72,8 @@ process.stdout.write(readFileSync(file(args[2])));
 	writeFileSync(join(bin, "gpg"), `#!/bin/sh
 case " $* " in
 *" --pinentry-mode error "*) [ -e "$TEST_GPG_STATE/unlocked" ] && exit 0; echo "gpg: decryption failed: No secret key" >&2; exit 2;;
-*" --passphrase-fd 3 "*)
-	IFS= read -r given <&3
+*" --passphrase-fd 0 "*)
+	IFS= read -r given
 	if [ "$given" = "$TEST_GPG_PASSPHRASE" ]; then echo "loopback ok" >> "$TEST_PASS_CALLS"; : > "$TEST_GPG_STATE/unlocked"; exit 0; fi
 	echo "loopback bad" >> "$TEST_PASS_CALLS"; echo "gpg: public key decryption failed: Bad passphrase" >&2; exit 2;;
 esac
