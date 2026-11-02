@@ -1,0 +1,23 @@
+[package]
+name = "pass-env-hello-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.10"
+zeroize = { version = "=1.8.1", default-features = false, features = ["alloc"] }
+pass-env-hello = { path = ".." }
+
+[[bin]]
+name = "parse_blob"
+path = "fuzz_targets/parse_blob.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the helper's build.
+[workspace]

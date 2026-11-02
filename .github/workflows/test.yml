@@ -5,12 +5,15 @@ on:
   pull_request:
 permissions:
   contents: read
+# Third-party actions are pinned to commit SHAs (see docs/windows-hello.md).
 jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.2.18
       - run: sudo apt-get update && sudo apt-get install -y pass
@@ -21,3 +24,72 @@ jobs:
           bun build --compile pass-env.ts --outfile dist/pass-env
           PASS_ENV_BIN=dist/pass-env bun test
           PASS_ENV_BIN=dist/pass-env ./demo/e2e.sh
+
+  helper-linux:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: hello
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+      - run: cargo deny check
+      - run: cargo audit
+      - name: Fuzz the blob parser for 60 seconds
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz@0.13.2 --locked
+          cd fuzz && cargo +nightly fuzz run parse_blob -- -max_total_time=60 -max_len=4300
+
+  helper-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: hello
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Reproducible build (two folders, same SHA-256)
+        run: |
+          $hashes = foreach ($name in "a", "b") {
+            $dir = Join-Path $env:RUNNER_TEMP $name
+            New-Item -ItemType Directory -Path $dir | Out-Null
+            Get-ChildItem -Force -Exclude target | Copy-Item -Recurse -Destination $dir
+            & (Join-Path $dir "build-release.ps1") | Select-Object -Last 1
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          $hashes
+          if ($hashes[0] -ne $hashes[1]) { Write-Error "builds differ"; exit 1 }
+          Copy-Item (Join-Path $env:RUNNER_TEMP "a\target\release\pass-env-hello.exe") .
+      - name: The helper on a machine without Windows Hello
+        run: |
+          ./pass-env-hello.exe version
+          $json = ./pass-env-hello.exe check
+          $code = $LASTEXITCODE
+          $json
+          $status = $json | ConvertFrom-Json
+          if ($status.helper -ne "pass-env-hello" -or $status.protocol -ne 1) { Write-Error "bad check output"; exit 1 }
+          if ($status.hello -ne "available" -and $code -ne 3) { Write-Error "unsupported Hello must exit 3, got $code"; exit 1 }
+          "garbage" | ./pass-env-hello.exe unwrap --from ci
+          if ($LASTEXITCODE -ne 6) { Write-Error "a bad blob must exit 6, got $LASTEXITCODE"; exit 1 }
+          ./pass-env-hello.exe enrol --key "bad/name"
+          if ($LASTEXITCODE -ne 2) { Write-Error "a bad key name must exit 2, got $LASTEXITCODE"; exit 1 }
+          exit 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pass-env-hello-exe
+          path: hello/pass-env-hello.exe
+          retention-days: 14

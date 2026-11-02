@@ -1,0 +1,48 @@
+[package]
+name = "pass-env-hello"
+version = "1.2.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Windows Hello helper for pass-env: wraps the GPG passphrase with a TPM-backed Windows Hello key"
+repository = "https://github.com/n8watkins/pass-env"
+publish = false
+
+[lib]
+name = "pass_env_hello"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pass-env-hello"
+path = "src/main.rs"
+
+# Exact versions on purpose: upgrades are explicit, reviewed changes (see docs/windows-hello.md).
+[dependencies]
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+hkdf = "=0.12.4"
+sha2 = { version = "=0.10.9", default-features = false }
+zeroize = { version = "=1.8.1", default-features = false, features = ["alloc"] }
+getrandom = "=0.2.16"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+	"Foundation",
+	"Security_Credentials",
+	"Security_Cryptography",
+	"Security_Cryptography_Core",
+	"Storage_Streams",
+	"Win32_Foundation",
+	"Win32_Security_Cryptography",
+	"Win32_System_WinRT",
+	"Win32_UI_WindowsAndMessaging",
+] }
+windows-future = "=0.3.2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+debug = false
+strip = true
+incremental = false

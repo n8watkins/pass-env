@@ -17,6 +17,9 @@ Each step keeps the existing rule: pass-env never prints a secret value.
 - **Scan history for `scrub`**: skip unchanged files, read only the new end of growing logs, and `scrub --history`.
   See "Scan history" in the README.
 
+- **Windows Hello unlock** (experimental): `pass-env unlock --hello`, see `docs/windows-hello.md`.
+  Leaves experimental once the owner's manual test (`docs/windows-hello-manual-test.md`) passes.
+
 ### Decisions that differ from the original plan
 
 - An unquoted value containing `#` with no space before it (`KEY=abc#def`) is skipped with a reason.
@@ -44,8 +47,7 @@ Each step keeps the existing rule: pass-env never prints a secret value.
 
 Nothing from the audit of real projects was skipped.
 
-1. **Publish the first release.**
-   The owner pushes a tag (`git tag v1.1.0 && git push origin v1.1.0`); the workflow does the rest.
+1. **Windows Hello out of experimental** after the manual test.
 2. **npm package `pass-env`.** The name is free.
    Install would be `bun add -g pass-env` or `bunx pass-env`.
    It still needs Bun at runtime, and the owner has to log in to npm once to publish.
