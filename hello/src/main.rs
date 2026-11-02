@@ -27,7 +27,7 @@ const BAD_BLOB: u8 = 6;
 const OTHER: u8 = 7;
 
 fn usage() -> ExitCode {
-	eprintln!("usage: pass-env-hello version | check | enrol --from <who> | unwrap --from <who> | forget");
+	eprintln!("usage: pass-env-hello version | check [--key <name>] | enrol [--from <who>] [--key <name>] | unwrap [--from <who>] | forget [--key <name>]");
 	eprintln!("Run by pass-env (pass-env hello enrol, pass-env unlock --hello), not by hand.");
 	ExitCode::from(USAGE)
 }
@@ -84,12 +84,37 @@ fn sanitize(from: &str) -> String {
 	}
 }
 
-fn from_argument(args: &[String]) -> Option<String> {
-	match args {
-		[] => Some("an unknown caller".into()),
-		[flag, value] if flag == "--from" => Some(sanitize(value)),
-		_ => None,
+/// Flags after the subcommand: `--from <who>` (shown in the notice) and
+/// `--key <name>` (the Windows Hello key; default "pass-env"). Each at most
+/// once, only where allowed; anything else is a usage error.
+#[derive(Debug, PartialEq, Eq)]
+struct Flags {
+	from: String,
+	key: String,
+}
+
+fn parse_flags(args: &[String], allow_from: bool, allow_key: bool) -> Option<Flags> {
+	let mut flags = Flags {
+		from: "an unknown caller".into(),
+		key: KEY_NAME.into(),
+	};
+	let (mut seen_from, mut seen_key) = (false, false);
+	let mut rest = args;
+	while let [flag, value, tail @ ..] = rest {
+		match flag.as_str() {
+			"--from" if allow_from && !seen_from => {
+				flags.from = sanitize(value);
+				seen_from = true;
+			}
+			"--key" if allow_key && !seen_key && pass_env_hello::valid_key_name(value) => {
+				flags.key = value.clone();
+				seen_key = true;
+			}
+			_ => return None,
+		}
+		rest = tail;
 	}
+	rest.is_empty().then_some(flags)
 }
 
 fn notice(from: &str, what: &str) {
@@ -102,34 +127,35 @@ fn main() -> ExitCode {
 	let Some((command, rest)) = args.split_first() else {
 		return usage();
 	};
-	match command.as_str() {
-		"version" | "--version" if rest.is_empty() => {
+	let flags = match command.as_str() {
+		"check" | "forget" => parse_flags(rest, false, true),
+		"enrol" => parse_flags(rest, true, true),
+		"unwrap" => parse_flags(rest, true, false),
+		_ => None,
+	};
+	match (command.as_str(), flags) {
+		("version" | "--version", _) if rest.is_empty() => {
 			println!("pass-env-hello {VERSION}");
 			ExitCode::from(OK)
 		}
-		"check" if rest.is_empty() => check(),
-		"enrol" => match from_argument(rest) {
-			Some(from) => enrol(&from),
-			None => usage(),
-		},
-		"unwrap" => match from_argument(rest) {
-			Some(from) => unwrap(&from),
-			None => usage(),
-		},
-		"forget" if rest.is_empty() => forget(),
+		("check", Some(flags)) => check(&flags.key),
+		("enrol", Some(flags)) => enrol(&flags.from, &flags.key),
+		// The key name comes from the blob.
+		("unwrap", Some(flags)) => unwrap(&flags.from),
+		("forget", Some(flags)) => forget(&flags.key),
 		_ => usage(),
 	}
 }
 
 #[cfg(not(windows))]
-fn check() -> ExitCode {
+fn check(_key: &str) -> ExitCode {
 	println!("{{\"helper\":\"pass-env-hello\",\"version\":\"{VERSION}\",\"protocol\":{PROTOCOL},\"hello\":\"unsupported\",\"tpm\":\"unknown\",\"key\":\"unknown\",\"attestation\":\"unknown\"}}");
 	ExitCode::from(UNAVAILABLE)
 }
 
 #[cfg(windows)]
-fn check() -> ExitCode {
-	let status = hello::status(KEY_NAME);
+fn check(key: &str) -> ExitCode {
+	let status = hello::status(key);
 	println!(
 		"{{\"helper\":\"pass-env-hello\",\"version\":\"{VERSION}\",\"protocol\":{PROTOCOL},\"hello\":\"{}\",\"tpm\":\"{}\",\"key\":\"{}\",\"attestation\":\"{}\"}}",
 		status.hello, status.tpm, status.key, status.attestation,
@@ -152,12 +178,12 @@ fn write_stdout(bytes: &[u8]) -> ExitCode {
 }
 
 #[cfg(not(windows))]
-fn enrol(_from: &str) -> ExitCode {
+fn enrol(_from: &str, _key: &str) -> ExitCode {
 	fail(UNAVAILABLE, "pass-env-hello only runs on Windows")
 }
 
 #[cfg(windows)]
-fn enrol(from: &str) -> ExitCode {
+fn enrol(from: &str, key: &str) -> ExitCode {
 	if let Some(code) = refuse_terminal_stdout() {
 		return code;
 	}
@@ -168,11 +194,11 @@ fn enrol(from: &str) -> ExitCode {
 		from,
 		"save your GPG passphrase (up to three prompts: create the key, use it, check it)",
 	);
-	let signer = match hello::open_or_create(KEY_NAME) {
+	let signer = match hello::open_or_create(key) {
 		Ok(signer) => signer,
 		Err(error) => return error_exit(Error::Signer(error)),
 	};
-	match pass_env_hello::wrap(&signer, KEY_NAME, &secret) {
+	match pass_env_hello::wrap(&signer, key, &secret) {
 		Ok(blob) => write_stdout(&blob),
 		Err(error) => error_exit(error),
 	}
@@ -208,15 +234,15 @@ fn unwrap(from: &str) -> ExitCode {
 }
 
 #[cfg(not(windows))]
-fn forget() -> ExitCode {
+fn forget(_key: &str) -> ExitCode {
 	fail(UNAVAILABLE, "pass-env-hello only runs on Windows")
 }
 
 #[cfg(windows)]
-fn forget() -> ExitCode {
-	match hello::delete(KEY_NAME) {
+fn forget(key: &str) -> ExitCode {
+	match hello::delete(key) {
 		Ok(()) => {
-			eprintln!("pass-env-hello: deleted the Windows Hello key {KEY_NAME}");
+			eprintln!("pass-env-hello: deleted the Windows Hello key {key}");
 			ExitCode::from(OK)
 		}
 		Err(error) => error_exit(Error::Signer(error)),
@@ -235,10 +261,25 @@ mod tests {
 	}
 
 	#[test]
-	fn from_flag_is_strict() {
-		assert_eq!(from_argument(&[]), Some("an unknown caller".into()));
-		assert_eq!(from_argument(&["--from".into(), "x".into()]), Some("x".into()));
-		assert_eq!(from_argument(&["--from".into()]), None);
-		assert_eq!(from_argument(&["x".into(), "y".into()]), None);
+	fn flags_are_strict() {
+		let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+		let default = Flags {
+			from: "an unknown caller".into(),
+			key: KEY_NAME.into(),
+		};
+		assert_eq!(parse_flags(&args(&[]), true, true), Some(default));
+		assert_eq!(
+			parse_flags(&args(&["--from", "x", "--key", "test-1"]), true, true),
+			Some(Flags {
+				from: "x".into(),
+				key: "test-1".into()
+			})
+		);
+		assert_eq!(parse_flags(&args(&["--from"]), true, true), None);
+		assert_eq!(parse_flags(&args(&["--key", "a/b"]), true, true), None);
+		assert_eq!(parse_flags(&args(&["--key", "k"]), true, false), None);
+		assert_eq!(parse_flags(&args(&["--from", "x"]), false, true), None);
+		assert_eq!(parse_flags(&args(&["--from", "x", "--from", "y"]), true, true), None);
+		assert_eq!(parse_flags(&args(&["x", "y"]), true, true), None);
 	}
 }

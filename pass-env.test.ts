@@ -1291,6 +1291,19 @@ describe("Windows Hello unlock (fake helper)", () => {
 		expect(statSync(dirname(blob(files))).mode & 0o777).toBe(0o700);
 	});
 
+	test.skipIf(!ttyAvailable)("PASS_ENV_HELLO_KEY picks another Windows Hello key, kept in the blob", () => {
+		const files = hello();
+		files.env.PASS_ENV_HELLO_KEY = "pass-env-test-1";
+		expect(inTty(files, ["hello", "enrol"]).status).toBe(0);
+		expect(helperCalls(files)).toContain("enrol --from Synthetic-WSL: ");
+		expect(helperCalls(files)).toContain(" --key pass-env-test-1\n");
+		expect(readFileSync(blob(files)).subarray(6, 21).toString()).toBe("pass-env-test-1");
+		rmSync(join(files.env.TEST_GPG_STATE!, "unlocked"));
+		expect(inTty(files, ["unlock", "--hello"]).output).toContain("Unlocked with Windows Hello");
+		files.env.PASS_ENV_HELLO_KEY = "bad/name";
+		expect(invoke(files, ["hello", "status"]).stderr).toContain("USAGE: PASS_ENV_HELLO_KEY must be");
+	});
+
 	test.skipIf(!ttyAvailable)("enrol refuses a wrong or cancelled passphrase and saves nothing", () => {
 		const files = hello();
 		files.env.FAKE_PIN = "not-it";

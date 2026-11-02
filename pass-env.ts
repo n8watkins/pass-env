@@ -874,6 +874,15 @@ async function hardenProcess(): Promise<void> {
 	} catch { /* Not available: carry on. */ }
 }
 
+// The Windows Hello key name; PASS_ENV_HELLO_KEY picks another, for example a
+// throwaway key for testing. unwrap takes it from the blob instead.
+function keyArgs(): string[] {
+	const name = process.env.PASS_ENV_HELLO_KEY;
+	if (name === undefined || name === "") return [];
+	if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) throw new CliError("USAGE", "PASS_ENV_HELLO_KEY must be 1 to 64 letters, digits, dots, dashes or underscores", 2);
+	return ["--key", name];
+}
+
 const caller = () => `${process.env.WSL_DISTRO_NAME || "WSL"}: ${process.cwd()}`;
 
 // True when gpg-agent can already decrypt the entry without asking.
@@ -1068,7 +1077,7 @@ async function helloUnlock(root: string, entry: string | undefined): Promise<{ t
 type HelloCheck = { hello?: string; tpm?: string; key?: string; attestation?: string; version?: string };
 
 async function helperCheck(path: string): Promise<{ code: number; status: HelloCheck }> {
-	const result = await runHelper(path, ["check"], undefined, 4096, 20_000);
+	const result = await runHelper(path, ["check", ...keyArgs()], undefined, 4096, 20_000);
 	let status: HelloCheck = {};
 	try { status = JSON.parse(result.out.toString("utf8")) as HelloCheck; } catch { /* Reported by the caller. */ }
 	return { code: result.code, status };
@@ -1104,7 +1113,7 @@ async function helloEnrol(entry: string | undefined): Promise<void> {
 		console.log("Passphrase checked. GPG is unlocked now.");
 		console.log("Step 2 of 2: confirm with Windows Hello. There can be up to three prompts: create the key, use it, check it.");
 		await hardenProcess();
-		const result = await runHelper(helper.path, ["enrol", "--from", caller()], passphrase, MAX_BLOB);
+		const result = await runHelper(helper.path, ["enrol", "--from", caller(), ...keyArgs()], passphrase, MAX_BLOB);
 		if (result.code !== 0) throw new CliError("HELLO", `${helperFailure(result)}; nothing was saved`);
 		const bad = blobProblem(result.out);
 		if (bad) throw new CliError("HELLO", `the helper returned an invalid blob (${bad}); nothing was saved`);
@@ -1282,7 +1291,7 @@ async function helloForget(): Promise<void> {
 		console.log(`The Windows Hello key was not deleted: ${helper.problem}. Without the blob it unlocks nothing.`);
 		return;
 	}
-	const result = await runHelper(helper.path, ["forget"], undefined, 0, 60_000);
+	const result = await runHelper(helper.path, ["forget", ...keyArgs()], undefined, 0, 60_000);
 	console.log(result.code === 0 ? "Deleted the pass-env Windows Hello key." : `The Windows Hello key was not deleted: ${helperFailure(result)}. Without the blob it unlocks nothing.`);
 	console.log("Your typed GPG passphrase works as before.");
 }

@@ -10,8 +10,8 @@ const [command, ...rest] = process.argv.slice(2);
 const mode = process.env.FAKE_HELLO_MODE ?? "ok";
 if (process.env.FAKE_HELLO_LOG) appendFileSync(process.env.FAKE_HELLO_LOG, `${[command, ...rest].join(" ")}\n`);
 const codes: Record<string, number> = { unavailable: 3, cancel: 4, locked: 5, corrupt: 6, other: 7 };
-const name = Buffer.from("pass-env");
-const header = Buffer.concat([Buffer.from("PEH1"), Buffer.from([1, name.length]), name, Buffer.alloc(32, 1), Buffer.alloc(12, 2)]);
+const header = (name: Buffer) => Buffer.concat([Buffer.from("PEH1"), Buffer.from([1, name.length]), name, Buffer.alloc(32, 1), Buffer.alloc(12, 2)]);
+const xorHeader = (key: string) => header(Buffer.from(key));
 const xor = (bytes: Uint8Array) => Buffer.from(bytes.map((byte) => byte ^ 0x5a));
 
 if (command === "version") {
@@ -24,13 +24,17 @@ if (command === "check") {
 	process.exit(available ? 0 : 3);
 }
 if (command === "forget") process.exit(0);
-if ((command !== "enrol" && command !== "unwrap") || rest[0] !== "--from" || rest.length !== 2) process.exit(2);
+const keyFlag = rest.indexOf("--key");
+const keyName = keyFlag === -1 ? "pass-env" : rest[keyFlag + 1];
+if ((command !== "enrol" && command !== "unwrap") || rest[0] !== "--from" || (rest.length !== 2 && !(command === "enrol" && rest.length === 4 && keyFlag === 2))) process.exit(2);
 const input = Buffer.from(await Bun.stdin.arrayBuffer());
 console.error(`fake-hello: request from ${rest[1]}`);
 if (mode in codes) process.exit(codes[mode]);
 if (command === "enrol") {
-	process.stdout.write(Buffer.concat([header, xor(input), Buffer.alloc(16)]));
+	process.stdout.write(Buffer.concat([xorHeader(keyName), xor(input), Buffer.alloc(16)]));
 	process.exit(0);
 }
-if (!input.subarray(0, header.length).equals(header) || input.length < header.length + 17) process.exit(6);
-process.stdout.write(mode === "wrong" ? Buffer.from("not-the-passphrase") : xor(input.subarray(header.length, input.length - 16)));
+const blobKey = input.subarray(6, 6 + (input[5] ?? 0)).toString("latin1");
+const expected = xorHeader(blobKey);
+if (!input.subarray(0, expected.length).equals(expected) || input.length < expected.length + 17) process.exit(6);
+process.stdout.write(mode === "wrong" ? Buffer.from("not-the-passphrase") : xor(input.subarray(expected.length, input.length - 16)));
