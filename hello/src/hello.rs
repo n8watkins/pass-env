@@ -12,6 +12,9 @@ use windows::core::{w, Interface, HSTRING, PCWSTR};
 use windows::Security::Credentials::{
 	KeyCredential, KeyCredentialAttestationStatus, KeyCredentialCreationOption, KeyCredentialManager, KeyCredentialStatus,
 };
+use windows::Security::Cryptography::Core::{
+	AsymmetricAlgorithmNames, AsymmetricKeyAlgorithmProvider, CryptographicEngine, CryptographicPublicKeyBlobType,
+};
 use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Storage::Streams::IBuffer;
 use windows::Win32::Security::Cryptography::{
@@ -121,6 +124,24 @@ fn checked(key: KeyCredential) -> Result<HelloSigner, SignerError> {
 	Ok(HelloSigner { key })
 }
 
+/// Enrol is stricter: the key must prove it lives in the TPM (attestation
+/// Success). Attestation can fail temporarily, so try a few times.
+fn attested(key: KeyCredential) -> Result<HelloSigner, SignerError> {
+	if !tpm_present() {
+		return Err(SignerError::Unavailable);
+	}
+	for attempt in 0..3 {
+		match attestation(&key) {
+			"tpm" => return Ok(HelloSigner { key }),
+			"software" => return Err(SignerError::Unavailable),
+			_ if attempt < 2 => std::thread::sleep(Duration::from_secs(2)),
+			_ => {}
+		}
+	}
+	eprintln!("pass-env-hello: Windows could not attest that the key is in the TPM (try again later)");
+	Err(SignerError::Unavailable)
+}
+
 fn require_hello() -> Result<(), SignerError> {
 	if supported() {
 		Ok(())
@@ -142,7 +163,7 @@ pub fn open_or_create(name: &str) -> Result<HelloSigner, SignerError> {
 	// Windows 11 25H2 throws NCrypt 0x80098044 from RequestCreateAsync(FailIfExists)
 	// even for new names, so probe first and only create when really absent.
 	if let Some(key) = open_existing(name)? {
-		return checked(key);
+		return attested(key);
 	}
 	let focus = focus_hello_window();
 	let created = KeyCredentialManager::RequestCreateAsync(&HSTRING::from(name), KeyCredentialCreationOption::ReplaceExisting)
@@ -150,7 +171,7 @@ pub fn open_or_create(name: &str) -> Result<HelloSigner, SignerError> {
 	drop(focus);
 	let created = created.map_err(other)?;
 	match created.Status().map_err(other)? {
-		KeyCredentialStatus::Success => checked(created.Credential().map_err(other)?),
+		KeyCredentialStatus::Success => attested(created.Credential().map_err(other)?),
 		status => Err(status_error(status)),
 	}
 }
@@ -185,6 +206,26 @@ fn take_buffer(buffer: &IBuffer) -> Result<Zeroizing<Vec<u8>>, SignerError> {
 	}
 }
 
+/// RSA PKCS#1 v1.5 SHA-256 verification against an X.509 SubjectPublicKeyInfo.
+fn verify_with(public: &IBuffer, data: &IBuffer, signature: &IBuffer) -> Result<bool, SignerError> {
+	let provider =
+		AsymmetricKeyAlgorithmProvider::OpenAlgorithm(&AsymmetricAlgorithmNames::RsaSignPkcs1Sha256().map_err(other)?).map_err(other)?;
+	let key = provider
+		.ImportPublicKeyWithBlobType(public, CryptographicPublicKeyBlobType::X509SubjectPublicKeyInfo)
+		.map_err(other)?;
+	CryptographicEngine::VerifySignature(&key, data, signature).map_err(other)
+}
+
+impl HelloSigner {
+	fn verify(&self, data: &IBuffer, signature: &IBuffer) -> Result<bool, SignerError> {
+		let public = self
+			.key
+			.RetrievePublicKeyWithBlobType(CryptographicPublicKeyBlobType::X509SubjectPublicKeyInfo)
+			.map_err(other)?;
+		verify_with(&public, data, signature)
+	}
+}
+
 impl Signer for HelloSigner {
 	fn sign(&self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>, SignerError> {
 		let input = CryptographicBuffer::CreateFromByteArray(data).map_err(other)?;
@@ -193,7 +234,15 @@ impl Signer for HelloSigner {
 		drop(focus);
 		let result = result.map_err(other)?;
 		match result.Status().map_err(other)? {
-			KeyCredentialStatus::Success => take_buffer(&result.Result().map_err(other)?),
+			KeyCredentialStatus::Success => {
+				let signature = result.Result().map_err(other)?;
+				// A real RSA PKCS#1 v1.5 SHA-256 signature by this key, so it is
+				// deterministic and really came from the Hello key.
+				if !self.verify(&input, &signature)? {
+					return Err(SignerError::Other);
+				}
+				take_buffer(&signature)
+			}
 			status => Err(status_error(status)),
 		}
 	}
@@ -218,4 +267,30 @@ fn focus_hello_window() -> mpsc::SyncSender<()> {
 		}
 	});
 	stop
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The same verification code against a throwaway software RSA key
+	/// (Windows Hello keys cannot be created in a test).
+	#[test]
+	fn verify_with_accepts_good_and_rejects_bad_signatures() {
+		let provider = AsymmetricKeyAlgorithmProvider::OpenAlgorithm(&AsymmetricAlgorithmNames::RsaSignPkcs1Sha256().unwrap()).unwrap();
+		let pair = provider.CreateKeyPair(2048).unwrap();
+		let public = pair
+			.ExportPublicKeyWithBlobType(CryptographicPublicKeyBlobType::X509SubjectPublicKeyInfo)
+			.unwrap();
+		let data = CryptographicBuffer::CreateFromByteArray(b"pass-env-hello v1 unwrap key\0k\0salt").unwrap();
+		let signature = CryptographicEngine::Sign(&pair, &data).unwrap();
+		assert!(verify_with(&public, &data, &signature).unwrap());
+		let again = CryptographicEngine::Sign(&pair, &data).unwrap();
+		assert!(
+			CryptographicBuffer::Compare(&signature, &again).unwrap(),
+			"PKCS#1 v1.5 is deterministic"
+		);
+		let other = CryptographicBuffer::CreateFromByteArray(b"something else").unwrap();
+		assert!(!verify_with(&public, &other, &signature).unwrap());
+	}
 }

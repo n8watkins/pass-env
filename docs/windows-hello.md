@@ -11,7 +11,8 @@ The owner's hands-on checklist is [windows-hello-manual-test.md](windows-hello-m
 
 Unlock GPG for pass-env with a fingerprint, face or Windows Hello PIN instead of typing the GPG passphrase every day, without weakening what pass-env already guarantees:
 
-- An agent without a terminal still cannot start an unlock.
+- pass-env itself still refuses to start an unlock without a terminal, and the helper is never a pinentry, so an agent's ordinary `pass`, `gpg` or `pass-env` calls never raise a prompt.
+  This is a guard against accidents, not a security boundary: a process running as you can fake a terminal or run the helper directly (see "prompt phishing" below).
 - No secret is ever printed, logged, put in argv or the environment, or written to disk in plaintext.
 - GPG stays the only thing that holds the store's key; Hello only replaces the typing.
 
@@ -85,9 +86,11 @@ Exit codes are the protocol between pass-env and the helper:
 - **Focus**: Hello's dialog can open behind the terminal; a short-lived thread finds the `Credential Dialog Xaml Host` window and brings it to the front.
 - **TPM check**: before creating or using the key the helper checks `KeyCredentialManager.IsSupportedAsync()`, that the TPM platform crypto provider opens, and asks the key for a TPM attestation (`GetAttestationAsync`).
   An attestation answer of `NotSupported` means a software key, and the helper refuses it (exit 3).
-  A temporary attestation failure (for example no network for the attestation certificate) is reported by `check` and `hello status` but does not block use while the TPM provider is present.
-- **Wrapping**: enrol picks a random 32-byte salt and asks Hello to sign it.
-  `RequestSignAsync` uses RSA PKCS#1 v1.5 with SHA-256, which is deterministic: the same key signing the same salt gives the same signature every time.
+  Enrol requires a successful attestation (three tries, two seconds apart), so a key is only ever enrolled once Windows has proven it lives in the TPM.
+  When unlocking, a temporary attestation failure (for example no network for the attestation certificate) does not block use while the TPM provider is present, because the key was attested at enrol; `check` and `hello status` show the current answer.
+- **Wrapping**: enrol picks a random 32-byte salt and asks Hello to sign `"pass-env-hello v1 unwrap key\0" || key name || "\0" || salt`, never the bare salt, so a signature another program obtains from the same key can never be the one pass-env uses.
+  `RequestSignAsync` uses RSA PKCS#1 v1.5 with SHA-256, which is deterministic: the same key signing the same message gives the same signature every time.
+  The helper verifies every signature against the key's public key (`RsaSignPkcs1Sha256`) before using it, so the key material is a genuine signature by that key and not whatever a broken or changed API returned.
   `HKDF-SHA256(ikm = signature, salt = salt, info = "pass-env-hello v1 aes-256-gcm")` gives a 256-bit key, and AES-256-GCM with a random 96-bit nonce encrypts the passphrase.
   Enrol then runs a full unwrap (a second gesture) and compares the result with the passphrase before saving anything, so a non-deterministic signer can never leave a blob that cannot be opened.
 - **Blob**, binary, at `${XDG_CONFIG_HOME:-~/.config}/pass-env/hello.blob`, mode 600, folder mode 700:
@@ -150,7 +153,7 @@ The existing baseline: while gpg-agent's cache is warm, anything running as the 
 | Prompt phishing: something else triggers a Hello prompt and you approve it out of habit | The helper prints who asked (distro and folder) in the terminal that started it; pass-env tells you a prompt is coming; docs say to approve only prompts you just started | Makes an unexpected prompt noticeable | Windows' Hello dialog cannot show a custom message, and the caller controls the `--from` text. If you approve a prompt you did not start, the caller gets the passphrase. Cancel any unexpected prompt and run `pass-env hello status` |
 | Same-user Windows process | None beyond Windows itself | Nothing specific | It can read `\\wsl.localhost\...`, replace `%LOCALAPPDATA%\pass-env\pass-env-hello.exe` between the hash check and the start, and read the helper's memory. Out of scope, as for every user-level tool |
 | Tampered helper binary on disk | pass-env hashes the file before every run and compares it with the hash pinned in the pass-env release (or, for the script, the hash recorded by `hello install`); mismatch means no run and a typed fallback | Corruption, a stale or swapped copy, a downgrade, a write by another principal | A same-user attacker who rewrites both the helper and pass-env (or the record). Time-of-check to time-of-use between hashing and starting is narrowed by hashing immediately before the start, not eliminated |
-| Malicious or compromised release | Built only by GitHub Actions from a tag on `main`; SHA-256 sums; Sigstore build provenance (`actions/attest-build-provenance`); `hello install` verifies the pinned hash and runs `gh attestation verify` with the workflow identity when `gh` exists; no auto-update | A tampered download, a release asset swapped after publishing, an artifact not built by this repository's workflow | A compromise of the repository itself (a malicious commit merged to `main`) or of GitHub. Branch protection and required reviews are the owner's controls here |
+| Malicious or compromised release | Built only by GitHub Actions from a tag on `main`; SHA-256 sums; Sigstore build provenance (`actions/attest-build-provenance`); `hello install` verifies the pinned hash and runs `gh attestation verify` with the workflow identity when `gh` exists; no auto-update | A tampered download, a release asset swapped after publishing, an artifact not built by this repository's workflow | Replacing pass-env, the helper and `SHA256SUMS` together: the pin lives inside pass-env, so it only stops a swapped helper. Verify pass-env's own provenance at install (README). A compromise of the repository itself (a malicious commit merged to `main`) or of GitHub. Branch protection, required checks and tag protection are the owner's controls here |
 | Compromised dependency | Few dependencies, exact versions, committed `Cargo.lock`, `cargo-deny` (licenses, sources, advisories, bans) and `cargo-audit` in CI, crates.io only | Known advisories, unexpected sources, version drift | A malicious release of a pinned crate that nobody has reported yet. Dependencies are the `windows` crates and RustCrypto (`aes-gcm`, `hkdf`, `sha2`, `zeroize`, `getrandom`) |
 | Tampered blob | Strict parser, AES-GCM tag, header bound as associated data | Bit flips, swapped fields, a blob from another key or salt, truncation | Deleting the blob (denial of service only: the typed unlock still works) |
 | Replay | A blob only opens with this machine's TPM key and a gesture; re-enrol uses a fresh salt and nonce | An old blob restored by an attacker still needs a gesture and yields only an old passphrase, which gpg rejects if it changed | The signature over a salt is a stable secret: anyone who once read it from the helper's memory can open that blob forever. Re-enrol after any suspected compromise, and change the GPG passphrase |
@@ -175,9 +178,10 @@ The existing baseline: while gpg-agent's cache is warm, anything running as the 
 ## Release and supply chain
 
 - `.github/workflows/release.yml` runs on a `v*` tag, first checking that the tagged commit is on `main`.
-- A `windows-latest` job runs `cargo test`, `cargo deny check` and `cargo audit`, builds `pass-env-hello.exe` twice in two folders and requires identical hashes (a reproducibility check), and uploads it with its SHA-256.
+- A Linux job runs `cargo deny check` and `cargo audit`; a `windows-latest` job runs `cargo test`, builds `pass-env-hello.exe` twice in two folders and requires identical hashes (a reproducibility check), and uploads it with its SHA-256.
 - The toolchain is pinned (`hello/rust-toolchain.toml`), the CRT is linked statically, `/Brepro` removes linker timestamps and `--remap-path-prefix` removes local paths (`hello/build-release.ps1`), so the same commit gives the same SHA-256 with the same toolchain and MSVC linker; CI builds twice in two folders on the runner and compares. A build on another PC can differ when its Visual Studio linker version differs, so users verify releases by provenance, not by rebuilding.
-- The Linux job pins that hash into `pass-env.ts` (`PINNED_HELPER_SHA256`, and `RELEASE_REPO`), checks the pin was applied exactly once, builds the binaries from the pinned file, runs the tests, attaches the pinned `pass-env.ts`, the binaries, `pass-env-hello.exe` and `SHA256SUMS`, and creates build provenance attestations for all of them.
+- A Linux job with read-only permissions pins that hash into `pass-env.ts` (`PINNED_HELPER_SHA256`, and `RELEASE_REPO`), checks the pin was applied exactly once, runs the tests, builds the binaries from the pinned file and writes `SHA256SUMS`.
+- A last, minimal job is the only one that can write the release or sign provenance; it runs only first-party actions and `gh`: it checks the sums, creates build provenance attestations for every asset (the binaries, the pinned `pass-env.ts` and `pass-env-hello.exe`) and publishes them.
 - Third-party actions are pinned to commit SHAs.
 - Forks: without a release, nothing about Hello runs; `hello install <file>` with a self-built helper records its hash locally.
 
@@ -192,9 +196,12 @@ gh attestation verify pass-env-hello.exe --repo n8watkins/pass-env \
 
 `pass-env hello install` does the same checks itself, and `pass-env hello status` shows the hash it expects and the one on disk.
 
+The pin only proves the helper belongs to the same release as your pass-env: an attacker who controls the release channel could replace pass-env, the helper and `SHA256SUMS` together.
+So verify pass-env itself the same way when you install it (the README shows how), and prefer the attested `pass-env.ts` or binary from a tagged release over the script on `main`, which carries no pin.
+
 ## Testing
 
-- Rust unit tests (`cargo test` in `hello/`, Linux and Windows): blob round trip, every tampered field rejected, wrong key rejected, length limits, trailing bytes, a fake signer trait, and a non-deterministic signer caught by enrol's check.
+- Rust unit tests (`cargo test` in `hello/`, Linux and Windows): blob round trip, a known answer, every tampered field rejected, wrong key rejected, length limits, trailing bytes, the domain-separated signed message, a fake signer trait, a non-deterministic signer caught by enrol's check, and (Windows) the signature verification code against a throwaway software RSA key.
 - A fuzz target for the blob parser (`hello/fuzz`, `cargo fuzz run parse_blob`), run for a short time in CI.
 - Bun tests with `PASS_ENV_HELLO_HELPER` pointing at a fake helper: success, cancel, unavailable, locked, corrupt blob, wrong passphrase, already unlocked, no TTY, SSH, hash mismatch, and each falling back to the typed unlock; enrol's prerequisites and passphrase check; status, forget and doctor output.
 - `demo/e2e.sh` runs enrol and `unlock --hello` against real GPG in a throwaway `GNUPGHOME`, with the fake helper and a fake pinentry, in a pseudo-terminal.

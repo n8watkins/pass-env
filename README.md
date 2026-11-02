@@ -50,6 +50,13 @@ curl -fsSL https://github.com/n8watkins/pass-env/releases/latest/download/pass-e
 chmod +x ~/.local/bin/pass-env
 ```
 
+To check that a binary was built by this repository's release workflow from that tag (recommended, and required for trusting Windows Hello's pinned helper), with [gh](https://cli.github.com):
+
+```sh
+gh attestation verify ~/.local/bin/pass-env --repo n8watkins/pass-env \
+  --signer-workflow n8watkins/pass-env/.github/workflows/release.yml --deny-self-hosted-runners
+```
+
 **The script**, if you have [Bun](https://bun.sh):
 
 ```sh
@@ -57,6 +64,8 @@ mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/n8watkins/pass-env/main/pass-env.ts -o ~/.local/bin/pass-env
 chmod +x ~/.local/bin/pass-env
 ```
+
+Each release also attaches an attested `pass-env.ts` (verify it the same way); the copy on `main` above is the latest code and is not attested.
 
 Make sure `~/.local/bin` is on your `PATH`.
 Then check the setup:

@@ -150,7 +150,7 @@ repo="$(dirname "$cli")"
 printf '#!/bin/sh\nFAKE_PIN=${FAKE_PIN:-demo-pass} exec %s/demo/fake-pinentry.sh "$@"\n' "$repo" > "$work/pinentry"
 chmod +x "$work/pinentry"
 printf 'allow-loopback-pinentry\npinentry-program %s\n' "$work/pinentry" > "$GNUPGHOME/gpg-agent.conf"
-export PASS_ENV_HELLO_HELPER="$repo/demo/fake-hello-helper.ts" PASS_ENV_PINENTRY="$work/pinentry" XDG_CONFIG_HOME="$work/config" WSL_DISTRO_NAME=e2e
+export PASS_ENV_HELLO_HELPER="$repo/demo/fake-hello-helper.ts" PASS_ENV_HELLO_HELPER_UNPINNED=1 PASS_ENV_PINENTRY="$work/pinentry" XDG_CONFIG_HOME="$work/config" WSL_DISTRO_NAME=e2e
 unset SSH_CONNECTION SSH_TTY
 # Runs pass-env in a pseudo-terminal, as a person would; output is kept for the leak check.
 if [ -n "$bin" ]; then pe_cmd=("$bin"); else pe_cmd=(bun "$cli"); fi
@@ -192,7 +192,7 @@ pe hello status; expect "status exit" "$?" 0
 in_tty hello forget >/dev/null
 expect "forget deleted the blob" "$(test -e "$work/config/pass-env/hello.blob" && echo present)" ""
 expect "the passphrase never appeared in any output" "$(grep -c demo-pass "$work/hello.log")" 0
-unset PASS_ENV_HELLO_HELPER PASS_ENV_PINENTRY XDG_CONFIG_HOME WSL_DISTRO_NAME
+unset PASS_ENV_HELLO_HELPER PASS_ENV_HELLO_HELPER_UNPINNED PASS_ENV_PINENTRY XDG_CONFIG_HOME WSL_DISTRO_NAME
 
 step "result"
 if [ "$failures" -eq 0 ]; then echo "all checks passed"; else echo "$failures checks failed"; exit 1; fi

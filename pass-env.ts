@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
-	appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync,
+	appendFileSync, chmodSync, closeSync, constants as fsConstants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync,
 	statSync, unlinkSync, utimesSync, writeFileSync, writeSync, type Stats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
@@ -733,15 +733,29 @@ function writePrivate(path: string, data: Uint8Array): void {
 
 // A regular file (not a symlink) of at most max bytes, or undefined if absent.
 function readRegular(path: string, max: number): Buffer | undefined {
-	let info: Stats;
+	let fd: number;
 	try {
-		info = lstatSync(path);
-	} catch {
-		return undefined;
+		fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw new CliError("CONFIG", `${tilde(path)} must be a regular file, not a symlink`);
 	}
-	if (!info.isFile()) throw new CliError("CONFIG", `${tilde(path)} must be a regular file, not a symlink`);
-	if (info.size > max) throw new CliError("CONFIG", `${tilde(path)} is too large`);
-	return readFileSync(path);
+	try {
+		// Checked on the open descriptor, so the file cannot be swapped in between.
+		const info = fstatSync(fd);
+		if (!info.isFile()) throw new CliError("CONFIG", `${tilde(path)} must be a regular file, not a symlink`);
+		if (info.size > max) throw new CliError("CONFIG", `${tilde(path)} is too large`);
+		const data = Buffer.alloc(info.size);
+		let offset = 0;
+		while (offset < data.length) {
+			const read = readSync(fd, data, offset, data.length - offset, offset);
+			if (read === 0) break;
+			offset += read;
+		}
+		return data.subarray(0, offset);
+	} finally {
+		closeSync(fd);
+	}
 }
 
 // Mirrors the helper's strict parser, so a bad blob never reaches Windows.
@@ -780,11 +794,22 @@ function interopAvailable(): boolean {
 	return Boolean(helloTestDir()) || ["WSLInterop", "WSLInterop-late"].some((name) => existsSync(`/proc/sys/fs/binfmt_misc/${name}`));
 }
 
+let overrideWarned = false;
+
 // Finds the helper and checks its hash immediately before it is used. The
 // helper is only ever run by its recorded absolute path, never from PATH.
 function resolveHelper(): ResolvedHelper {
 	const override = process.env.PASS_ENV_HELLO_HELPER;
-	if (override) return { path: resolve(override), override: true };
+	if (override) {
+		// A release build pins the real helper; only an explicit second variable
+		// lets a test swap it out.
+		if (PINNED_HELPER_SHA256 && process.env.PASS_ENV_HELLO_HELPER_UNPINNED !== "1") {
+			return { problem: "PASS_ENV_HELLO_HELPER is set, but this pass-env release pins its helper", fix: "unset PASS_ENV_HELLO_HELPER", severity: "FAIL" };
+		}
+		if (!overrideWarned) console.error(`pass-env: using PASS_ENV_HELLO_HELPER=${override}, which is not hash-checked`);
+		overrideWarned = true;
+		return { path: resolve(override), override: true };
+	}
 	if (!isWsl() && !helloTestDir()) return { problem: "Windows Hello unlock needs WSL on Windows", fix: "use the typed pass-env unlock", severity: "warn" };
 	if (!interopAvailable()) {
 		return { problem: "WSL interop is off, so Windows programs cannot run", fix: "enable [interop] in /etc/wsl.conf, then wsl --shutdown", severity: "warn" };
@@ -964,12 +989,22 @@ async function askPassphrase(tty: string, description: string): Promise<Buffer> 
 	if (!program) throw new CliError("PINENTRY", "no pinentry program found; sudo apt install pinentry-curses");
 	const args = ["--ttyname", tty, ...(process.env.TERM ? ["--ttytype", process.env.TERM] : [])];
 	const child = spawn(program, args, { stdio: ["pipe", "pipe", "ignore"] });
+	child.stdin!.on("error", () => { /* pinentry exited; reported as "pinentry stopped". */ });
+	// A person can take a while, but not forever.
+	const timer = setTimeout(() => child.kill("SIGKILL"), 5 * 60_000);
+	let buffered = 0;
 	const lines: Buffer[] = [];
 	let partial = Buffer.alloc(0);
 	let ended = false;
 	let wake: (() => void) | undefined;
 	child.on("error", () => { ended = true; wake?.(); });
 	child.stdout!.on("data", (chunk: Buffer) => {
+		buffered += chunk.length;
+		if (buffered > 1_000_000) {
+			chunk.fill(0);
+			child.kill("SIGKILL");
+			return;
+		}
 		const data = Buffer.concat([partial, chunk]);
 		chunk.fill(0);
 		partial.fill(0);
@@ -1002,6 +1037,8 @@ async function askPassphrase(tty: string, description: string): Promise<Buffer> 
 			const head = line.subarray(0, 4).toString("latin1");
 			if (head.startsWith("OK")) return { ok: true, data };
 			if (head.startsWith("ERR")) return { ok: false, data, error: line.toString("latin1") };
+			// pass-env never answers questions from pinentry.
+			if (head.startsWith("INQ")) return { ok: false, data, error: "unexpected INQUIRE" };
 			if (head.startsWith("D ")) data.push(assuanDecode(line.subarray(2)));
 			line.fill(0);
 		}
@@ -1023,6 +1060,7 @@ async function askPassphrase(tty: string, description: string): Promise<Buffer> 
 		wipe(pin.data);
 		return passphrase;
 	} finally {
+		clearTimeout(timer);
 		try { child.stdin!.end("BYE\n"); } catch { /* Already gone. */ }
 		wipe(lines);
 		partial.fill(0);
@@ -1042,7 +1080,6 @@ async function tryHelloUnlock(root: string, target: string): Promise<string | un
 	if (bad) return `the saved blob is not valid (${bad}); run pass-env hello enrol`;
 	const helper = resolveHelper();
 	if ("problem" in helper) return `${helper.problem} (fix: ${helper.fix})`;
-	await hardenProcess();
 	console.error("pass-env: confirm with Windows Hello (face, fingerprint or PIN) to unlock GPG.");
 	const result = await runHelper(helper.path, ["unwrap", "--from", caller()], blob, MAX_PASSPHRASE);
 	if (result.code !== 0) {
@@ -1064,6 +1101,7 @@ async function tryHelloUnlock(root: string, target: string): Promise<string | un
 
 async function helloUnlock(root: string, entry: string | undefined): Promise<{ target: string; how: "already" | "hello" | "typed" }> {
 	const tty = requireTty("unlock --hello");
+	await hardenProcess();
 	const target = canaryEntry(root, entry);
 	if (await gpgUnlocked(root, target)) return { target, how: "already" };
 	const reason = await tryHelloUnlock(root, target);
@@ -1085,6 +1123,7 @@ async function helperCheck(path: string): Promise<{ code: number; status: HelloC
 
 async function helloEnrol(entry: string | undefined): Promise<void> {
 	const tty = requireTty("hello enrol");
+	await hardenProcess();
 	const missing = [...toolChecks(), ...storeChecks()].filter((check) => check.status === "FAIL");
 	if (missing.length) {
 		for (const check of missing) console.error(`FAIL  ${check.text}\n      fix: ${check.fix}`);
@@ -1112,8 +1151,13 @@ async function helloEnrol(entry: string | undefined): Promise<void> {
 		if (outcome !== "ok") throw new CliError("DECRYPT", `gpg could not decrypt ${target}; run pass-env doctor`);
 		console.log("Passphrase checked. GPG is unlocked now.");
 		console.log("Step 2 of 2: confirm with Windows Hello. There can be up to three prompts: create the key, use it, check it.");
-		await hardenProcess();
-		const result = await runHelper(helper.path, ["enrol", "--from", caller(), ...keyArgs()], passphrase, MAX_BLOB);
+		// Hash the helper again right before it gets the passphrase: the prompt
+		// above may have taken minutes.
+		const again = resolveHelper();
+		if ("problem" in again || again.path !== helper.path || again.sha256 !== helper.sha256) {
+			throw new CliError("HELLO", "the Windows Hello helper changed during enrol; nothing was saved");
+		}
+		const result = await runHelper(again.path, ["enrol", "--from", caller(), ...keyArgs()], passphrase, MAX_BLOB);
 		if (result.code !== 0) throw new CliError("HELLO", `${helperFailure(result)}; nothing was saved`);
 		const bad = blobProblem(result.out);
 		if (bad) throw new CliError("HELLO", `the helper returned an invalid blob (${bad}); nothing was saved`);
@@ -1153,6 +1197,7 @@ async function download(url: string): Promise<Buffer> {
 		throw new CliError("DOWNLOAD", `could not download ${url}`);
 	}
 	if (!response.ok) throw new CliError("DOWNLOAD", `could not download ${url} (HTTP ${response.status})`);
+	if (Number(response.headers.get("content-length") ?? 0) > MAX_HELPER_BYTES) throw new CliError("DOWNLOAD", `${url} is too large`);
 	const bytes = Buffer.from(await response.arrayBuffer());
 	if (bytes.length > MAX_HELPER_BYTES) throw new CliError("DOWNLOAD", `${url} is too large`);
 	return bytes;
@@ -1202,17 +1247,21 @@ async function helloInstall(file: string | undefined, yes: boolean): Promise<voi
 	if (!lstatSync(dir).isDirectory()) throw new CliError("HELLO", `${dir} must be a real folder`);
 	const destination = join(dir, HELPER_NAME);
 	const temporary = join(dir, `${HELPER_NAME}.${process.pid}.tmp`);
+	let note = "";
 	try {
 		writeFileSync(temporary, bytes, { flag: "wx", mode: 0o700 });
 		const provenance = helloTestDir() ? "no-gh" : verifyProvenance(temporary, file ? undefined : tag);
-		if (provenance === "failed" && (PINNED_HELPER_SHA256 || !file)) {
+		// With a pin, the hash already proves it is the helper of this release;
+		// a failed check (gh not logged in, offline) is then only reported.
+		if (provenance === "failed" && !PINNED_HELPER_SHA256 && !file) {
 			throw new CliError("HELLO", `gh attestation verify could not prove this file was built by ${RELEASE_REPO}'s release workflow; nothing was installed`);
 		}
 		if (provenance === "no-gh" && !PINNED_HELPER_SHA256 && !file) {
 			throw new CliError("HELLO", "without gh, this pass-env cannot check where the download was built: install gh, or verify the file yourself (docs/windows-hello.md) and run pass-env hello install <file>");
 		}
-		const note = provenance === "verified" ? `build provenance verified (${RELEASE_REPO} release workflow)`
-			: provenance === "failed" ? "not a release build of this repository (fine for your own build)"
+		note = provenance === "verified" ? `build provenance verified (${RELEASE_REPO} release workflow)`
+			: provenance === "failed" && PINNED_HELPER_SHA256 ? "gh attestation verify failed (offline or not logged in?); the hash matches the pin"
+				: provenance === "failed" ? "not a release build of this repository (fine for your own build)"
 				: PINNED_HELPER_SHA256 ? "provenance not checked (gh not installed); the hash is pinned" : "provenance not checked";
 		let previous: HelperRecord | undefined;
 		try { previous = readRecord(); } catch { /* Replaced below. */ }
@@ -1233,6 +1282,7 @@ async function helloInstall(file: string | undefined, yes: boolean): Promise<voi
 	writePrivate(recordPath(), Buffer.from(`${JSON.stringify(record, null, 2)}\n`));
 	console.log(`Installed pass-env-hello ${reported} at ${destination}`);
 	console.log(`SHA-256 ${hash}`);
+	console.log(`Provenance: ${note}`);
 	console.log("Next: pass-env hello enrol");
 }
 

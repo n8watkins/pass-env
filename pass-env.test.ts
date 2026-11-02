@@ -1236,7 +1236,7 @@ describe("Windows Hello unlock (fake helper)", () => {
 		const files = fixture({ token: "synthetic-value" });
 		writeFileSync(join(files.store, ".gpg-id"), "synthetic@example.invalid\n");
 		Object.assign(files.env, {
-			PASS_ENV_HELLO_HELPER: fakeHelper, FAKE_HELLO_MODE: mode, FAKE_HELLO_LOG: join(files.root, "helper-calls"),
+			PASS_ENV_HELLO_HELPER: fakeHelper, PASS_ENV_HELLO_HELPER_UNPINNED: "1", FAKE_HELLO_MODE: mode, FAKE_HELLO_LOG: join(files.root, "helper-calls"),
 			PASS_ENV_PINENTRY: fakePinentry, FAKE_PIN: PASSPHRASE, TEST_GPG_PASSPHRASE: PASSPHRASE,
 			TEST_GPG_SECRET_KEYS: "synthetic@example.invalid", TEST_PASS_ALLOW_TYPED: "1", WSL_DISTRO_NAME: "Synthetic-WSL",
 		});
@@ -1409,6 +1409,17 @@ describe("Windows Hello unlock (fake helper)", () => {
 		const status = invoke(files, ["hello", "status"]);
 		expect(status.status).toBe(1);
 		expect(status.stdout).toMatch(/^FAIL\s+the helper at .* changed since it was installed/m);
+	});
+
+	test("a release build refuses PASS_ENV_HELLO_HELPER unless PASS_ENV_HELLO_HELPER_UNPINNED=1, and warns on every use", () => {
+		const files = hello();
+		const status = invoke(files, ["hello", "status"]);
+		expect(status.stderr).toContain(`pass-env: using PASS_ENV_HELLO_HELPER=${fakeHelper}, which is not hash-checked`);
+		delete files.env.PASS_ENV_HELLO_HELPER_UNPINNED;
+		const pinned = invoke(files, ["version"]).stdout.includes("pins pass-env-hello.exe SHA-256");
+		const result = invoke(files, ["hello", "status"]);
+		if (pinned) expect(result.stdout).toMatch(/^FAIL\s+PASS_ENV_HELLO_HELPER is set, but this pass-env release pins its helper/m);
+		else expect(result.status).toBe(0);
 	});
 
 	test("hello install rejects files that are not Windows programs, and needs a terminal or --yes", () => {

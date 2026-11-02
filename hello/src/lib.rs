@@ -22,6 +22,9 @@ pub const MAX_SECRET: usize = 4096;
 /// The largest well-formed blob; readers never need more than this.
 pub const MAX_BLOB: usize = MAGIC.len() + 2 + MAX_KEY_NAME + SALT_LEN + NONCE_LEN + MAX_SECRET + TAG_LEN;
 pub const HKDF_INFO: &[u8] = b"pass-env-hello v1 aes-256-gcm";
+/// Prefix of what Windows Hello signs, so a signature made for pass-env is
+/// never the same as one another program asks the same key for.
+pub const SIGN_CONTEXT: &[u8] = b"pass-env-hello v1 unwrap key\0";
 /// Smallest RSA-2048 signature we accept as key material.
 const MIN_SIGNATURE: usize = 256;
 
@@ -133,8 +136,18 @@ fn header(key_name: &str, salt: &[u8; SALT_LEN], nonce: &[u8; NONCE_LEN]) -> Vec
 	out
 }
 
-fn cipher(signer: &dyn Signer, salt: &[u8]) -> Result<Aes256Gcm, Error> {
-	let signature = signer.sign(salt)?;
+/// What Windows Hello signs: context, key name, NUL, salt.
+pub fn signed_message(key_name: &str, salt: &[u8]) -> Vec<u8> {
+	let mut message = Vec::with_capacity(SIGN_CONTEXT.len() + key_name.len() + 1 + salt.len());
+	message.extend_from_slice(SIGN_CONTEXT);
+	message.extend_from_slice(key_name.as_bytes());
+	message.push(0);
+	message.extend_from_slice(salt);
+	message
+}
+
+fn cipher(signer: &dyn Signer, key_name: &str, salt: &[u8]) -> Result<Aes256Gcm, Error> {
+	let signature = signer.sign(&signed_message(key_name, salt))?;
 	if signature.len() < MIN_SIGNATURE {
 		return Err(Error::Signer(SignerError::Other));
 	}
@@ -156,7 +169,7 @@ pub fn seal(signer: &dyn Signer, key_name: &str, secret: &[u8], salt: &[u8; SALT
 		return Err(Error::BadSecret);
 	}
 	let aad = header(key_name, salt, nonce);
-	let ciphertext = cipher(signer, salt)?
+	let ciphertext = cipher(signer, key_name, salt)?
 		.encrypt(Nonce::from_slice(nonce), Payload { msg: secret, aad: &aad })
 		.map_err(|_| Error::Decrypt)?;
 	let mut blob = aad;
@@ -167,7 +180,7 @@ pub fn seal(signer: &dyn Signer, key_name: &str, secret: &[u8], salt: &[u8; SALT
 /// Opens a blob. The returned secret is wiped when dropped.
 pub fn unwrap(signer: &dyn Signer, bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
 	let blob = parse(bytes)?;
-	let cipher = cipher(signer, blob.salt)?;
+	let cipher = cipher(signer, blob.key_name, blob.salt)?;
 	// decrypt allocates the plaintext once; it goes straight into Zeroizing.
 	cipher
 		.decrypt(
@@ -303,8 +316,8 @@ mod tests {
 				"6b",
 				"0101010101010101010101010101010101010101010101010101010101010101",
 				"020202020202020202020202",
-				"c3",
-				"2ad66f15d7e21d157b699b817911bd22",
+				"e0",
+				"69e29a0ba446d60fa899ddee14a5054a",
 			)
 		);
 		assert_eq!(&*unwrap(&FakeSigner::new(9), &blob).unwrap(), b"x");
@@ -425,6 +438,25 @@ mod tests {
 			assert!(matches!(unwrap(&signer, garbage), Err(Error::Malformed(_))));
 		}
 		assert_eq!(signer.calls.get(), 0);
+	}
+
+	/// Records what it was asked to sign.
+	struct Recording(std::cell::RefCell<Vec<Vec<u8>>>);
+	impl Signer for Recording {
+		fn sign(&self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>, SignerError> {
+			self.0.borrow_mut().push(data.to_vec());
+			Ok(Zeroizing::new(vec![3; 256]))
+		}
+	}
+
+	#[test]
+	fn hello_signs_a_domain_separated_message_not_the_bare_salt() {
+		let signer = Recording(Default::default());
+		let blob = seal(&signer, "k1", b"x", &[4; SALT_LEN], &[5; NONCE_LEN]).unwrap();
+		let signed = signer.0.borrow()[0].clone();
+		assert_eq!(signed, [SIGN_CONTEXT, b"k1\0", &[4; SALT_LEN]].concat());
+		assert!(unwrap(&signer, &blob).is_ok());
+		assert_eq!(signer.0.borrow()[1], signed);
 	}
 
 	#[test]
