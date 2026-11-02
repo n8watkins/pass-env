@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end walk-through against real pass and GPG, with a passphrase-protected
 # key, in a throwaway GNUPGHOME and store. Your real keys are never touched.
-# Needs: bun, gpg, pass.
+# Needs: bun, gpg, pass, script (util-linux).
 set -uo pipefail
 
 cli="$(cd "$(dirname "$0")/.." && pwd)/pass-env.ts"
@@ -143,6 +143,56 @@ expect "history prints no secret" "$(printf '%s' "$out" | secrets_in)" 0
 state="$home/.local/state/pass-env/scrub.json"
 expect "the history file is readable only by you" "$(bun -e 'console.log((require("fs").statSync(process.argv[1]).mode & 0o777).toString(8))' "$state")" 600
 expect "the history file holds no secret" "$(secrets_in "$state")" 0
+
+step "Windows Hello unlock with the fake helper (no Windows needed; real GPG)"
+repo="$(dirname "$cli")"
+# gpg-agent starts pinentry with its own environment, so wrap the fake one.
+printf '#!/bin/sh\nFAKE_PIN=${FAKE_PIN:-demo-pass} exec %s/demo/fake-pinentry.sh "$@"\n' "$repo" > "$work/pinentry"
+chmod +x "$work/pinentry"
+printf 'allow-loopback-pinentry\npinentry-program %s\n' "$work/pinentry" > "$GNUPGHOME/gpg-agent.conf"
+export PASS_ENV_HELLO_HELPER="$repo/demo/fake-hello-helper.ts" PASS_ENV_PINENTRY="$work/pinentry" XDG_CONFIG_HOME="$work/config" WSL_DISTRO_NAME=e2e
+unset SSH_CONNECTION SSH_TTY
+# Runs pass-env in a pseudo-terminal, as a person would; output is kept for the leak check.
+if [ -n "$bin" ]; then pe_cmd=("$bin"); else pe_cmd=(bun "$cli"); fi
+in_tty() { script -qec "$(printf '%q ' "${pe_cmd[@]}" "$@")" /dev/null </dev/null | tr -d '\r' | tee -a "$work/hello.log"; }
+locked() { gpgconf --kill gpg-agent; }
+is_unlocked() { gpg --batch --pinentry-mode error -d "$PASSWORD_STORE_DIR/app/AUTH_SECRET.gpg" >/dev/null 2>&1 && echo yes || echo no; }
+locked
+out=$(in_tty unlock --hello app/AUTH_SECRET)
+expect "not enrolled yet: falls back to the typed passphrase" "$(printf '%s' "$out" | grep -c 'not enrolled yet')" 1
+expect "the typed fallback unlocked GPG" "$(is_unlocked)" yes
+step "hello enrol checks the passphrase with real GPG, then saves the blob"
+FAKE_PIN=wrong-pass in_tty hello enrol app/AUTH_SECRET >/dev/null
+expect "a wrong passphrase is refused and nothing saved" "$(test -e "$work/config/pass-env/hello.blob" && echo saved || echo none)" none
+out=$(FAKE_PIN=demo-pass in_tty hello enrol app/AUTH_SECRET); printf '%s\n' "$out"
+expect "enrol saved the blob" "$(test -e "$work/config/pass-env/hello.blob" && echo saved)" saved
+expect "the blob is readable only by you" "$(stat -c %a "$work/config/pass-env/hello.blob")" 600
+step "unlock --hello warms the real gpg-agent cache; run then works"
+locked
+out=$(in_tty unlock --hello app/AUTH_SECRET); printf '%s\n' "$out"
+expect "unlocked with Windows Hello" "$(printf '%s' "$out" | grep -c 'Unlocked with Windows Hello')" 1
+expect "run works after the Hello unlock" "$(pe run -- sh -c 'printf %s "${#STRIPE_SECRET_KEY}"')" 17
+out=$(in_tty unlock --hello app/AUTH_SECRET)
+expect "already unlocked: no prompt" "$(printf '%s' "$out" | grep -c 'already unlocked')" 1
+step "a cancelled prompt, and a passphrase GPG rejects, fall back to typing"
+locked
+out=$(FAKE_HELLO_MODE=cancel in_tty unlock --hello app/AUTH_SECRET)
+expect "cancel falls back" "$(printf '%s' "$out" | grep -c 'Windows Hello was cancelled')" 1
+expect "the fallback unlocked GPG" "$(is_unlocked)" yes
+locked
+out=$(FAKE_HELLO_MODE=wrong in_tty unlock --hello app/AUTH_SECRET)
+expect "real gpg rejects a stale passphrase and it falls back" "$(printf '%s' "$out" | grep -c 'no longer opens GPG')" 1
+expect "the fallback unlocked GPG" "$(is_unlocked)" yes
+step "an agent (no terminal) still cannot unlock"
+locked
+pe unlock --hello app/AUTH_SECRET </dev/null; expect "unlock --hello without a terminal exits 2" "$?" 2
+expect "still locked" "$(is_unlocked)" no
+step "hello status, then forget"
+pe hello status; expect "status exit" "$?" 0
+in_tty hello forget >/dev/null
+expect "forget deleted the blob" "$(test -e "$work/config/pass-env/hello.blob" && echo present)" ""
+expect "the passphrase never appeared in any output" "$(grep -c demo-pass "$work/hello.log")" 0
+unset PASS_ENV_HELLO_HELPER PASS_ENV_PINENTRY XDG_CONFIG_HOME WSL_DISTRO_NAME
 
 step "result"
 if [ "$failures" -eq 0 ]; then echo "all checks passed"; else echo "$failures checks failed"; exit 1; fi
