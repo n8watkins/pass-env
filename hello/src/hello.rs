@@ -155,14 +155,16 @@ pub fn open_or_create(name: &str) -> Result<HelloSigner, SignerError> {
 	}
 }
 
-pub fn delete(name: &str) -> Result<(), SignerError> {
+/// Deletes the key; Ok(false) when there was none.
+pub fn delete(name: &str) -> Result<bool, SignerError> {
 	require_hello()?;
 	if open_existing(name)?.is_none() {
-		return Ok(());
+		return Ok(false);
 	}
 	KeyCredentialManager::DeleteAsync(&HSTRING::from(name))
 		.and_then(|op| op.join())
-		.map_err(other)
+		.map_err(other)?;
+	Ok(true)
 }
 
 /// Copies a WinRT buffer into a wiped-on-drop Vec, then zeroes the buffer.

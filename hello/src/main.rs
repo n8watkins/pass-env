@@ -163,6 +163,8 @@ fn check(key: &str) -> ExitCode {
 	ExitCode::from(if status.usable() { OK } else { UNAVAILABLE })
 }
 
+/// Guards against printing a secret in a Windows console. (Through WSL
+/// interop stdout is always a pipe, so pass-env never trips this.)
 fn refuse_terminal_stdout() -> Option<ExitCode> {
 	std::io::stdout()
 		.is_terminal()
@@ -222,11 +224,12 @@ fn unwrap(from: &str) -> ExitCode {
 		Ok(parsed) => parsed.key_name.to_owned(),
 		Err(error) => return error_exit(error),
 	};
-	notice(from, "unlock GPG for pass-env");
 	let signer = match hello::open(&key_name) {
 		Ok(signer) => signer,
 		Err(error) => return error_exit(Error::Signer(error)),
 	};
+	// Only now is a prompt certain to follow.
+	notice(from, "unlock GPG for pass-env");
 	match pass_env_hello::unwrap(&signer, &blob) {
 		Ok(secret) => write_stdout(&secret),
 		Err(error) => error_exit(error),
@@ -241,8 +244,12 @@ fn forget(_key: &str) -> ExitCode {
 #[cfg(windows)]
 fn forget(key: &str) -> ExitCode {
 	match hello::delete(key) {
-		Ok(()) => {
-			eprintln!("pass-env-hello: deleted the Windows Hello key {key}");
+		Ok(existed) => {
+			if existed {
+				eprintln!("pass-env-hello: deleted the Windows Hello key {key}");
+			} else {
+				eprintln!("pass-env-hello: there is no Windows Hello key {key}");
+			}
 			ExitCode::from(OK)
 		}
 		Err(error) => error_exit(Error::Signer(error)),

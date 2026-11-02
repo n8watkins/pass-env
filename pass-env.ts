@@ -1292,7 +1292,7 @@ async function helloForget(): Promise<void> {
 		return;
 	}
 	const result = await runHelper(helper.path, ["forget", ...keyArgs()], undefined, 0, 60_000);
-	console.log(result.code === 0 ? "Deleted the pass-env Windows Hello key." : `The Windows Hello key was not deleted: ${helperFailure(result)}. Without the blob it unlocks nothing.`);
+	console.log(result.code === 0 ? "No pass-env Windows Hello key is left." : `The Windows Hello key was not deleted: ${helperFailure(result)}. Without the blob it unlocks nothing.`);
 	console.log("Your typed GPG passphrase works as before.");
 }
 

@@ -1434,7 +1434,7 @@ describe("Windows Hello unlock (fake helper)", () => {
 		expect(invoke(files, ["hello", "status"]).stdout).toMatch(/^FAIL\s+.*hello\.blob is not valid \(not a pass-env Hello blob\)/m);
 		const forget = inTty(files, ["hello", "forget"]);
 		expect(forget.status).toBe(0);
-		expect(forget.output).toContain("Deleted the pass-env Windows Hello key.");
+		expect(forget.output).toContain("No pass-env Windows Hello key is left.");
 		expect(existsSync(blob(files))).toBe(false);
 		expect(helperCalls(files)).toEndWith("forget\n");
 	});
