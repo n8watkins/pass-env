@@ -54,12 +54,14 @@ It is stateless: it reads its input on stdin, writes its result on stdout, print
 | Subcommand | Input | Output | Prompts? |
 | --- | --- | --- | --- |
 | `version` | none | `pass-env-hello <version>` | No |
-| `check` | none | one JSON line: version, protocol, Hello availability, TPM, key presence | No |
-| `enrol --from <context>` | the passphrase on stdin | the blob on stdout | Yes (creates the key if missing, then signs) |
-| `unwrap --from <context>` | the blob on stdin | the passphrase on stdout | Yes |
-| `forget` | none | none | No (deletes the Hello key) |
+| `check [--key <name>]` | none | one JSON line: version, protocol, Hello availability, TPM, key presence, attestation | No |
+| `enrol [--from <context>] [--key <name>]` | the passphrase on stdin | the blob on stdout | Yes (creates the key if missing, then signs twice) |
+| `unwrap [--from <context>]` | the blob on stdin | the passphrase on stdout | Yes (the key name comes from the blob) |
+| `forget [--key <name>]` | none | none | No (deletes the Hello key) |
 
-`--from` is the WSL distro and folder pass-env runs in; the helper prints it on stderr just before the Hello prompt, with a reminder to approve only a prompt you just started.
+`--from` is the WSL distro and folder pass-env runs in; the helper prints it on stderr just before the Hello prompt (only once the key opened, so only when a prompt really follows), with a reminder to approve only a prompt you just started.
+The key name defaults to `pass-env`.
+In a Windows console the helper refuses to write a secret to the screen; through WSL interop its stdout is always a pipe.
 
 Exit codes are the protocol between pass-env and the helper:
 
@@ -114,7 +116,14 @@ Exit codes are the protocol between pass-env and the helper:
 | `pass-env hello forget` | Deletes the blob and asks the helper to delete the Hello key. The typed passphrase is unaffected. |
 | `pass-env unlock --hello [entry]` | Needs a TTY. If GPG is already unlocked, says so and stops. Otherwise runs the helper, feeds the passphrase to `gpg --pinentry-mode loopback --passphrase-fd 0` decrypting the canary entry (the same entry plain `unlock` uses), and forgets it. On any failure it explains why and falls back to the typed unlock. |
 
-`PASS_ENV_HELLO_HELPER=<path>` points pass-env at another helper; tests use it with a fake helper, and it skips the WSL and hash checks, so only set it yourself.
+Environment variables, all optional:
+
+- `PASS_ENV_HELLO_HELPER=<path>` points pass-env at another helper; tests use it with a fake helper (`demo/fake-hello-helper.ts`), and it skips the WSL and hash checks, so only set it yourself.
+- `PASS_ENV_HELLO_KEY=<name>` uses another Windows Hello key name for enrol, status and forget (the blob records the name, so unlock follows it); the sandbox tests use throwaway names.
+- `PASS_ENV_HELLO_TEST_DIR=<folder>` is for tests: it installs the helper into that folder instead of `%LOCALAPPDATA%\pass-env` and skips the WSL detection.
+- `PASS_ENV_PINENTRY=<program>` picks the pinentry `hello enrol` uses.
+
+`pass-env version` also prints the pinned helper hash in a release build.
 
 ### Canary entry
 
@@ -167,7 +176,8 @@ The existing baseline: while gpg-agent's cache is warm, anything running as the 
 
 - `.github/workflows/release.yml` runs on a `v*` tag, first checking that the tagged commit is on `main`.
 - A `windows-latest` job runs `cargo test`, `cargo deny check` and `cargo audit`, builds `pass-env-hello.exe` twice in two folders and requires identical hashes (a reproducibility check), and uploads it with its SHA-256.
-- The Linux job pins that hash into `pass-env.ts` (`PINNED_HELPER_SHA256`), checks the pin was applied exactly once, builds the binaries from the pinned file, runs the tests, attaches the pinned `pass-env.ts`, the binaries, `pass-env-hello.exe` and `SHA256SUMS`, and creates build provenance attestations for all of them.
+- The toolchain is pinned (`hello/rust-toolchain.toml`), the CRT is linked statically, `/Brepro` removes linker timestamps and `--remap-path-prefix` removes local paths (`hello/build-release.ps1`), so the same commit gives the same SHA-256; CI builds twice in two folders and compares.
+- The Linux job pins that hash into `pass-env.ts` (`PINNED_HELPER_SHA256`, and `RELEASE_REPO`), checks the pin was applied exactly once, builds the binaries from the pinned file, runs the tests, attaches the pinned `pass-env.ts`, the binaries, `pass-env-hello.exe` and `SHA256SUMS`, and creates build provenance attestations for all of them.
 - Third-party actions are pinned to commit SHAs.
 - Forks: without a release, nothing about Hello runs; `hello install <file>` with a self-built helper records its hash locally.
 
@@ -189,7 +199,8 @@ gh attestation verify pass-env-hello.exe --repo n8watkins/pass-env \
 - Bun tests with `PASS_ENV_HELLO_HELPER` pointing at a fake helper: success, cancel, unavailable, locked, corrupt blob, wrong passphrase, already unlocked, no TTY, SSH, hash mismatch, and each falling back to the typed unlock; enrol's prerequisites and passphrase check; status, forget and doctor output.
 - `demo/e2e.sh` runs enrol and `unlock --hello` against real GPG in a throwaway `GNUPGHOME`, with the fake helper and a fake pinentry, in a pseudo-terminal.
 - CI on `windows-latest` builds the helper and runs `pass-env-hello.exe check`, covering the "Hello unsupported" path of a machine without Hello.
-- Real Hello prompts cannot be automated; the owner runs [windows-hello-manual-test.md](windows-hello-manual-test.md).
+- On the owner's PC, an isolated sandbox run with the real helper (throwaway GPG key, store, config folder, helper folder and Hello key name) covers install over interop, `check`, status and doctor, a blob for a missing key (answered "unavailable" with no prompt), a corrupt blob, a tampered helper and forget, without any Hello prompt.
+- Real Hello prompts cannot be automated; the owner runs `demo/hello-manual.sh` (the same sandbox plus the prompts, about two minutes) as described in [windows-hello-manual-test.md](windows-hello-manual-test.md).
 
 ## Resource impact
 

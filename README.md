@@ -88,6 +88,9 @@ Lose that key and every stored secret is gone.
 | `pass-env scrub --history` | Show when each log folder was last checked, what was found and what was fixed. Prints no secret | No |
 | `pass-env doctor` | Check pass, GPG, the store and the current folder, including env variables the code reads but nothing declares. Decrypts nothing | No |
 | `pass-env unlock` | Type your GPG passphrase for this session. Only works in your own terminal | |
+| `pass-env unlock --hello` | Experimental, WSL on Windows: unlock with face, fingerprint or PIN; falls back to typing | |
+| `pass-env hello install`, `enrol`, `status`, `forget` | Experimental: set up, check or remove Windows Hello unlock (see below) | |
+| `pass-env version` | Print the version | |
 | `pass-env help` | Everything here, with examples | |
 
 Options:
@@ -308,6 +311,26 @@ Use the terminal passphrase prompt (`pinentry-program /usr/bin/pinentry-curses` 
 `--copy` and `copy` use the Windows clipboard (`clip.exe`), so you can paste straight into a browser.
 For a GUI to browse entries, QtPass runs inside WSL (`sudo apt install qtpass`) and uses the same store.
 
+### Windows Hello unlock (experimental, opt-in)
+
+Instead of typing the GPG passphrase, unlock with face, fingerprint or Windows Hello PIN.
+It needs Windows 11 (or 10) with Windows Hello and a TPM, and WSL.
+Nothing changes until you run these, and the typed passphrase always keeps working, so you cannot be locked out.
+
+```sh
+pass-env hello install        # puts pass-env-hello.exe in %LOCALAPPDATA%\pass-env, checks its hash and build provenance
+pass-env hello enrol          # type your passphrase once; it is checked, then saved encrypted with a TPM-backed Hello key
+pass-env unlock --hello       # in your terminal: one Hello prompt instead of typing
+```
+
+`pass-env hello status` shows the setup without any prompt, and `pass-env hello forget` removes it.
+Like `unlock`, `unlock --hello` only works in your own terminal, so an agent cannot start a prompt; never set the helper as gpg-agent's `pinentry-program` (`doctor` flags it).
+Approve a Hello prompt only right after you started one yourself.
+The saved passphrase is ciphertext in `~/.config/pass-env/hello.blob` (mode 600); opening it needs the TPM key and a live Hello gesture.
+Any problem (cancelled, unavailable, locked screen, SSH, a changed helper, a changed passphrase) prints why and falls back to the typed prompt.
+Design, threat model and release verification: [docs/windows-hello.md](docs/windows-hello.md).
+It stays experimental until the [manual test](docs/windows-hello-manual-test.md) passes.
+
 ## Migrate an existing project
 
 `import` moves the secrets in an existing `.env.local` (or `.env`, `.dev.vars`) into pass in two steps.
@@ -414,12 +437,14 @@ Errors are one line, start with a code, and never include secret values or GPG o
 | `TRACKED` | `import` was given a file committed to git; it only moves local secret files |
 | `REFERENCE_FILE`, `WRITE` | A file could not be read, or could not be rewritten |
 | `USAGE`, `STORE`, `PASS_MISSING` | Wrong arguments, no store yet (`pass init`), or `pass` not installed |
+| `HELLO`, `SETUP`, `PASSPHRASE`, `PINENTRY`, `CANCELLED`, `CONFIG`, `DOWNLOAD` | Windows Hello setup: the helper or Hello is not usable, pass and GPG are not set up yet, the typed passphrase did not open the store, no pinentry, you cancelled, a pass-env config file is wrong, or a download failed |
 
 ## Tests
 
 ```sh
-bun test           # 63 tests with a fake pass, gpg and clipboard, including a real-terminal Ctrl-C test
-./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder, including import, --remove, scrub and its scan history
+bun test           # 76 tests with a fake pass, gpg, clipboard and Windows Hello helper, including real-terminal tests
+./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder, including import, --remove, scrub, its scan history and Hello unlock
+cd hello && cargo test   # the Windows helper's blob format and crypto (runs on Linux too)
 ```
 
 Set `PASS_ENV_BIN=path/to/binary` to run both against a compiled binary.
