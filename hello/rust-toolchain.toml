@@ -1,0 +1,5 @@
+# Pinned so a release build can be reproduced byte for byte.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

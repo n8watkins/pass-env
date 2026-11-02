@@ -1,0 +1,4 @@
+# Reproducible Windows builds: /Brepro makes the MSVC linker write no
+# timestamps. Build scripts pass --remap-path-prefix for the source folder.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/Brepro", "-C", "target-feature=+crt-static"]
