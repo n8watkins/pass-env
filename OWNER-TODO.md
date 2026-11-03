@@ -83,3 +83,16 @@ Windows Hello prompts (face, fingerprint, PIN) cannot be automated, so a person 
 
 **Unblocks.**
 Dropping the "experimental" label from `unlock --hello`, and using Hello instead of typing the passphrase every day.
+
+## 3. Turn on npm and Homebrew publishing (about 15 minutes)
+
+- [ ] npm: an account with two-factor authentication, the `NPM_TOKEN` secret for the first publish, and the repository variable `NPM_PUBLISH=true`.
+- [ ] Homebrew: create `n8watkins/homebrew-tap`, add the `HOMEBREW_TAP_TOKEN` secret, and set `HOMEBREW_TAP=true`.
+- [ ] After the first release reaches npm: switch the five packages to trusted publishing and delete the token.
+
+**What.**
+The release workflow can publish pass-env to npm (so `npm`, `pnpm`, `yarn` and `bun` can install it) and to a Homebrew tap, but both are off until these are set up.
+
+**Steps.**
+[`docs/publishing.md`](docs/publishing.md) has each step.
+The installer (`install.sh`) already works without any of this.

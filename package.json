@@ -45,5 +45,6 @@
   "contributors": [
     "Phaedrus Raznikov (https://github.com/moomooskycow)",
     "Nathan Watkins (https://github.com/n8watkins)"
-  ]
+  ],
+  "private": true
 }

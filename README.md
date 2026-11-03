@@ -29,20 +29,34 @@ For a hard boundary, run agents as a different OS user or in a container, and ke
 
 ## Install
 
-Needs `gpg` and `pass`.
-Works on Linux, macOS and Windows through WSL.
+pass-env needs `pass` and `gpg`, on Linux, macOS or Windows through WSL:
 
 ```sh
-# pass and a GPG key (skip what you already have)
 sudo apt install pass                 # macOS: brew install pass gnupg
 gpg --full-generate-key               # choose a passphrase you can type daily
 pass init you@example.com             # the email on that key
 ```
 
-Then install pass-env one of two ways.
+Then install pass-env itself, whichever way you prefer.
+Every option installs the same standalone binary from a [release](https://github.com/n8watkins/pass-env/releases); none of them needs Bun or Node at run time.
 
-**A standalone binary** (no Bun needed), from the [releases page](https://github.com/n8watkins/pass-env/releases) once a release is published.
-Pick the file for your system: `pass-env-linux-x64`, `pass-env-linux-arm64`, `pass-env-darwin-x64` (Intel Mac) or `pass-env-darwin-arm64` (Apple silicon).
+| How | Command |
+| --- | --- |
+| Installer (recommended) | `curl -fsSL https://raw.githubusercontent.com/n8watkins/pass-env/main/install.sh \| sh` |
+| npm | `npm install -g pass-env` |
+| pnpm, yarn, bun | `pnpm add -g pass-env`, `yarn global add pass-env`, `bun add -g pass-env` |
+| Run once without installing | `npx pass-env doctor` (or `pnpm dlx`, `yarn dlx`, `bunx`) |
+| Homebrew | `brew install n8watkins/tap/pass-env` |
+
+The installer picks the binary for your system, checks it against the release's `SHA256SUMS`, also checks its build provenance when [gh](https://cli.github.com) is signed in, and puts it in `~/.local/bin`.
+It takes `--version v1.2.0` and `--dir <folder>` (`curl ... | sh -s -- --dir /usr/local/bin`), or the same as `PASS_ENV_VERSION` and `PASS_ENV_INSTALL_DIR`.
+npm and Homebrew install from the same release, and the npm packages carry npm provenance.
+The npm and Homebrew packages start with the first release after v1.2.0; until then, use the installer.
+
+<details>
+<summary>By hand, or verifying a binary yourself</summary>
+
+Download the file for your system (`pass-env-linux-x64`, `pass-env-linux-arm64`, `pass-env-darwin-x64` or `pass-env-darwin-arm64`):
 
 ```sh
 mkdir -p ~/.local/bin
@@ -50,25 +64,18 @@ curl -fsSL https://github.com/n8watkins/pass-env/releases/latest/download/pass-e
 chmod +x ~/.local/bin/pass-env
 ```
 
-To check that a binary was built by this repository's release workflow from that tag (recommended, and required for trusting Windows Hello's pinned helper), with [gh](https://cli.github.com):
+Check that it was built by this repository's release workflow from that tag (recommended, and required for trusting Windows Hello's pinned helper):
 
 ```sh
 gh attestation verify ~/.local/bin/pass-env --repo n8watkins/pass-env --source-ref refs/tags/v1.2.0 \
   --signer-workflow n8watkins/pass-env/.github/workflows/release.yml --deny-self-hosted-runners   # the tag you downloaded
 ```
 
-**The script**, if you have [Bun](https://bun.sh):
+With [Bun](https://bun.sh) you can run the script instead: download `pass-env.ts` from a release (attested the same way) or from `main` (latest, not attested) to `~/.local/bin/pass-env` and `chmod +x` it.
 
-```sh
-mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/n8watkins/pass-env/main/pass-env.ts -o ~/.local/bin/pass-env
-chmod +x ~/.local/bin/pass-env
-```
+</details>
 
-Each release also attaches an attested `pass-env.ts` (verify it the same way); the copy on `main` above is the latest code and is not attested.
-
-Make sure `~/.local/bin` is on your `PATH`.
-Then check the setup:
+Make sure `~/.local/bin` (or wherever it went) is on your `PATH`, then check the setup:
 
 ```sh
 pass-env doctor
@@ -100,7 +107,7 @@ Lose that key and every stored secret is gone.
 | `pass-env unlock --hello` | Experimental, WSL on Windows: unlock with face, fingerprint or PIN; falls back to typing | |
 | `pass-env hello install`, `enrol`, `status`, `forget` | Experimental: set up, check or remove Windows Hello unlock (see below) | |
 | `pass-env version` | Print the version | |
-| `pass-env help` | Everything here, with examples | |
+| `pass-env help [command]` | Everything here with examples, or one command. `pass-env` alone lists the everyday commands | |
 
 Options:
 - `--force` on `set` or `generate` replaces an existing entry (rotation).
