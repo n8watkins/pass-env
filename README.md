@@ -459,6 +459,8 @@ cd hello && cargo test   # the Windows helper's blob format and crypto (runs on 
 Set `PASS_ENV_BIN=path/to/binary` to run both against a compiled binary.
 CI does this on every push.
 
+The maintainer's own pending steps (machine setup and the Windows Hello manual test) are in [OWNER-TODO.md](OWNER-TODO.md).
+
 ## Credits
 
 pass-env was written by Phaedrus Raznikov at [Misty Step](https://github.com/misty-step) as part of [mistystack](https://github.com/misty-step/mistystack) (MIT).
