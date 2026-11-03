@@ -144,3 +144,72 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+
+  # npm: the same attested binaries, as pass-env (a small launcher) plus one
+  # pass-env-<os>-<arch> package each. Off until the maintainer sets the
+  # repository variable NPM_PUBLISH to true; see docs/publishing.md.
+  npm:
+    needs: publish
+    if: vars.NPM_PUBLISH == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # npm provenance and trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@11.21.1 # trusted publishing needs npm 11.5.1 or newer
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+      - run: cd dist && sha256sum --check SHA256SUMS
+      - run: node packaging/npm.mjs dist npm-out
+      - name: Publish, platform packages first (a rerun skips versions already on npm)
+        env:
+          # Empty when trusted publishing is set up; only the first publish needs a token.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for package in npm-out/pass-env-* npm-out/pass-env; do
+            spec="$(node -p "const p = require('./$package/package.json'); p.name + '@' + p.version")"
+            if npm view "$spec" version >/dev/null 2>&1; then echo "$spec is already published"; continue; fi
+            npm publish "./$package" --provenance --access public
+          done
+
+  # Homebrew: writes Formula/pass-env.rb in n8watkins/homebrew-tap. Off until
+  # the maintainer sets the repository variable HOMEBREW_TAP to true and adds
+  # the HOMEBREW_TAP_TOKEN secret; see docs/publishing.md.
+  homebrew:
+    needs: publish
+    if: vars.HOMEBREW_TAP == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+      - run: cd dist && sha256sum --check SHA256SUMS
+      - name: Update the formula in the tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          [ -n "$TAP_TOKEN" ] || { echo "::error::HOMEBREW_TAP_TOKEN is not set"; exit 1; }
+          version="${GITHUB_REF_NAME#v}"
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/n8watkins/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          node packaging/homebrew.mjs "$version" dist/SHA256SUMS > tap/Formula/pass-env.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/pass-env.rb
+          git diff --cached --quiet && { echo "formula already at $version"; exit 0; }
+          git commit -m "pass-env $version"
+          git push

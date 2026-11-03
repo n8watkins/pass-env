@@ -20,7 +20,7 @@ type Mapping = { name: string; entry: string; multiline: boolean };
 type Sources = { files: string[]; explicit: Mapping[] };
 type Charset = "alnum" | "hex" | "base64url";
 type Options =
-	| { command: "help" }
+	| { command: "help"; topic?: string; brief?: boolean }
 	| { command: "list"; prefix: string; json: boolean }
 	| ({ command: "run"; argv: string[] } & Sources)
 	| ({ command: "check" } & Sources)
@@ -63,28 +63,26 @@ const CHARSETS: Record<Charset, string> = {
 	base64url: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
 };
 
-function usage(): string {
-	return `pass-env: use secrets from pass without printing them.
+const HELP_INTRO = "pass-env: use secrets from pass without printing them.";
 
-Store a secret
-  pass-env set <entry> [--force]
+// One block per command, shown by `pass-env help <command>` and `<command> --help`;
+// `pass-env help` prints them all in the order of HELP_GROUPS.
+const HELP: Record<string, string> = {
+	set: `  pass-env set <entry> [--force]
       Paste a key you were given (hidden prompt), or pipe it in.
-  pass-env generate <entry> [length] [--charset alnum|hex|base64url] [--copy] [--force]
+      --force replaces an existing one (rotation).`,
+	generate: `  pass-env generate <entry> [length] [--charset alnum|hex|base64url] [--copy] [--force]
       Make a random secret (default 48 alnum). Never printed.
       --copy also puts it on your clipboard to paste somewhere, cleared after 45s.
-      --force replaces an existing one (rotation).
-
-Use a secret
-  pass-env run [-f file]... [-e NAME=entry]... -- command args...
+      --force replaces an existing one (rotation).`,
+	run: `  pass-env run [-f file]... [-e NAME=entry]... -- command args...
       Start a command with secrets as environment variables.
-      With no -f or -e, uses ./.env.pass.
-  pass-env pipe <entry> [--multiline] -- command args...
-      Send one secret to a command's input, e.g. gh secret set NAME.
-  pass-env copy <entry> [--multiline]
-      Put one secret on your clipboard, cleared after 45s.
-
-Move an existing .env file into pass
-  pass-env import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--map NAME=entry]... [--force]
+      With no -f or -e, uses ./.env.pass.`,
+	pipe: `  pass-env pipe <entry> [--multiline] -- command args...
+      Send one secret to a command's input, e.g. gh secret set NAME.`,
+	copy: `  pass-env copy <entry> [--multiline]
+      Put one secret on your clipboard, cleared after 45s.`,
+	import: `  pass-env import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--map NAME=entry]... [--force]
       Store each secret as <prefix>/<NAME> and add it to .env.pass next to
       the file. Public names (NEXT_PUBLIC_*, VITE_*, ...) and placeholders
       stay. The file is not changed. --dry-run shows the plan, names only.
@@ -92,10 +90,8 @@ Move an existing .env file into pass
       An existing entry is reused if its value is the same (needs unlock).
   pass-env import <file> --prefix <prefix> [--skip ...] [--map ...] --remove
       After testing with run: check every stored value against the file,
-      then delete those lines from it. Needs GPG unlocked.
-
-Clean up keys agents already saw
-  pass-env scrub [--path <file-or-folder>]... [--known] [--all]
+      then delete those lines from it. Needs GPG unlocked.`,
+	scrub: `  pass-env scrub [--path <file-or-folder>]... [--known] [--all]
       Coding agents keep chat logs (~/.claude, ~/.codex, ~/.pi, ~/.omp) with
       everything they saw. Count the secrets in them per file, by kind.
       Never prints them. Exits 1 if any are found. --known also finds the
@@ -108,22 +104,21 @@ Clean up keys agents already saw
       valid. Skips files changed in the last 10 minutes (an agent may be
       writing them) unless --include-active. No backups, on purpose.
   pass-env scrub --history
-      When each log folder was last checked, and what was found and fixed.
-
-Check and set up
-  pass-env doctor
+      When each log folder was last checked, and what was found and fixed.`,
+	doctor: `  pass-env doctor
       Check pass, GPG, the store and this folder, including env variables
-      the code reads but nothing declares. Decrypts nothing.
-  pass-env check [-f file]... [-e NAME=entry]...
-      Show each mapping as ok or MISSING. Decrypts nothing.
-  pass-env list [prefix] [--json]
-      Show entry names. Decrypts nothing.
-  pass-env unlock [entry]
+      the code reads but nothing declares. Decrypts nothing.`,
+	check: `  pass-env check [-f file]... [-e NAME=entry]...
+      Show each mapping as ok or MISSING. Decrypts nothing.`,
+	list: `  pass-env list [prefix] [--json]
+      Show entry names. Decrypts nothing.`,
+	unlock: `  pass-env unlock [entry] [--hello]
       Type your GPG passphrase once per session. Terminal only.
-  pass-env version
-
-Windows Hello unlock (experimental, WSL on Windows only, opt-in)
-  pass-env hello install [<pass-env-hello.exe>] [--yes]
+      --hello (experimental, WSL on Windows) uses face, fingerprint or PIN;
+      see pass-env help hello.`,
+	version: `  pass-env version
+      Print the version.`,
+	hello: `  pass-env hello install [<pass-env-hello.exe>] [--yes]
       Put the Windows helper in %LOCALAPPDATA%\\pass-env and record its
       SHA-256. With no file, downloads this release's helper and checks
       its hash and build provenance. Never updates itself.
@@ -134,8 +129,44 @@ Windows Hello unlock (experimental, WSL on Windows only, opt-in)
       Unlock with face, fingerprint or PIN. Terminal only. Any problem
       falls back to typing the passphrase, which always keeps working.
   pass-env hello status | hello forget
-      Show the setup (no prompt), or delete the saved passphrase and key.
-  pass-env help
+      Show the setup (no prompt), or delete the saved passphrase and key.`,
+};
+
+const HELP_GROUPS: [string, string[]][] = [
+	["Store a secret", ["set", "generate"]],
+	["Use a secret", ["run", "pipe", "copy"]],
+	["Move an existing .env file into pass", ["import"]],
+	["Clean up keys agents already saw", ["scrub"]],
+	["Check and set up", ["doctor", "check", "list", "unlock", "version"]],
+	["Windows Hello unlock (experimental, WSL on Windows only, opt-in)", ["hello"]],
+];
+
+// What `pass-env` with no arguments prints: the everyday commands, one line each.
+function overview(): string {
+	const rows: [string, string][] = [
+		["set <entry>", "store a key you were given"],
+		["generate <entry>", "make a random secret, never shown"],
+		["run -- <command>", "run a command with the secrets in .env.pass"],
+		["pipe <entry> -- <command>", "send one secret to a command's input"],
+		["check", "check that every .env.pass entry exists"],
+		["import <file> --prefix <name>", "move a .env file into pass"],
+		["scrub", "find secrets saved in agent chat logs"],
+		["doctor", "check the setup"],
+	];
+	const width = Math.max(...rows.map(([usage]) => usage.length));
+	return `${HELP_INTRO}\n\n${rows.map(([usage, what]) => `  pass-env ${usage.padEnd(width)}  ${what}`).join("\n")}\n\nMore: pass-env help <command>, or pass-env help for everything.`;
+}
+
+function commandHelp(command: string): string {
+	return `${HELP_INTRO}\n\n${HELP[command]}`;
+}
+
+function usage(): string {
+	const groups = HELP_GROUPS.map(([title, commands]) => `${title}\n${commands.map((command) => HELP[command]).join("\n")}`).join("\n\n");
+	return `${HELP_INTRO}
+
+${groups}
+  pass-env help [command]
 
 Reference files (.env.pass)
   One NAME=entry per line, full-line # comments allowed. Names only, safe
@@ -206,7 +237,7 @@ function parseSources(args: string[], allowCommand: boolean): Sources & { argv?:
 		if (arg === "-e" || arg === "--env") explicit.push(mapping(value, "--env"));
 		else files.push(value);
 	}
-	if (allowCommand) throw new CliError("USAGE", "run requires -- command args...", 2);
+	if (allowCommand) throw new CliError("USAGE", "run needs the command after --, e.g. pass-env run -- npm run dev", 2);
 	return { files, explicit };
 }
 
@@ -221,9 +252,14 @@ function withDefaultFile(sources: Sources): Sources {
 function parseArgs(args: string[]): Options {
 	const [command, ...rest] = args;
 	if (command === "--version") return { command: "version" };
-	if (!command || ["help", "--help", "-h"].includes(command) || rest.some((arg) => arg === "--help" || arg === "-h") && !rest.includes("--")) {
-		return { command: "help" };
+	if (!command) return { command: "help", brief: true };
+	if (["help", "--help", "-h"].includes(command)) {
+		if (rest.length > 1 || rest[0] && !Object.hasOwn(HELP, rest[0])) throw new CliError("USAGE", `no help for ${JSON.stringify(rest.join(" "))}; commands: ${Object.keys(HELP).join(", ")}`, 2);
+		return { command: "help", topic: rest[0] };
 	}
+	const helpAt = rest.findIndex((arg) => arg === "--help" || arg === "-h");
+	const separator = rest.indexOf("--");
+	if (helpAt !== -1 && (separator === -1 || helpAt < separator)) return { command: "help", topic: Object.hasOwn(HELP, command) ? command : undefined };
 	switch (command) {
 		case "list": {
 			let prefix: string | undefined;
@@ -307,7 +343,7 @@ function parseArgs(args: string[]): Options {
 			if (rest.length) throw new CliError("USAGE", "expected doctor", 2);
 			return { command: "doctor" };
 		default:
-			throw new CliError("USAGE", "unknown command; run pass-env help", 2);
+			throw new CliError("USAGE", `unknown command ${JSON.stringify(command)}`, 2);
 	}
 }
 
@@ -2607,7 +2643,7 @@ async function scrub(options: ScrubOptions): Promise<number> {
 async function main(args: string[]): Promise<number> {
 	const options = parseArgs(args);
 	if (options.command === "help") {
-		console.log(usage());
+		console.log(options.brief ? overview() : options.topic ? commandHelp(options.topic) : usage());
 		return 0;
 	}
 	if (options.command === "version") {
@@ -2721,6 +2757,10 @@ if (import.meta.main) {
 	} catch (error) {
 		const failure = error instanceof CliError ? error : new CliError("INTERNAL", "command failed");
 		console.error(`${failure.code}: ${failure.message}`);
+		if (failure.code === "USAGE") {
+			const command = process.argv[2];
+			console.error(command && Object.hasOwn(HELP, command) ? `See pass-env help ${command}` : "See pass-env help");
+		}
 		process.exitCode = failure.exitCode;
 	}
 }
