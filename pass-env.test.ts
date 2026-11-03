@@ -457,6 +457,37 @@ describe("unlock and list", () => {
 		const out = invoke(files, ["help"]).stdout;
 		for (const command of ["run", "pipe", "copy", "check", "set", "generate", "unlock", "list", "import", "scrub", "doctor"]) expect(out).toContain(`pass-env ${command}`);
 	});
+
+	test("no arguments prints a short overview that points at the full help", () => {
+		const files = fixture();
+		const result = invoke(files, []);
+		expect(result.status).toBe(0);
+		expect(result.stdout.trim().split("\n").length).toBeLessThan(15);
+		expect(result.stdout).toContain("pass-env help <command>");
+	});
+
+	test("help <command> and <command> --help print only that command", () => {
+		const files = fixture();
+		for (const args of [["help", "generate"], ["generate", "--help"], ["generate", "x", "-h"]]) {
+			const out = invoke(files, args).stdout;
+			expect(out).toContain("pass-env generate <entry>");
+			expect(out).not.toContain("pass-env run");
+		}
+		const passthrough = invoke(files, ["run", "-e", "A=missing", "--", "sh", "--help"]);
+		expect(passthrough.stdout).not.toContain("pass-env: use secrets");
+	});
+
+	test("a usage error names the help to read", () => {
+		const files = fixture();
+		const run = invoke(files, ["run"]);
+		expect(run.status).toBe(2);
+		expect(run.stderr).toContain("pass-env run -- npm run dev");
+		expect(run.stderr).toContain("See pass-env help run");
+		const unknown = invoke(files, ["frob"]);
+		expect(unknown.stderr).toContain('unknown command "frob"');
+		expect(unknown.stderr).toContain("See pass-env help\n");
+		expect(invoke(files, ["help", "nope"]).status).toBe(2);
+	});
 });
 
 describe("import", () => {
