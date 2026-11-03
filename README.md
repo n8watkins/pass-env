@@ -51,7 +51,7 @@ Every option installs the same standalone binary from a [release](https://github
 The installer picks the binary for your system, checks it against the release's `SHA256SUMS`, also checks its build provenance when [gh](https://cli.github.com) is signed in, and puts it in `~/.local/bin`.
 It takes `--version v1.2.0` and `--dir <folder>` (`curl ... | sh -s -- --dir /usr/local/bin`), or the same as `PASS_ENV_VERSION` and `PASS_ENV_INSTALL_DIR`.
 npm and Homebrew install from the same release, and the npm packages carry npm provenance.
-The npm and Homebrew packages start with the first release after v1.2.0; until then, use the installer.
+The npm packages start with the first release after v1.2.0; until then, use the installer or Homebrew.
 
 <details>
 <summary>By hand, or verifying a binary yourself</summary>

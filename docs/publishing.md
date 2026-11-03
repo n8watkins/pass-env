@@ -8,7 +8,7 @@ Everything ships from one tag: push `vX.Y.Z` on `main` and `.github/workflows/re
 | GitHub Release (binaries, `pass-env.ts`, `SHA256SUMS`, build provenance) | `build` and `publish` jobs | Always on |
 | `install.sh` | Reads the latest release | Always on |
 | npm (`pass-env` plus `pass-env-<os>-<arch>`) | `npm` job, from the release's files | Repository variable `NPM_PUBLISH=true` |
-| Homebrew (`n8watkins/tap/pass-env`) | `homebrew` job, writes `Formula/pass-env.rb` in `n8watkins/homebrew-tap` | Repository variable `HOMEBREW_TAP=true` and secret `HOMEBREW_TAP_TOKEN` |
+| Homebrew (`n8watkins/tap/pass-env`) | `homebrew` job, writes `Formula/pass-env.rb` in `n8watkins/homebrew-tap` | Repository variable `HOMEBREW_TAP=true` and secret `HOMEBREW_TAP_DEPLOY_KEY` (both set) |
 
 The npm and Homebrew jobs run only after the GitHub Release is published, and use the exact files it published, checked against `SHA256SUMS` again.
 A failed npm or Homebrew job never undoes the release; fix the cause and re-run the job (npm skips versions already published).
@@ -27,11 +27,12 @@ A failed npm or Homebrew job never undoes the release; fix the cause and re-run 
 3. After the first release reaches npm: for each of the five packages (`pass-env`, `pass-env-linux-x64`, `pass-env-linux-arm64`, `pass-env-darwin-x64`, `pass-env-darwin-arm64`), open its settings on npmjs.com, add a trusted publisher (GitHub Actions, repository `n8watkins/pass-env`, workflow `release.yml`), and set "require two-factor authentication and disallow tokens".
 4. Delete the `NPM_TOKEN` secret and revoke the token. From then on the workflow publishes with short-lived OIDC credentials and nothing long-lived exists to leak.
 
-## One-time setup: Homebrew
+## Homebrew (set up)
 
-1. Create the public repository `n8watkins/homebrew-tap` with a `Formula/` folder (Homebrew finds `n8watkins/tap` there).
-2. Create a fine-grained token with Contents read and write on that one repository, and add it to pass-env as the secret `HOMEBREW_TAP_TOKEN`.
-3. Set the repository variable `HOMEBREW_TAP` to `true`.
+The tap is `n8watkins/homebrew-tap`, shared by pass-env and devguard.
+The release workflow pushes the formula with an SSH deploy key that can write to that one repository and nothing else: its public half is a deploy key on the tap ("release workflows: pass-env, devguard"), its private half the `HOMEBREW_TAP_DEPLOY_KEY` secret here and in the other repo.
+To rotate it, generate a new key pair, replace the deploy key on the tap, and set the secret again in both repos (`gh secret set HOMEBREW_TAP_DEPLOY_KEY < key`), then delete the private key file.
+The repository variable `HOMEBREW_TAP=true` turns the job on; set it to anything else to pause it.
 
 ## Checking changes to packaging
 

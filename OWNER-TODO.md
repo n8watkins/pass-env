@@ -87,11 +87,11 @@ Dropping the "experimental" label from `unlock --hello`, and using Hello instead
 ## 3. Turn on npm and Homebrew publishing (about 15 minutes)
 
 - [ ] npm: an account with two-factor authentication, the `NPM_TOKEN` secret for the first publish, and the repository variable `NPM_PUBLISH=true`.
-- [ ] Homebrew: create `n8watkins/homebrew-tap`, add the `HOMEBREW_TAP_TOKEN` secret, and set `HOMEBREW_TAP=true`.
+- [x] Homebrew: tap, deploy key and `HOMEBREW_TAP=true` set up by an agent (2026-11-03).
 - [ ] After the first release reaches npm: switch the five packages to trusted publishing and delete the token.
 
 **What.**
-The release workflow can publish pass-env to npm (so `npm`, `pnpm`, `yarn` and `bun` can install it) and to a Homebrew tap, but both are off until these are set up.
+The release workflow publishes pass-env to npm (so `npm`, `pnpm`, `yarn` and `bun` can install it) once npm is set up; Homebrew is already on.
 
 **Steps.**
 [`docs/publishing.md`](docs/publishing.md) has each step.
