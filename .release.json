@@ -1,0 +1,13 @@
+{
+  "versionFiles": [
+    {
+      "path": "pass-env.ts",
+      "pattern": "^const VERSION = \"(.*)\";$"
+    },
+    "hello/Cargo.toml",
+    "hello/Cargo.lock"
+  ],
+  "workflows": "package",
+  "repository": "n8watkins/pass-env",
+  "visibility": "public"
+}
