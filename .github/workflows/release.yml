@@ -8,7 +8,8 @@ permissions:
 # sums and Sigstore build provenance. See docs/windows-hello.md.
 jobs:
   verify:
-    # Only the upstream repo publishes: a fork that pushes a tag releases nothing.
+    # release-kit: fork guard. Only the upstream repo publishes: a fork that
+    # pushes a tag releases nothing.
     # Every other job needs this one, so they are skipped too.
     if: github.repository == 'n8watkins/pass-env'
     runs-on: ubuntu-24.04
