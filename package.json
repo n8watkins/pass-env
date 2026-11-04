@@ -31,7 +31,10 @@
   ],
   "scripts": {
     "test": "bun test",
-    "e2e": "./demo/e2e.sh"
+    "e2e": "./demo/e2e.sh",
+    "release": "release-kit release",
+    "release:check": "release-kit check && npm test",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "homepage": "https://github.com/n8watkins/pass-env#readme",
   "bugs": {
@@ -46,5 +49,8 @@
     "Phaedrus Raznikov (https://github.com/moomooskycow)",
     "Nathan Watkins (https://github.com/n8watkins)"
   ],
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "release-kit": "github:n8watkins/release-kit#v2.6.0"
+  }
 }

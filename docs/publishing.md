@@ -1,7 +1,7 @@
 # Publishing pass-env
 
 How a release reaches each install channel, and the one-time setup each needs.
-Everything ships from one tag: push `vX.Y.Z` on `main` and `.github/workflows/release.yml` does the rest.
+Everything ships from one tag, which [release-kit](https://github.com/n8watkins/release-kit) cuts (`npm run release -- --push`); `.github/workflows/release.yml` does the rest.
 
 | Channel | Built by | Turned on by |
 | --- | --- | --- |
@@ -15,9 +15,10 @@ A failed npm or Homebrew job never undoes the release; fix the cause and re-run 
 
 ## Releasing
 
-1. Set the version in `pass-env.ts` (`const VERSION`), `package.json` and `hello/Cargo.toml`, and add the changes to `CHANGES.md`.
-2. Merge that to `main`, then tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. The release workflow checks the tag is on `main` and the three versions match, builds and tests everything, publishes the release, then npm and Homebrew if they are on.
+1. On an up-to-date `main`, preview with `npm run release -- --dry-run`, then run `npm run release -- --push`.
+   release-kit picks the version from the Conventional Commits since the last tag, bumps it in `package.json`, `pass-env.ts` (`const VERSION`), `hello/Cargo.toml` and `hello/Cargo.lock` (`.release.json`), writes the `CHANGELOG.md` section, and lands the release commit and tag through a release pull request (main is protected).
+2. The tag starts the release workflow: it checks the tag is on `main` and the versions match, builds and tests everything, publishes the GitHub Release with the `CHANGELOG.md` section as its notes, then npm and Homebrew if they are on.
+3. `CHANGES.md` (what this fork changed from upstream) is still edited by hand when a change is worth listing there.
 
 ## One-time setup: npm
 
