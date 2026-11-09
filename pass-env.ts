@@ -42,7 +42,7 @@ type ImportOptions = {
 	command: "import"; file: string; prefix: string; skip: Set<string>; map: Map<string, string>; dryRun: boolean; force: boolean; remove: boolean;
 };
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 // The release workflow replaces these two lines (exactly once each) with the
 // SHA-256 of the pass-env-hello.exe built from the same tagged commit, and the
 // repository it was released from. Empty in source: then the hash recorded by
