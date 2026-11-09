@@ -1534,7 +1534,7 @@ describe("Windows Hello unlock (fake helper)", () => {
 });
 
 describe("init", () => {
-	const PASSPHRASE = "synthetic-pass-42";
+	const PASSPHRASE = "synthetic-test-passphrase";
 	const fakePinentry = join(import.meta.dir, "demo", "fake-pinentry.sh");
 	const ttyAvailable = Boolean(Bun.which("script"));
 	const NEW_KEY = "0123456789ABCDEF0123456789ABCDEF01234567";
@@ -1578,7 +1578,7 @@ describe("init", () => {
 	});
 
 	test.skipIf(!ttyAvailable)("shows the rules, names what was wrong, then makes the key and the store", () => {
-		const files = setup(["short1", "lettersonlyhere", PASSPHRASE, "synthetic-pass-43", PASSPHRASE, PASSPHRASE]);
+		const files = setup(["short1", "lettersonlyhere", PASSPHRASE, "synthetic-other-passphrase", PASSPHRASE, PASSPHRASE]);
 		const result = inTty(files, ["init", "--name", "Synthetic Person", "--email", "synthetic@example.invalid"]);
 		expect(result.status).toBe(0);
 		const log = shown(files);
