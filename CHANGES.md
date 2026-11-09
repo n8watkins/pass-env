@@ -24,7 +24,7 @@ The first commit in this repository is that file unchanged.
 ## Added
 
 - `init [--name] [--email] [--key <fingerprint>]`: first-time setup in your own terminal. It makes the GPG key through pass-env's own prompt, which shows the passphrase rules (12+ characters, a digit or symbol) up front, names the rule an entry missed, and asks again to confirm; GPG's wizard only names its rules after a miss. The passphrase goes to gpg on stdin. Then it runs `pass init` with the key's fingerprint, so the store does not record the email. `--key` uses an existing key; a store that is already set up is left alone.
-- `set <entry>`: store a pasted (hidden, confirmed prompt) or piped value.
+- `set <entry>`: store a pasted or piped value. The prompt is pass-env's own: a `*` for each character instead of a blank line, no second paste to confirm (it catches typos, not a paste that missed), surrounding spaces trimmed, a question before saving a value under 8 characters or with a space, and the number of characters saved.
 - `generate <entry> [length] [--charset] [--copy]`: store a random secret without printing it, unlike `pass generate`, which prints the new password. `--copy` also puts it on the clipboard for a human to paste.
 - `pipe <entry> -- command`: send one secret to a command's stdin, replacing `sh -c 'printf %s "$V" | ...'`.
 - `copy <entry>`: put one secret on the clipboard. Like `pass -c`, it is cleared after `PASSWORD_STORE_CLIP_TIME` seconds (default 45), but only if the clipboard still holds it. Uses `clip.exe` on WSL, then `pbcopy`, `wl-copy` or `xclip`.
