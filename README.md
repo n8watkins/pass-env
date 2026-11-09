@@ -33,8 +33,6 @@ pass-env needs `pass` and `gpg`, on Linux, macOS or Windows through WSL:
 
 ```sh
 sudo apt install pass                 # macOS: brew install pass gnupg
-gpg --full-generate-key               # choose a passphrase you can type daily
-pass init you@example.com             # the email on that key
 ```
 
 Then install pass-env itself, whichever way you prefer.
@@ -75,20 +73,34 @@ With [Bun](https://bun.sh) you can run the script instead: download `pass-env.ts
 
 </details>
 
-Make sure `~/.local/bin` (or wherever it went) is on your `PATH`, then check the setup:
+Make sure `~/.local/bin` (or wherever it went) is on your `PATH`, then set up your GPG key and the store, once, in your own terminal:
+
+```sh
+pass-env init
+```
+
+It asks for a name and an email, which only label the key: nothing is emailed or published.
+Then it asks for the passphrase you will type to unlock, with the rules shown in the prompt itself: at least 12 characters, with at least one digit or symbol.
+If an entry misses a rule, the prompt says which one; then you type it again to confirm, and it tells you if the two differ.
+It makes the key (ed25519, never expires) and runs `pass init` with the key's fingerprint, so the store does not record your email.
+Already have a GPG key? `pass-env init --key <fingerprint>` uses it instead (`gpg --list-secret-keys` shows yours).
+A store that is already set up is left alone.
+
+Then check the setup:
 
 ```sh
 pass-env doctor
 ```
 
 It prints one line per check (ok, warn or FAIL) and a command to fix each problem.
-Back up your GPG private key once (`gpg --export-secret-keys --armor you@example.com > key.asc`), store it offline, and delete the file.
+Back up your GPG private key once (`gpg --export-secret-keys --armor <fingerprint> > key.asc`; init prints the exact command), store it offline, and delete the file.
 Lose that key and every stored secret is gone.
 
 ## All commands
 
 | Command | What it does | Needs unlock? |
 | --- | --- | --- |
+| `pass-env init` | First-time setup, in your own terminal: make your GPG key (the passphrase rules are shown in the prompt) and the store for it. `--key <fingerprint>` uses a key you already have | No |
 | `pass-env set <entry>` | Store a key you were given. Paste it at the hidden prompt, or pipe it in | No |
 | `pass-env generate <entry>` | Make a random secret and store it. Never printed | No |
 | `pass-env generate <entry> --copy` | Same, and put it on your clipboard to paste somewhere (cleared after 45s) | No |
@@ -446,13 +458,14 @@ Errors are one line, start with a code, and never include secret values or GPG o
 | `EXISTS` | Already stored: add `--force` to replace it |
 | `DECRYPT` | This machine's GPG key cannot open the entry |
 | `CLIPBOARD` | No clipboard tool found (`clip.exe`, `pbcopy`, `wl-copy` or `xclip`) |
-| `TTY` | `unlock` was run without a terminal (for example by an agent) |
+| `TTY` | `unlock` or `init` was run without a terminal (for example by an agent) |
 | `MISMATCH` | `import --remove` found a stored value that differs from the file, so it removed nothing |
 | `CONFLICT` | `import` found a name that `.env.pass` already maps to another entry |
 | `PARSE` | `import` could not read a line of the file (the line number is given) |
 | `TRACKED` | `import` was given a file committed to git; it only moves local secret files |
 | `REFERENCE_FILE`, `WRITE` | A file could not be read, or could not be rewritten |
-| `USAGE`, `STORE`, `PASS_MISSING` | Wrong arguments, no store yet (`pass init`), or `pass` not installed |
+| `USAGE`, `STORE`, `PASS_MISSING` | Wrong arguments, no store yet (`pass-env init`) or one already set up, or `pass` not installed |
+| `KEY`, `GPG` | `init --key` named a key this machine does not have or that cannot encrypt, or gpg could not create the key |
 | `HELLO`, `SETUP`, `PASSPHRASE`, `PINENTRY`, `CANCELLED`, `CONFIG`, `DOWNLOAD` | Windows Hello setup: the helper or Hello is not usable, pass and GPG are not set up yet, the typed passphrase did not open the store, no pinentry, you cancelled, a pass-env config file is wrong, or a download failed |
 
 ## Tests

@@ -33,6 +33,7 @@ type Options =
 	| { command: "hello"; action: "install"; file?: string; yes: boolean }
 	| { command: "hello"; action: "status" | "forget" }
 	| { command: "version" }
+	| { command: "init"; name?: string; email?: string; key?: string }
 	| ImportOptions
 	| ScrubOptions
 	| { command: "doctor" };
@@ -105,6 +106,11 @@ const HELP: Record<string, string> = {
       writing them) unless --include-active. No backups, on purpose.
   pass-env scrub --history
       When each log folder was last checked, and what was found and fixed.`,
+	init: `  pass-env init [--name <name>] [--email <email>] [--key <fingerprint>]
+      First-time setup in your terminal: makes your GPG key, with the
+      passphrase rules shown in the prompt, then creates the store for it.
+      --key uses a GPG key you already have instead of making one.
+      Name and email only label the key; the store records its fingerprint.`,
 	doctor: `  pass-env doctor
       Check pass, GPG, the store and this folder, including env variables
       the code reads but nothing declares. Decrypts nothing.`,
@@ -137,13 +143,14 @@ const HELP_GROUPS: [string, string[]][] = [
 	["Use a secret", ["run", "pipe", "copy"]],
 	["Move an existing .env file into pass", ["import"]],
 	["Clean up keys agents already saw", ["scrub"]],
-	["Check and set up", ["doctor", "check", "list", "unlock", "version"]],
+	["Set up and check", ["init", "doctor", "check", "list", "unlock", "version"]],
 	["Windows Hello unlock (experimental, WSL on Windows only, opt-in)", ["hello"]],
 ];
 
 // What `pass-env` with no arguments prints: the everyday commands, one line each.
 function overview(): string {
 	const rows: [string, string][] = [
+		["init", "first-time setup: your GPG key and the store"],
 		["set <entry>", "store a key you were given"],
 		["generate <entry>", "make a random secret, never shown"],
 		["run -- <command>", "run a command with the secrets in .env.pass"],
@@ -339,6 +346,23 @@ function parseArgs(args: string[]): Options {
 			return parseImport(rest);
 		case "scrub":
 			return parseScrub(rest);
+		case "init": {
+			const values: { name?: string; email?: string; key?: string } = {};
+			for (let index = 0; index < rest.length; index += 1) {
+				const flag = rest[index];
+				const field = ({ "--name": "name", "--email": "email", "--key": "key" } as const)[flag as "--name"];
+				const value = rest[index + 1];
+				if (!field || value === undefined || values[field] !== undefined) {
+					throw new CliError("USAGE", "expected init [--name <name>] [--email <email>] [--key <fingerprint>]", 2);
+				}
+				values[field] = value;
+				index += 1;
+			}
+			if (values.key !== undefined && (values.name !== undefined || values.email !== undefined)) {
+				throw new CliError("USAGE", "--key uses an existing key, so --name and --email do not apply", 2);
+			}
+			return { command: "init", ...values };
+		}
 		case "doctor":
 			if (rest.length) throw new CliError("USAGE", "expected doctor", 2);
 			return { command: "doctor" };
@@ -457,7 +481,7 @@ function storePath(): string {
 			if (!lstatSync(current).isDirectory()) throw new Error();
 		}
 	} catch {
-		throw new CliError("STORE", "no password store found (it must be a real directory, not a symlink); create one with: pass init <your-gpg-id>");
+		throw new CliError("STORE", "no password store found (it must be a real directory, not a symlink); create one with: pass-env init");
 	}
 	return root;
 }
@@ -692,6 +716,193 @@ async function unlock(root: string, entry: string | undefined): Promise<string> 
 	const target = canaryEntry(root, entry);
 	await typedUnlock(root, target, tty);
 	return target;
+}
+
+// First-time setup (pass-env init). GPG's own key wizard only names its
+// passphrase rules after a miss, and on some terminals its prompt just comes
+// back with no reason given. init asks through its own prompt, which states the
+// rules up front and names the one that was missed, then makes the key in
+// batch mode with the passphrase on gpg's stdin, never in argv, env or a file.
+const MIN_PASSPHRASE = 12;
+const MAX_TRIES = 10;
+const PASSPHRASE_RULES = `at least ${MIN_PASSPHRASE} characters, with at least one digit or symbol`;
+
+type SecretKey = { fingerprint: string; uid: string; encrypts: boolean };
+
+function secretKeys(id?: string): SecretKey[] {
+	const result = Bun.spawnSync({ cmd: ["gpg", "--batch", "--list-secret-keys", "--with-colons", ...(id ? ["--", id] : [])], stdout: "pipe", stderr: "ignore" });
+	if (result.exitCode !== 0) return [];
+	const keys: SecretKey[] = [];
+	let current: SecretKey | undefined;
+	let section = "";
+	for (const line of result.stdout.toString().split("\n")) {
+		const fields = line.split(":");
+		if (fields[0] === "sec") {
+			// Field 12 holds the whole key's capabilities: E means it can encrypt.
+			current = { fingerprint: "", uid: "", encrypts: (fields[11] ?? "").includes("E") };
+			keys.push(current);
+		}
+		if (["sec", "ssb", "uid"].includes(fields[0])) section = fields[0];
+		if (!current) continue;
+		if (fields[0] === "fpr" && section === "sec" && !current.fingerprint) current.fingerprint = fields[9] ?? "";
+		if (fields[0] === "uid" && !current.uid) current.uid = (fields[9] ?? "").replace(/\\x([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
+	}
+	return keys.filter((key) => /^[0-9A-F]{40,64}$/.test(key.fingerprint));
+}
+
+// What is wrong with a new passphrase, or undefined when it follows the rules.
+// Counts characters, not bytes; any non-ASCII character counts as a symbol.
+function passphraseProblem(passphrase: Uint8Array): string | undefined {
+	if (!passphrase.length) return `You did not type anything. The rules: ${PASSPHRASE_RULES}.`;
+	if (passphrase.includes(0) || passphrase.includes(10) || passphrase.includes(13)) return "Line breaks cannot be part of a passphrase.";
+	if (passphrase.length > MAX_PASSPHRASE) return `That is too long: ${MAX_PASSPHRASE} bytes at most.`;
+	let characters = 0;
+	let symbol = false;
+	for (const byte of passphrase) {
+		if ((byte & 0xc0) !== 0x80) characters += 1;
+		if (!((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122))) symbol = true;
+	}
+	if (characters < MIN_PASSPHRASE) return `Too short: that was ${characters} characters, and at least ${MIN_PASSPHRASE} are needed.`;
+	if (!symbol) return "Add at least one digit or symbol; that was letters only.";
+	return undefined;
+}
+
+// Asks for a new passphrase twice, until both entries match and follow the rules.
+async function newPassphrase(tty: string): Promise<Buffer> {
+	const description = `Choose a passphrase for your new GPG key. It protects every secret in your store, and you type it to unlock.
+
+Rules: ${PASSPHRASE_RULES}.
+It cannot be recovered, so save it in your password manager.`;
+	let error: string | undefined;
+	for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
+		const first = await askPassphrase(tty, description, error);
+		error = passphraseProblem(first);
+		if (error) {
+			first.fill(0);
+			continue;
+		}
+		const second = await askPassphrase(tty, "Type the same passphrase again, to make sure it is the one you meant.");
+		const same = first.length === second.length && timingSafeEqual(first, second);
+		second.fill(0);
+		if (same) return first;
+		first.fill(0);
+		error = "The two entries did not match. Start again with the first one.";
+	}
+	throw new CliError("PASSPHRASE", `no usable passphrase after ${MAX_TRIES} tries; nothing was created`);
+}
+
+// Reads one line from the terminal and stops there. An async reader (for
+// await ... of console) keeps reading stdin in the background afterwards, and
+// would swallow the keystrokes meant for a pinentry prompt that opens later.
+function readLine(): string {
+	const bytes: number[] = [];
+	const one = Buffer.alloc(1);
+	for (;;) {
+		let count: number;
+		try {
+			count = readSync(0, one, 0, 1, null);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EAGAIN") continue;
+			throw error;
+		}
+		if (count === 0 || one[0] === 10) break;
+		if (bytes.length < 4096) bytes.push(one[0]);
+	}
+	return Buffer.from(bytes).toString("utf8").replace(/\r$/, "");
+}
+
+async function ask(question: string): Promise<string> {
+	process.stdout.write(question);
+	return readLine().trim();
+}
+
+async function keyLabel(options: { name?: string; email?: string }): Promise<string> {
+	if (options.name === undefined || options.email === undefined) {
+		console.log("Your key gets a name and an email. They only label it, so you can tell keys apart: nothing is emailed or published,");
+		console.log("and the store records the key's fingerprint, not your email.");
+	}
+	const name = options.name ?? await ask("Name: ");
+	if (!name.trim() || name.length > 100 || /[<>\x00-\x1f\x7f]/.test(name)) throw new CliError("USAGE", "the name must be 1 to 100 characters, without < or >", 2);
+	const email = options.email ?? await ask("Email (optional, press Enter to skip): ");
+	if (email && !/^[^\s<>@]+@[^\s<>@]+$/.test(email)) throw new CliError("USAGE", `${JSON.stringify(email)} does not look like an email address`, 2);
+	return email ? `${name.trim()} <${email}>` : name.trim();
+}
+
+// Makes an ed25519 signing key with a cv25519 encryption subkey ("future-default")
+// that never expires, protected by the passphrase. Returns its fingerprint.
+async function createKey(uid: string, passphrase: Uint8Array): Promise<string> {
+	const child = guardSpawn(() => Bun.spawn({
+		cmd: ["gpg", "--batch", "--no-tty", "--pinentry-mode", "loopback", "--passphrase-fd", "0", "--status-fd", "1",
+			"--quick-generate-key", "--", uid, "future-default", "default", "never"],
+		stdin: "pipe", stdout: "pipe", stderr: "pipe",
+	}));
+	try {
+		child.stdin.write(passphrase);
+		child.stdin.write("\n");
+		await child.stdin.end();
+	} catch { /* gpg may exit first; its status says why. */ }
+	// stderr is drained, never shown: errors carry no GPG output.
+	const [status, , code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+	const fingerprint = /^\[GNUPG:\] KEY_CREATED [BP] ([0-9A-F]{40,64})$/m.exec(status)?.[1];
+	if (code !== 0 || !fingerprint) throw new CliError("GPG", "gpg could not create the key; nothing was created. pass-env doctor checks GPG's setup");
+	return fingerprint;
+}
+
+async function init(options: { name?: string; email?: string; key?: string }): Promise<number> {
+	const tty = requireTty("init");
+	for (const tool of ["gpg", "pass"]) if (!Bun.which(tool)) throw new CliError("SETUP", `${tool} is not installed; ${installFix(tool)}`);
+	const configured = process.env.PASSWORD_STORE_DIR;
+	if (!configured && !process.env.HOME) throw new CliError("STORE", "set PASSWORD_STORE_DIR or HOME");
+	const root = resolve(configured || join(process.env.HOME!, ".password-store"));
+	if (isWsl() && /^\/mnt\/[a-z]\//i.test(`${root}/`)) throw new CliError("STORE", `${root} is on the Windows drive, where Linux file permissions do not protect it; unset PASSWORD_STORE_DIR`);
+	let existing: Stats | undefined;
+	try { existing = lstatSync(root); } catch { /* No store yet: the usual case. */ }
+	if (existing && !existing.isDirectory()) throw new CliError("STORE", `${tilde(root)} exists but is not a folder (a symlink or a file); move it away first`);
+	if (existsSync(join(root, ".gpg-id"))) {
+		const ids = readFileSync(join(root, ".gpg-id"), "utf8").split("\n").map((line) => line.trim()).filter(Boolean).join(", ");
+		throw new CliError("STORE", `${tilde(root)} is already set up (for ${ids}); nothing to do. pass-env doctor checks it`);
+	}
+
+	let fingerprint: string;
+	let uid: string;
+	if (options.key !== undefined) {
+		const [key, ...others] = secretKeys(options.key);
+		if (!key) throw new CliError("KEY", `no private key matching ${JSON.stringify(options.key)} on this machine; gpg --list-secret-keys shows the ones you have`);
+		if (others.length) throw new CliError("KEY", `${JSON.stringify(options.key)} matches ${others.length + 1} keys; give the full fingerprint`);
+		if (!key.encrypts) throw new CliError("KEY", `${key.fingerprint} cannot encrypt, so pass cannot use it; run pass-env init without --key to make one that can`);
+		({ fingerprint, uid } = key);
+	} else {
+		const keys = secretKeys();
+		if (keys.length) {
+			console.log(`You already have ${keys.length === 1 ? "a GPG key" : `${keys.length} GPG keys`} on this machine:`);
+			for (const key of keys) console.log(`  ${key.fingerprint}  ${key.uid}`);
+			console.log("To use one for the store: pass-env init --key <fingerprint>");
+			if (!await confirm("Make a new key anyway?")) {
+				console.log("Nothing changed.");
+				return 1;
+			}
+		}
+		uid = await keyLabel(options);
+		await hardenProcess();
+		console.log(`Next, choose the passphrase: ${PASSPHRASE_RULES}. You type it twice.`);
+		const passphrase = await newPassphrase(tty);
+		try {
+			console.log("Making your key...");
+			fingerprint = await createKey(uid, passphrase);
+		} finally {
+			passphrase.fill(0);
+		}
+		console.log(`Created your GPG key ${fingerprint} (${uid}).`);
+	}
+
+	const env = { ...process.env, PASSWORD_STORE_DIR: root };
+	const result = Bun.spawnSync({ cmd: ["pass", "init", "--", fingerprint], env, stdout: "ignore", stderr: "ignore" });
+	if (result.exitCode !== 0) throw new CliError("STORE", `pass init failed; your key ${fingerprint} is kept, so retry with: pass-env init --key ${fingerprint}`);
+	console.log(`Created the store ${tilde(root)} for ${options.key !== undefined ? `your key ${fingerprint} (${uid})` : "that key"}.`);
+	console.log("Next: pass-env set <project>/<NAME> to add a key, then pass-env unlock when something needs it.");
+	console.log(`Keep a copy of your key off this machine, or a lost laptop means a lost store: gpg --export-secret-keys --armor ${fingerprint} > gpg-key.asc,`);
+	console.log("then save that file in your password manager and delete it here. It stays protected by your passphrase.");
+	return 0;
 }
 
 // Windows Hello unlock (experimental, WSL only). Design and threat model:
@@ -1022,7 +1233,7 @@ function assuanDecode(data: Uint8Array): Buffer {
 
 // Asks for the passphrase through pinentry's Assuan protocol, so it looks
 // like GPG's own prompt. The answer goes straight into a byte buffer.
-async function askPassphrase(tty: string, description: string): Promise<Buffer> {
+async function askPassphrase(tty: string, description: string, error?: string): Promise<Buffer> {
 	const program = pinentryProgram();
 	if (!program) throw new CliError("PINENTRY", "no pinentry program found; sudo apt install pinentry-curses");
 	const args = ["--ttyname", tty, ...(process.env.TERM ? ["--ttytype", process.env.TERM] : [])];
@@ -1084,6 +1295,7 @@ async function askPassphrase(tty: string, description: string): Promise<Buffer> 
 	const wipe = (parts: Buffer[]) => { for (const part of parts) part.fill(0); };
 	try {
 		const steps = [undefined, "SETTITLE pass-env", `SETDESC ${assuanEncode(description)}`, "SETPROMPT Passphrase:"];
+		if (error) steps.push(`SETERROR ${assuanEncode(error)}`);
 		for (const step of steps) {
 			const reply = await send(step);
 			wipe(reply.data);
@@ -1254,8 +1466,7 @@ function verifyProvenance(path: string, tag: string | undefined): "verified" | "
 
 async function confirm(question: string): Promise<boolean> {
 	process.stdout.write(`${question} [y/N] `);
-	for await (const line of console) return /^y(es)?$/i.test(line.trim());
-	return false;
+	return /^y(es)?$/i.test(readLine().trim());
 }
 
 async function helloInstall(file: string | undefined, yes: boolean): Promise<void> {
@@ -1758,12 +1969,12 @@ function storeChecks(): Check[] {
 	const root = resolve(configured || join(home!, ".password-store"));
 	if (isWsl() && /^\/mnt\/[a-z]\//i.test(`${root}/`)) {
 		return [fail(`store ${root} is on the Windows drive, where Linux file permissions do not protect it`,
-			"keep it inside WSL: unset PASSWORD_STORE_DIR, pass init <your-gpg-id>, then move the entries into ~/.password-store")];
+			"keep it inside WSL: unset PASSWORD_STORE_DIR, pass-env init, then move the entries into ~/.password-store")];
 	}
 	try {
 		storePath();
 	} catch {
-		return [fail(`no password store at ${tilde(root)} (it must be a real folder, not a symlink)`, "pass init <your-gpg-id>")];
+		return [fail(`no password store at ${tilde(root)} (it must be a real folder, not a symlink)`, "pass-env init")];
 	}
 	const checks = [ok(`store ${tilde(root)}`)];
 	let ids: string[];
@@ -1772,7 +1983,7 @@ function storeChecks(): Check[] {
 	} catch {
 		ids = [];
 	}
-	if (!ids.length) return [...checks, fail("the store has no .gpg-id, so pass cannot encrypt", "pass init <your-gpg-id>")];
+	if (!ids.length) return [...checks, fail("the store has no .gpg-id, so pass cannot encrypt", "pass-env init")];
 	if (!Bun.which("gpg")) return checks;
 	const missing = ids.filter((id) => {
 		const result = Bun.spawnSync({ cmd: ["gpg", "--batch", "--list-secret-keys", "--with-colons", "--", id], stdout: "pipe", stderr: "ignore" });
@@ -2652,6 +2863,7 @@ async function main(args: string[]): Promise<number> {
 		return 0;
 	}
 	if (options.command === "doctor") return doctor();
+	if (options.command === "init") return init(options);
 	if (options.command === "hello") {
 		switch (options.action) {
 			case "install":
