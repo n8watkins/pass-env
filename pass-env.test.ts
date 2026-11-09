@@ -30,6 +30,12 @@ import { dirname, join, resolve } from "node:path";
 const args = process.argv.slice(2);
 appendFileSync(process.env.TEST_PASS_CALLS, args.join(" ") + "\\n");
 const file = (entry) => join(process.env.PASSWORD_STORE_DIR, entry + ".gpg");
+if (args[0] === "init") {
+  if (args[1] !== "--" || args.length !== 3) process.exit(7);
+  mkdirSync(process.env.PASSWORD_STORE_DIR, { recursive: true });
+  writeFileSync(join(process.env.PASSWORD_STORE_DIR, ".gpg-id"), args[2] + "\\n");
+  process.exit(0);
+}
 if (args[0] === "insert") {
   if (args.join(" ") !== "insert --multiline --force -- " + args[4] || args.length !== 5) process.exit(7);
   mkdirSync(dirname(file(args[4])), { recursive: true });
@@ -65,20 +71,27 @@ process.stdout.write(readFileSync(file(args[2])));
 	// A fake clipboard backed by a file.
 	writeFileSync(join(bin, "fakeclip"), `#!/bin/sh\ncat > "$CLIP_FILE"\n`, { mode: 0o700 });
 	writeFileSync(join(bin, "fakepaste"), `#!/bin/sh\ncat "$CLIP_FILE"\n`, { mode: 0o700 });
-	// A fake gpg: doctor's secret-key question, and the decrypts unlock --hello
-	// makes (unlocked yet? / loopback with the passphrase on fd 3).
+	// A fake gpg: doctor's and init's secret-key questions, init's key creation
+	// (passphrase on stdin), and the decrypts unlock --hello makes (unlocked yet?
+	// / loopback with the passphrase on stdin).
 	const state = join(root, "gpg-state");
 	mkdirSync(state);
 	writeFileSync(join(bin, "gpg"), `#!/bin/sh
 case " $* " in
 *" --pinentry-mode error "*) [ -e "$TEST_GPG_STATE/unlocked" ] && exit 0; echo "gpg: decryption failed: No secret key" >&2; exit 2;;
+*" --quick-generate-key "*)
+	IFS= read -r given
+	if [ "$given" = "$TEST_GPG_PASSPHRASE" ]; then echo "keygen ok: $*" >> "$TEST_PASS_CALLS"; else echo "keygen got another passphrase" >> "$TEST_PASS_CALLS"; fi
+	echo "[GNUPG:] KEY_CREATED B 0123456789ABCDEF0123456789ABCDEF01234567"; exit 0;;
 *" --passphrase-fd 0 "*)
 	IFS= read -r given
 	if [ "$given" = "$TEST_GPG_PASSPHRASE" ]; then echo "loopback ok" >> "$TEST_PASS_CALLS"; : > "$TEST_GPG_STATE/unlocked"; exit 0; fi
 	echo "loopback bad" >> "$TEST_PASS_CALLS"; echo "gpg: public key decryption failed: Bad passphrase" >&2; exit 2;;
 esac
 for id; do :; done
-case " $TEST_GPG_SECRET_KEYS " in *" $id "*) echo "sec:u:255:22:SYNTHETIC::::::::::"; exit 0;; esac
+# With no key named, list every key: TEST_GPG_COLONS holds gpg's --with-colons lines.
+if [ "$id" = "--with-colons" ]; then printf '%b' "\${TEST_GPG_COLONS:-}"; exit 0; fi
+case " $TEST_GPG_SECRET_KEYS " in *" $id "*) if [ -n "\${TEST_GPG_COLONS:-}" ]; then printf '%b' "$TEST_GPG_COLONS"; else echo "sec:u:255:22:SYNTHETIC::::::::::"; fi; exit 0;; esac
 exit 2
 `, { mode: 0o700 });
 	writeFileSync(join(bin, "gpgconf"), `#!/bin/sh\necho "gpgconf $*" >> "$TEST_PASS_CALLS"\nrm -f "$TEST_GPG_STATE/unlocked"\n`, { mode: 0o700 });
@@ -784,7 +797,7 @@ describe("doctor", () => {
 		files.env.PASSWORD_STORE_DIR = join(files.root, "nowhere");
 		result = invoke(files, ["doctor"]);
 		line(result.stdout, "FAIL", "no password store at");
-		expect(result.stdout).toContain("fix: pass init <your-gpg-id>");
+		expect(result.stdout).toContain("fix: pass-env init");
 	});
 
 	test("fails when pass and gpg are missing, and on a WSL store under /mnt", () => {
@@ -1517,5 +1530,106 @@ describe("Windows Hello unlock (fake helper)", () => {
 		expect(version).toBe(`pass-env ${pkg}`);
 		expect(cargo).toBe(pkg);
 		expect(invoke(files, ["--version"]).stdout.split("\n")[0]).toBe(version);
+	});
+});
+
+describe("init", () => {
+	const PASSPHRASE = "synthetic-test-passphrase";
+	const fakePinentry = join(import.meta.dir, "demo", "fake-pinentry.sh");
+	const ttyAvailable = Boolean(Bun.which("script"));
+	const NEW_KEY = "0123456789ABCDEF0123456789ABCDEF01234567";
+	const OLD_KEY = "FEDCBA9876543210FEDCBA9876543210FEDCBA98";
+
+	// No store yet, and a fake pinentry that gives the answers in order.
+	const setup = (answers: string[]) => {
+		const files = fixture({});
+		rmSync(files.store, { recursive: true });
+		const seq = join(files.root, "pin-answers");
+		writeFileSync(seq, answers.map((answer) => `${answer}\n`).join(""));
+		Object.assign(files.env, {
+			PASS_ENV_PINENTRY: fakePinentry, FAKE_PIN_SEQ: seq, FAKE_PIN_LOG: join(files.root, "pin-log"), TEST_GPG_PASSPHRASE: PASSPHRASE,
+		});
+		return files;
+	};
+	const shown = (files: Fixture) => existsSync(files.env.FAKE_PIN_LOG!) ? readFileSync(files.env.FAKE_PIN_LOG!, "utf8") : "";
+	const calls = (files: Fixture) => existsSync(files.calls) ? readFileSync(files.calls, "utf8") : "";
+	const inTty = (files: Fixture, args: string[]) => {
+		const command = [...launcher, ...args].map((part) => `'${part.replace(/'/g, "'\\''")}'`).join(" ");
+		const result = spawnSync("script", ["-qec", command, "/dev/null"], { cwd: files.root, env: files.env, input: "", encoding: "utf8", timeout: 20_000 });
+		if (result.error) throw result.error;
+		const output = result.stdout.replace(/\r/g, "");
+		expect(output).not.toContain(PASSPHRASE);
+		return { status: result.status, output };
+	};
+
+	test("refuses without a terminal, before asking anything", () => {
+		const files = setup([PASSPHRASE, PASSPHRASE]);
+		const result = invoke(files, ["init", "--name", "Synthetic", "--email", "synthetic@example.invalid"]);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("TTY: init needs your terminal");
+		expect(calls(files)).toBe("");
+		expect(existsSync(join(files.store, ".gpg-id"))).toBe(false);
+	});
+
+	test("rejects --key together with --name or --email", () => {
+		const result = invoke(setup([]), ["init", "--key", OLD_KEY, "--name", "Synthetic"]);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("--key uses an existing key");
+	});
+
+	test.skipIf(!ttyAvailable)("shows the rules, names what was wrong, then makes the key and the store", () => {
+		const files = setup(["short1", "lettersonlyhere", PASSPHRASE, "synthetic-other-passphrase", PASSPHRASE, PASSPHRASE]);
+		const result = inTty(files, ["init", "--name", "Synthetic Person", "--email", "synthetic@example.invalid"]);
+		expect(result.status).toBe(0);
+		const log = shown(files);
+		// The rules are in the prompt itself, before any mistake.
+		expect(log.split("\n")[0]).toContain("Rules: at least 12 characters, with at least one digit or symbol.");
+		expect(log).toContain("SETERROR Too short: that was 6 characters, and at least 12 are needed.");
+		expect(log).toContain("SETERROR Add at least one digit or symbol; that was letters only.");
+		expect(log).toContain("SETDESC Type the same passphrase again");
+		expect(log).toContain("SETERROR The two entries did not match.");
+		expect(log).not.toContain(PASSPHRASE);
+		// The passphrase went to gpg on stdin, never in its arguments.
+		expect(calls(files)).toContain("keygen ok: --batch --no-tty --pinentry-mode loopback --passphrase-fd 0 --status-fd 1 --quick-generate-key -- Synthetic Person <synthetic@example.invalid> future-default default never");
+		expect(calls(files)).not.toContain(PASSPHRASE);
+		// The store records the fingerprint, not the email.
+		expect(readFileSync(join(files.store, ".gpg-id"), "utf8")).toBe(`${NEW_KEY}\n`);
+		expect(result.output).toContain(`Created your GPG key ${NEW_KEY} (Synthetic Person <synthetic@example.invalid>).`);
+		expect(result.output).toContain("Created the store");
+	});
+
+	test.skipIf(!ttyAvailable)("cancelling the prompt creates nothing", () => {
+		const files = setup([]);
+		files.env.FAKE_PIN_CANCEL = "1";
+		const result = inTty(files, ["init", "--name", "Synthetic", "--email", ""]);
+		expect(result.status).not.toBe(0);
+		expect(result.output).toContain("CANCELLED");
+		expect(calls(files)).not.toContain("keygen");
+		expect(existsSync(join(files.store, ".gpg-id"))).toBe(false);
+	});
+
+	test.skipIf(!ttyAvailable)("--key uses a key you already have, without a passphrase prompt", () => {
+		const files = setup([]);
+		Object.assign(files.env, {
+			TEST_GPG_SECRET_KEYS: OLD_KEY,
+			TEST_GPG_COLONS: `sec:u:255:22:F4BE65B3D6E82D5C:1762700000:::u:::scESC:::+:::23::0:\\nfpr:::::::::${OLD_KEY}:\\nuid:u::::1::X::Synthetic Owner <synthetic@example.invalid>::::::::::0:\\nssb:u:255:18:2DF604CBEF434726:1762700000:::::e:::+:::23:\\nfpr:::::::::AD57D968D058DA245840C6812DF604CBEF434726:\\n`,
+		});
+		const result = inTty(files, ["init", "--key", OLD_KEY]);
+		expect(result.status).toBe(0);
+		expect(shown(files)).toBe("");
+		expect(calls(files)).not.toContain("keygen");
+		expect(readFileSync(join(files.store, ".gpg-id"), "utf8")).toBe(`${OLD_KEY}\n`);
+		expect(result.output).toContain(`for your key ${OLD_KEY} (Synthetic Owner <synthetic@example.invalid>)`);
+	});
+
+	test.skipIf(!ttyAvailable)("leaves a store that is already set up alone", () => {
+		const files = setup([PASSPHRASE, PASSPHRASE]);
+		mkdirSync(files.store);
+		writeFileSync(join(files.store, ".gpg-id"), "synthetic@example.invalid\n");
+		const result = inTty(files, ["init", "--name", "Synthetic", "--email", ""]);
+		expect(result.status).not.toBe(0);
+		expect(result.output).toContain("is already set up (for synthetic@example.invalid); nothing to do");
+		expect(calls(files)).not.toContain("keygen");
+		expect(readFileSync(join(files.store, ".gpg-id"), "utf8")).toBe("synthetic@example.invalid\n");
 	});
 });
