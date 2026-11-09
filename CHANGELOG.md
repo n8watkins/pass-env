@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0 - 2026-11-09
+
+### New
+
+- Set shows a * per character and how many were saved ([#15](https://github.com/n8watkins/pass-env/pull/15))
+
 ## 1.3.0 - 2026-11-09
 
 New pass-env init: first-time setup in one step, with the passphrase rules shown in the prompt.
