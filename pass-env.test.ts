@@ -406,12 +406,79 @@ describe("pipe", () => {
 	});
 });
 
+describe("set at the prompt", () => {
+	const ttyAvailable = Boolean(Bun.which("script"));
+	// Types into pass-env in a pseudo-terminal, after the prompt is up, like a
+	// person pasting. Each chunk is sent after a pause, so answers to a
+	// follow-up question arrive after it is asked.
+	const typed = (files: Fixture, args: string[], chunks: string[]) => {
+		const command = [...launcher, ...args].map((part) => `'${part.replace(/'/g, "'\\''")}'`).join(" ");
+		const feed = chunks.map((chunk) => `sleep 0.6; printf '%s' '${chunk.replace(/'/g, "'\\''")}'`).join("; ");
+		const result = spawnSync("sh", ["-c", `{ ${feed}; sleep 1.5; } | script -qec "$0" /dev/null`, command], { cwd: files.root, env: files.env, encoding: "utf8", timeout: 20_000 });
+		if (result.error) throw result.error;
+		return { status: result.status, output: result.stdout.replace(/\r/g, "") };
+	};
+
+	test.skipIf(!ttyAvailable)("shows a * per character, never the value, and says how many were saved", () => {
+		const files = fixture({});
+		const value = "AQ.synthetic-key-0123456789";
+		const result = typed(files, ["set", "app/KEY"], [`${value}\r`]);
+		expect(result.status).toBe(0);
+		expect(result.output).not.toContain(value);
+		expect(result.output).toContain("*".repeat(value.length));
+		expect(result.output).toContain(`Stored app/KEY: ${value.length} characters.`);
+		expect(result.output).not.toContain("Retype");
+		expect(stored(files, "app/KEY")).toBe(`${value}\n`);
+	});
+
+	test.skipIf(!ttyAvailable)("backspace removes a character and spaces around the value are trimmed", () => {
+		const files = fixture({});
+		const result = typed(files, ["set", "app/KEY"], [" synthetic-valueX\x7f \r"]);
+		expect(result.status).toBe(0);
+		expect(result.output).toContain("Removed the spaces");
+		expect(result.output).toContain("Stored app/KEY: 15 characters.");
+		expect(stored(files, "app/KEY")).toBe("synthetic-value\n");
+	});
+
+	test.skipIf(!ttyAvailable)("a 1-character paste asks first, and saves nothing on no", () => {
+		const files = fixture({});
+		const result = typed(files, ["set", "app/KEY"], ["v\r", "n\r"]);
+		expect(result.status).toBe(1);
+		expect(result.output).toContain("That is only 1 character");
+		expect(result.output).toContain("nothing was saved");
+		expect(existsSync(join(files.store, "app", "KEY.gpg"))).toBe(false);
+	});
+
+	test.skipIf(!ttyAvailable)("a short value is saved when confirmed", () => {
+		const files = fixture({});
+		const result = typed(files, ["set", "app/PIN"], ["1234\r", "y\r"]);
+		expect(result.status).toBe(0);
+		expect(result.output).toContain("Stored app/PIN: 4 characters.");
+		expect(stored(files, "app/PIN")).toBe("1234\n");
+	});
+
+	test.skipIf(!ttyAvailable)("Ctrl-C cancels without saving and gives the terminal back", () => {
+		const files = fixture({});
+		const result = typed(files, ["set", "app/KEY"], ["synthetic\x03"]);
+		expect(result.status).toBe(1);
+		expect(result.output).toContain("cancelled; nothing was saved");
+		expect(existsSync(join(files.store, "app", "KEY.gpg"))).toBe(false);
+	});
+
+	test.skipIf(!ttyAvailable)("an empty Enter saves nothing", () => {
+		const files = fixture({});
+		const result = typed(files, ["set", "app/KEY"], ["\r"]);
+		expect(result.status).toBe(1);
+		expect(result.output).toContain("nothing was pasted");
+	});
+});
+
 describe("set", () => {
 	test("stores piped input, dropping one trailing newline, and refuses to overwrite without --force", () => {
 		const files = fixture({});
 		const result = invoke(files, ["set", "app/KEY"], "sk-live-synthetic\n");
 		expect(result.status).toBe(0);
-		expect(result.stdout).toBe("Stored app/KEY.\n");
+		expect(result.stdout).toBe("Stored app/KEY: 17 characters.\n");
 		expect(stored(files, "app/KEY")).toBe("sk-live-synthetic\n");
 		expect(invoke(files, ["run", "-e", "K=app/KEY", "--", "sh", "-c", 'printf %s "$K"']).stdout).toBe("sk-live-synthetic");
 
@@ -437,7 +504,9 @@ describe("set", () => {
 
 	test("empty input and bad names are rejected", () => {
 		const files = fixture({});
-		expect(invoke(files, ["set", "app/KEY"], "").status).toBe(1);
+		const empty = invoke(files, ["set", "app/KEY"], "");
+		expect(empty.status).toBe(1);
+		expect(empty.stderr).toContain("run pass-env set in your own terminal");
 		expect(invoke(files, ["set", "../KEY"], "x").status).toBe(2);
 		expect(invoke(files, ["set"], "x").status).toBe(2);
 	});

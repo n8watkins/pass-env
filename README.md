@@ -101,7 +101,7 @@ Lose that key and every stored secret is gone.
 | Command | What it does | Needs unlock? |
 | --- | --- | --- |
 | `pass-env init` | First-time setup, in your own terminal: make your GPG key (the passphrase rules are shown in the prompt) and the store for it. `--key <fingerprint>` uses a key you already have | No |
-| `pass-env set <entry>` | Store a key you were given. Paste it at the hidden prompt, or pipe it in | No |
+| `pass-env set <entry>` | Store a key you were given. Paste it at the prompt (a `*` per character), or pipe it in | No |
 | `pass-env generate <entry>` | Make a random secret and store it. Never printed | No |
 | `pass-env generate <entry> --copy` | Same, and put it on your clipboard to paste somewhere (cleared after 45s) | No |
 | `pass-env run -- <command>` | Run a command with the secrets from `./.env.pass` as environment variables | Yes |
@@ -142,7 +142,9 @@ Names are visible file names, so never put a secret in a name.
 pass-env set myapp/OPENAI_API_KEY
 ```
 
-Paste it, then paste it again to confirm.
+Paste it and press Enter.
+The value stays hidden: a `*` shows for each character, so you can see the paste arrived, and pass-env says how many characters it saved.
+A value under 8 characters, or one with a space in it, asks before saving, since that is usually a paste that missed.
 Nothing is echoed or saved in your shell history.
 
 For a value that spans lines, such as a PEM key or JSON, pipe it in:

@@ -70,7 +70,8 @@ const HELP_INTRO = "pass-env: use secrets from pass without printing them.";
 // `pass-env help` prints them all in the order of HELP_GROUPS.
 const HELP: Record<string, string> = {
 	set: `  pass-env set <entry> [--force]
-      Paste a key you were given (hidden prompt), or pipe it in.
+      Paste a key you were given, or pipe it in. The prompt shows a * for each
+      character and says how many were saved; a very short value asks first.
       --force replaces an existing one (rotation).`,
 	generate: `  pass-env generate <entry> [length] [--charset alnum|hex|base64url] [--copy] [--force]
       Make a random secret (default 48 alnum). Never printed.
@@ -603,28 +604,113 @@ function randomSecret(length: number, charset: Charset): string {
 	return out;
 }
 
-// Returns the number of lines stored from piped input (0 for the prompt).
-async function setEntry(root: string, entry: string, force: boolean): Promise<number> {
+// Values shorter than this are almost always a paste that missed, so the
+// prompt asks before saving one.
+const SHORT_VALUE = 8;
+
+function characters(value: string): number {
+	return [...value].length;
+}
+
+// What set stored: the number of lines (1 for a single line) and characters.
+type Stored = { lines: number; chars: number };
+
+async function setEntry(root: string, entry: string, force: boolean): Promise<Stored> {
 	if (!process.stdin.isTTY) {
 		// One line loses its trailing newline; several lines are kept exactly.
 		const input = await Bun.stdin.text();
 		const value = input.replace(/\r?\n$/, "");
-		if (!value) throw new CliError("VALUE", "nothing was piped in");
+		if (!value) throw new CliError("VALUE", "nothing was piped in; to paste it at a prompt instead, run pass-env set in your own terminal");
 		const multiline = /[\r\n]/.test(value);
 		await store(root, entry, multiline ? input : value, force, multiline);
-		return multiline ? value.split(/\r?\n|\r/).length : 1;
+		return { lines: multiline ? value.split(/\r?\n|\r/).length : 1, chars: characters(value) };
 	}
 	if (!force && entryExists(root, entry)) throw new CliError("EXISTS", `${entry} already exists; add --force to replace it`);
-	// Interactive: pass shows its own hidden, confirmed prompt.
-	const backend = guardSpawn(() => Bun.spawn({
-		cmd: ["pass", "insert", "--force", "--", entry],
-		env: { ...process.env, PASSWORD_STORE_DIR: root },
-		stdin: "inherit",
-		stdout: "inherit",
-		stderr: "inherit",
-	}));
-	if (await backend.exited !== 0) throw new CliError("STORE", `${entry} was not stored`);
-	return 0;
+	console.log(`Paste the value for ${entry} and press Enter. It stays hidden: a * shows for each character.`);
+	const raw = readHidden("Value: ");
+	const value = raw.trim();
+	if (!value) throw new CliError("CANCELLED", "nothing was pasted; nothing was saved");
+	const count = characters(value);
+	if (value !== raw) console.log("Removed the spaces or line breaks around it.");
+	if (count < SHORT_VALUE && !await confirm(`That is only ${plural(count, "character")}, which is short for a key. Save it anyway?`)) {
+		throw new CliError("CANCELLED", "nothing was saved; run it again and paste the whole value");
+	}
+	if (/\s/.test(value) && !await confirm("It contains a space, which keys rarely do. Save it anyway?")) {
+		throw new CliError("CANCELLED", "nothing was saved; run it again and paste the whole value");
+	}
+	await store(root, entry, value, true);
+	return { lines: 1, chars: count };
+}
+
+function stty(args: string[]): string {
+	const result = Bun.spawnSync({ cmd: ["stty", ...args], stdin: "inherit", stdout: "pipe", stderr: "ignore" });
+	if (result.exitCode !== 0) throw new CliError("TTY", "could not set up the terminal for a hidden prompt", 2);
+	return result.stdout.toString().trim();
+}
+
+// Reads a value typed or pasted into the terminal without showing it: a * for
+// each character, so a paste that missed is plain to see. Backspace removes one,
+// Ctrl-U clears, Enter ends, Ctrl-C (or Ctrl-D on an empty line) cancels.
+// Reads stdin synchronously, like readLine, so nothing keeps reading after it.
+function readHidden(prompt: string): string {
+	const saved = stty(["-g"]);
+	process.stdout.write(prompt);
+	stty(["-echo", "-icanon", "-isig", "min", "1", "time", "0"]);
+	const bytes: number[] = [];
+	let stars = 0;
+	const one = Buffer.alloc(1);
+	const next = (): number | undefined => {
+		for (;;) {
+			try {
+				return readSync(0, one, 0, 1, null) === 0 ? undefined : one[0];
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EAGAIN") throw error;
+			}
+		}
+	};
+	const cancelled = () => new CliError("CANCELLED", "cancelled; nothing was saved");
+	try {
+		for (;;) {
+			const byte = next();
+			if (byte === undefined || byte === 13 || byte === 10) break;
+			if (byte === 3) throw cancelled();
+			if (byte === 4) {
+				if (!bytes.length) throw cancelled();
+				break;
+			}
+			if (byte === 127 || byte === 8) {
+				// Drop one whole character: its UTF-8 continuation bytes, then its lead byte.
+				while (bytes.length && (bytes[bytes.length - 1] & 0xc0) === 0x80) bytes.pop();
+				if (bytes.pop() !== undefined) {
+					stars -= 1;
+					process.stdout.write("\b \b");
+				}
+				continue;
+			}
+			if (byte === 21) {
+				process.stdout.write("\b \b".repeat(stars));
+				bytes.length = 0;
+				stars = 0;
+				continue;
+			}
+			if (byte === 27) {
+				// An escape sequence (arrow keys, paste markers): skip it whole.
+				let tail = next();
+				if (tail === 91) while (tail !== undefined && !(tail >= 64 && tail <= 126 && tail !== 91)) tail = next();
+				continue;
+			}
+			if (byte < 32 || bytes.length >= 64 * 1024) continue;
+			bytes.push(byte);
+			if ((byte & 0xc0) !== 0x80) {
+				stars += 1;
+				process.stdout.write("*");
+			}
+		}
+	} finally {
+		stty([saved]);
+		process.stdout.write("\n");
+	}
+	return Buffer.from(bytes).toString("utf8");
 }
 
 type Clipboard = { write: string[]; read?: string[] };
@@ -2902,8 +2988,10 @@ async function main(args: string[]): Promise<number> {
 			return missing ? 1 : 0;
 		}
 		case "set": {
-			const lines = await setEntry(root, options.entry, options.force);
-			console.log(lines > 1 ? `Stored ${options.entry} exactly as piped (${lines} lines); map it with multiline:${options.entry}.` : `Stored ${options.entry}.`);
+			const { lines, chars } = await setEntry(root, options.entry, options.force);
+			console.log(lines > 1
+				? `Stored ${options.entry} exactly as piped (${lines} lines); map it with multiline:${options.entry}.`
+				: `Stored ${options.entry}: ${plural(chars, "character")}.`);
 			return 0;
 		}
 		case "generate": {
