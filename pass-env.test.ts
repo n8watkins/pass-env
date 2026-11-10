@@ -1084,6 +1084,7 @@ describe("doctor", () => {
 		writeFileSync(join(files.store, ".gpg-id"), "synthetic@example.invalid\n");
 		writeFileSync(join(gnupg, "gpg-agent.conf"), `pinentry-program ${join(files.root, "bin", "fakeclip")}\ndefault-cache-ttl 3600\nmax-cache-ttl 28800\n`);
 		Object.assign(files.env, { GNUPGHOME: gnupg, GPG_TTY: "/dev/pts/synthetic", TEST_GPG_SECRET_KEYS: "synthetic@example.invalid" });
+		expect(invoke(files, ["backup", "drill-done"]).status).toBe(0);
 		return files;
 	};
 	const line = (out: string, status: string, text: string) => expect(out).toMatch(new RegExp(`^${status}\\s+.*${text}`, "m"));
@@ -1183,6 +1184,57 @@ describe("doctor", () => {
 	});
 });
 
+describe("restore drill reminder", () => {
+	const drill = (files: Fixture) => join(files.env.XDG_STATE_HOME!, "pass-env", "restore-drill.json");
+	const drillLine = (files: Fixture) => invoke(files, ["doctor"]).stdout.split("\n").find((line) => /restore drill/.test(line)) ?? "";
+	const monthsAgo = (months: number, days = 0) => {
+		const date = new Date();
+		date.setMonth(date.getMonth() - months);
+		date.setDate(date.getDate() - days);
+		return date.toISOString();
+	};
+
+	test("doctor warns when no drill is recorded, and backup drill-done records one", () => {
+		const files = fixture();
+		expect(drillLine(files)).toMatch(/^warn\s+no restore drill recorded/);
+		expect(invoke(files, ["doctor"]).stdout).toContain("then run pass-env backup drill-done");
+		const result = invoke(files, ["backup", "drill-done"]);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toMatch(/^Recorded a restore drill on \d{4}-\d\d-\d\d \d\d:\d\d\. pass-env doctor reminds you again in 6 months\.$/m);
+		const record = JSON.parse(readFileSync(drill(files), "utf8"));
+		expect(Object.keys(record).sort()).toEqual(["last_drill", "version"]);
+		expect(Date.now() - Date.parse(record.last_drill)).toBeLessThan(60_000);
+		expect(statSync(drill(files)).mode & 0o777).toBe(0o600);
+		expect(statSync(dirname(drill(files))).mode & 0o777).toBe(0o700);
+		expect(drillLine(files)).toMatch(/^ok\s+last restore drill: \d{4}-\d\d-\d\d/);
+		expect(existsSync(files.calls)).toBe(false);
+	});
+
+	test("doctor warns once the last drill is over 6 months old, and on a broken record", () => {
+		const files = fixture();
+		mkdirSync(dirname(drill(files)), { recursive: true });
+		writeFileSync(drill(files), JSON.stringify({ version: 1, last_drill: monthsAgo(5, 25) }));
+		expect(drillLine(files)).toMatch(/^ok\s+last restore drill/);
+		writeFileSync(drill(files), JSON.stringify({ version: 1, last_drill: monthsAgo(6, 1) }));
+		expect(drillLine(files)).toMatch(/^warn\s+the last restore drill was on .*, over 6 months ago$/);
+		writeFileSync(drill(files), "not json");
+		expect(drillLine(files)).toMatch(/^warn\s+.*restore-drill\.json is not a restore drill record$/);
+		rmSync(drill(files));
+		symlinkSync(join(files.root, "elsewhere"), drill(files));
+		expect(drillLine(files)).toMatch(/^warn\s+cannot read the restore drill record: .* must be a regular file, not a symlink$/);
+	});
+
+	test("backup takes only drill-done", () => {
+		const files = fixture();
+		for (const args of [["backup"], ["backup", "run"], ["backup", "drill-done", "extra"]]) {
+			const result = invoke(files, args);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("expected backup drill-done");
+		}
+		expect(invoke(files, ["help", "backup"]).stdout).toContain("pass-env backup drill-done");
+	});
+});
+
 describe("doctor env drift", () => {
 	const project = (files: Record<string, string>) => {
 		const fx = fixture();
@@ -1212,7 +1264,7 @@ describe("doctor env drift", () => {
 		const out = doctorOut(fx);
 		expect(out).toMatch(/^warn\s+env vars used in code but declared nowhere: APP_H, APP_I, APP_J, APP_K$/m);
 		expect(out).toMatch(/^warn\s+env vars in \.env\.pass but never read by the code: UNUSED_KEY$/m);
-		for (const name of ["FROM_DEPENDENCY", "FROM_BUILD", "NODE_ENV", "VERCEL_URL", "MODE", "rest", "renamed"]) expect(out).not.toContain(name);
+		for (const name of ["FROM_DEPENDENCY", "FROM_BUILD", "NODE_ENV", "VERCEL_URL", "MODE", "rest", "renamed"]) expect(out).not.toMatch(new RegExp(`\\b${name}\\b`));
 	});
 
 	test("long lists are capped, a fully declared project is ok, and no declarations means no check", () => {

@@ -115,7 +115,8 @@ Lose that key and every stored secret is gone.
 | `pass-env scrub` | Count the secrets coding agents already saved in their chat logs, per file. Prints none of them | Only with `--known` |
 | `pass-env scrub --fix` | Replace those secrets in the logs with `[REDACTED:<kind>]` | Only with `--known` |
 | `pass-env scrub --history` | Show when each log folder was last checked, what was found and what was fixed. Prints no secret | No |
-| `pass-env doctor` | Check pass, GPG, the store and the current folder, including env variables the code reads but nothing declares. Decrypts nothing | No |
+| `pass-env doctor` | Check pass, GPG, the store and the current folder, including env variables the code reads but nothing declares. Decrypts nothing. Warns when no backup restore drill is recorded, or the last is over 6 months old | No |
+| `pass-env backup drill-done` | Record that you just test-restored a backup of your store and a secret decrypted from it. Keeps only the date, in `~/.local/state/pass-env/restore-drill.json` | No |
 | `pass-env unlock` | Type your GPG passphrase for this session. Only works in your own terminal | |
 | `pass-env unlock --hello` | Experimental, WSL on Windows: unlock with face, fingerprint or PIN; falls back to typing | |
 | `pass-env hello install`, `enrol`, `status`, `forget` | Experimental: set up, check or remove Windows Hello unlock (see below) | |
