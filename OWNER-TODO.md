@@ -86,8 +86,9 @@ Dropping the "experimental" label from `unlock --hello`, and using Hello instead
 
 ## 3. Turn on npm and Homebrew publishing (about 15 minutes)
 
-- [ ] npm: an account with two-factor authentication, the `NPM_TOKEN` secret for the first publish, and the repository variable `NPM_PUBLISH=true`.
+- [ ] npm: an account with two-factor authentication, the `NPM_TOKEN` secret of the `release` environment for the first publish, and the repository variable `NPM_PUBLISH=true`.
 - [x] Homebrew: tap, deploy key and `HOMEBREW_TAP=true` set up by an agent (2026-11-03).
+- [ ] Homebrew: move `HOMEBREW_TAP_DEPLOY_KEY` from the repository secrets into the `release` environment, so only an approved release job can read it (commands in the pull request that added the environment gate; rotating the key per [`docs/publishing.md`](docs/publishing.md) works too).
 - [ ] After the first release reaches npm: switch the five packages to trusted publishing and delete the token.
 
 **What.**
