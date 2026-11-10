@@ -1,7 +1,7 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { ReadStream as TtyReadStream } from "node:tty";
@@ -14,7 +14,9 @@ type Fixture = { root: string; store: string; env: NodeJS.ProcessEnv; calls: str
 
 // A fake `pass` that stores plaintext, so tests can inspect what was written.
 function fixture(entries: Record<string, string | Uint8Array> = { token: "synthetic-value" }): Fixture {
-	const root = mkdtempSync(join(tmpdir(), "pass-env-test-"));
+	// The real path: on macOS the temp folder is under /var, a symlink, and the
+	// store must not be reached through one.
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pass-env-test-")));
 	roots.push(root);
 	const store = join(root, ".password-store");
 	const bin = join(root, "bin");
