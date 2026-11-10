@@ -436,6 +436,17 @@ process.exit(0);`)];
 		}
 	}, 20_000);
 
+	test("all output arrives before pass-env ends with the signal that killed the command", () => {
+		const files = fixture({ token: `${value}\n` });
+		const result = spawnSync(launcher[0], [...launcher.slice(1), "run", "-e", "TOKEN=token", ...node(`const fs = require("node:fs");
+for (let i = 0; i < 2000; i++) fs.writeSync(1, "line " + i + " " + process.env.TOKEN + " " + "y".repeat(500) + "\\n");
+process.kill(process.pid, "SIGTERM");`)], { cwd: files.root, env: files.env, encoding: "utf8", maxBuffer: 16 << 20, timeout: 20_000 });
+		expect(result.signal).toBe("SIGTERM");
+		const lines = result.stdout.split("\n");
+		expect(lines.length).toBe(2001);
+		expect(lines[1999]).toBe(`line 1999 *** ${"y".repeat(500)}`);
+	});
+
 	test("background processes the command leaves behind do not keep pass-env waiting", () => {
 		const files = fixture({ token: `${value}\n` });
 		const started = Date.now();

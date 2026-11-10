@@ -1731,13 +1731,13 @@ const MASK_DRAIN_MS = 100;
 // fall back to plain pipes, so colors are lost but masking still works.
 const PTY_MIN_BUN = "1.4.4";
 
-// Every form of the values to replace, as latin1 strings of their UTF-8 bytes,
-// so binary output passes through unchanged. Longest first, so a value inside a
-// longer one is never replaced first.
-function maskTargets(values: Iterable<string>): string[] {
-	const targets = new Set<string>();
+// Every form of the values to replace, as UTF-8 bytes, so output is searched
+// and passed on as bytes and binary output stays unchanged. Longest first, so a
+// value inside a longer one is never replaced first.
+function maskTargets(values: Iterable<string>): Buffer[] {
+	const targets = new Map<string, Buffer>();
 	const add = (text: string) => {
-		if (text.length >= MASK_MIN) targets.add(Buffer.from(text, "utf8").toString("latin1"));
+		if (text.length >= MASK_MIN) targets.set(text, Buffer.from(text, "utf8"));
 	};
 	const encodings = (text: string) => {
 		add(text);
@@ -1752,16 +1752,22 @@ function maskTargets(values: Iterable<string>): string[] {
 		if (value.length < MASK_MIN) continue;
 		encodings(value);
 		if (!/[\r\n]/.test(value)) continue;
-		// A pseudo-terminal turns \n into \r\n; tools may print one line at a time.
+		// Windows line endings, or a terminal's; tools may print one line at a time.
 		add(value.replace(/\r?\n/g, "\r\n"));
 		for (const line of value.split(/\r?\n/)) add(line);
 	}
-	return [...targets].sort((a, b) => b.length - a.length);
+	return [...targets.values()].sort((a, b) => b.length - a.length);
 }
 
+const NO_BYTES = Buffer.alloc(0);
+
 class Masker {
-	private pending = "";
-	constructor(private readonly targets: string[]) {}
+	private pending = NO_BYTES;
+	// The same values as latin1 text (one character per byte), for replacing.
+	private readonly texts: string[];
+	constructor(private readonly targets: Buffer[]) {
+		this.texts = targets.map((target) => target.toString("latin1"));
+	}
 
 	get holding(): boolean {
 		return this.pending.length > 0;
@@ -1769,33 +1775,39 @@ class Masker {
 
 	// Masks a chunk and returns what can be shown now; keeps back the end of the
 	// output only while it could be the start of a value split across chunks.
+	// Output with no value in it is passed on as it came, without a copy.
 	push(chunk: Uint8Array): Buffer {
-		let text = this.pending + Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString("latin1");
-		for (const target of this.targets) {
-			if (text.includes(target)) text = text.split(target).join(MASK);
+		const bytes = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+		let data = this.pending.length ? Buffer.concat([this.pending, bytes]) : bytes;
+		if (this.targets.some((target) => data.includes(target))) {
+			let text = data.toString("latin1");
+			for (const target of this.texts) {
+				if (text.includes(target)) text = text.split(target).join(MASK);
+			}
+			data = Buffer.from(text, "latin1");
 		}
-		const keep = this.heldLength(text);
-		this.pending = text.slice(text.length - keep);
-		return Buffer.from(text.slice(0, text.length - keep), "latin1");
+		const keep = this.heldLength(data);
+		this.pending = keep ? Buffer.from(data.subarray(data.length - keep)) : NO_BYTES;
+		return keep ? data.subarray(0, data.length - keep) : data;
 	}
 
 	flush(): Buffer {
-		const rest = Buffer.from(this.pending, "latin1");
-		this.pending = "";
+		const rest = this.pending;
+		this.pending = NO_BYTES;
 		return rest;
 	}
 
-	// The longest end of text that some value starts with (and is longer than).
-	private heldLength(text: string): number {
+	// The longest end of data that some value starts with (and is longer than).
+	private heldLength(data: Buffer): number {
 		let held = 0;
 		for (const target of this.targets) {
-			let at = text.indexOf(target[0], Math.max(0, text.length - target.length + 1));
-			while (at !== -1 && text.length - at > held) {
-				if (target.startsWith(text.slice(at))) {
-					held = text.length - at;
+			let at = data.indexOf(target[0], Math.max(0, data.length - target.length + 1));
+			while (at !== -1 && data.length - at > held) {
+				if (data.compare(target, 0, data.length - at, at) === 0) {
+					held = data.length - at;
 					break;
 				}
-				at = text.indexOf(target[0], at + 1);
+				at = data.indexOf(target[0], at + 1);
 			}
 		}
 		return held;
@@ -1910,36 +1922,49 @@ function closeQuietly(fd: number): void {
 // stops accepting output (a closed pipe), reading stops too, so the child gets
 // SIGPIPE as it would have without pass-env in between.
 async function forward(source: Source, target: NodeJS.WriteStream, masker: Masker, active: () => void): Promise<void> {
-	let writes = Promise.resolve();
 	let broken = false;
+	const failed = (error?: Error | null) => {
+		if (error) broken = true;
+	};
+	target.on("error", failed);
+	// Waits only when the target has more queued than it wants (or on error).
+	const settled = () => broken || !target.writableNeedDrain ? undefined : new Promise<void>((done) => {
+		const finish = () => {
+			target.removeListener("drain", finish);
+			target.removeListener("error", finish);
+			done();
+		};
+		target.once("drain", finish);
+		target.once("error", finish);
+	});
 	const show = (bytes: Uint8Array) => {
-		if (bytes.length && !broken) {
-			writes = writes.then(() => new Promise<void>((done) => {
-				target.write(bytes, (error) => {
-					if (error) broken = true;
-					done();
-				});
-			}));
-		}
-		return writes;
+		if (bytes.length && !broken) target.write(bytes, failed);
 	};
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	for (let chunk = await source.next(); chunk; chunk = await source.next()) {
 		active();
 		clearTimeout(timer);
-		await show(masker.push(chunk));
+		show(masker.push(chunk));
+		await settled();
 		if (broken) break;
 		if (masker.holding) timer = setTimeout(() => show(masker.flush()), MASK_HOLD_MS);
 	}
 	clearTimeout(timer);
 	source.close();
-	await show(masker.flush());
+	show(masker.flush());
+	// Everything is handed to the system before pass-env exits (or re-raises
+	// the child's signal).
+	if (!broken && target.writableLength > 0) {
+		await new Promise<void>((done) => target.write(NO_BYTES, () => done()));
+	}
+	await settled();
+	target.removeListener("error", failed);
 }
 
 // Runs the child with its output read through a Masker. Returns the child's
 // output channels' descriptors to pass to spawn and a function that finishes
 // passing on the output once the child has exited.
-function maskOutput(targets: string[]): { stdout: number | "pipe"; stderr: number | "pipe"; attach(child: Bun.Subprocess): () => Promise<void> } {
+function maskOutput(targets: Buffer[]): { stdout: number | "pipe"; stderr: number | "pipe"; attach(child: Bun.Subprocess): () => Promise<void> } {
 	const out = openChannel(process.stdout, 1);
 	const err = sameFile(1, 2) && (out.childFd !== undefined) ? out : openChannel(process.stderr, 2);
 	const channels = err === out ? [out] : [out, err];
