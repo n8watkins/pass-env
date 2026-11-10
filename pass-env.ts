@@ -38,6 +38,7 @@ type Options =
 	| { command: "init"; name?: string; email?: string; key?: string }
 	| ImportOptions
 	| ScrubOptions
+	| { command: "backup"; action: "drill-done" }
 	| { command: "doctor" };
 type ScrubOptions = { command: "scrub"; paths: string[]; known: boolean; fix: boolean; includeActive: boolean; all: boolean; history: boolean };
 type ImportOptions = {
@@ -122,7 +123,12 @@ const HELP: Record<string, string> = {
       Name and email only label the key; the store records its fingerprint.`,
 	doctor: `  pass-env doctor
       Check pass, GPG, the store and this folder, including env variables
-      the code reads but nothing declares. Decrypts nothing.`,
+      the code reads but nothing declares. Decrypts nothing. Reminds you
+      to test-restore your backup when the last drill is over 6 months old.`,
+	backup: `  pass-env backup drill-done
+      Record that you just test-restored a backup of your store and a
+      secret decrypted from it. Keeps only the date; doctor reminds you
+      again after 6 months.`,
 	check: `  pass-env check [-f file]... [-e NAME=entry]...
       Show each mapping as ok or MISSING. Decrypts nothing.`,
 	list: `  pass-env list [prefix] [--json]
@@ -153,6 +159,7 @@ const HELP_GROUPS: [string, string[]][] = [
 	["Move an existing .env file into pass", ["import"]],
 	["Clean up keys agents already saw", ["scrub"]],
 	["Set up and check", ["init", "doctor", "check", "list", "unlock", "version"]],
+	["Backups", ["backup"]],
 	["Windows Hello unlock (experimental, WSL on Windows only, opt-in)", ["hello"]],
 ];
 
@@ -381,6 +388,9 @@ function parseArgs(args: string[]): Options {
 		case "doctor":
 			if (rest.length) throw new CliError("USAGE", "expected doctor", 2);
 			return { command: "doctor" };
+		case "backup":
+			if (rest.length !== 1 || rest[0] !== "drill-done") throw new CliError("USAGE", "expected backup drill-done", 2);
+			return { command: "backup", action: "drill-done" };
 		default:
 			throw new CliError("USAGE", `unknown command ${JSON.stringify(command)}`, 2);
 	}
@@ -2669,8 +2679,62 @@ function driftChecks(): Check[] {
 	return checks;
 }
 
+// Restore drills: a backup is only known to work once it has been restored.
+// pass-env backup drill-done records the date of one (and nothing else);
+// doctor reminds you when the last is older than DRILL_MONTHS, or there is none.
+const DRILL_MONTHS = 6;
+const DRILL_FIX = "test-restore your latest backup of the store somewhere temporary, check a secret decrypts from it, then run pass-env backup drill-done";
+
+function drillPath(): string {
+	const state = process.env.XDG_STATE_HOME;
+	if (state && isAbsolute(state)) return join(state, "pass-env", "restore-drill.json");
+	if (!process.env.HOME) throw new CliError("CONFIG", "set HOME or XDG_STATE_HOME");
+	return join(process.env.HOME, ".local", "state", "pass-env", "restore-drill.json");
+}
+
+// Readable only by you, and replaced in one step so a crash never leaves half a file.
+function recordDrill(): number {
+	const path = drillPath();
+	const now = new Date().toISOString();
+	const temp = `${path}.pass-env-${process.pid}.tmp`;
+	try {
+		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		rmSync(temp, { force: true });
+		writeFileSync(temp, `${JSON.stringify({ version: 1, last_drill: now })}\n`, { mode: 0o600, flag: "wx" });
+		chmodSync(temp, 0o600);
+		renameSync(temp, path);
+	} catch {
+		rmSync(temp, { force: true });
+		throw new CliError("WRITE", `could not write ${tilde(path)}`);
+	}
+	console.log(`Recorded a restore drill on ${when(now)}. pass-env doctor reminds you again in ${DRILL_MONTHS} months.`);
+	return 0;
+}
+
+function drillCheck(): Check {
+	let path: string;
+	let raw: Buffer | undefined;
+	try {
+		path = drillPath();
+		raw = readRegular(path, 4096);
+	} catch (error) {
+		return warn(`cannot read the restore drill record: ${error instanceof CliError ? error.message : "unknown error"}`, DRILL_FIX);
+	}
+	if (!raw) return warn("no restore drill recorded: a backup that was never restored may not work", DRILL_FIX);
+	let last: Date | undefined;
+	try {
+		const record = JSON.parse(raw.toString("utf8")) as { version?: unknown; last_drill?: unknown };
+		if (record.version === 1 && typeof record.last_drill === "string") last = new Date(record.last_drill);
+	} catch { /* Invalid below. */ }
+	if (!last || Number.isNaN(last.getTime())) return warn(`${tilde(path)} is not a restore drill record`, DRILL_FIX);
+	const due = new Date(last);
+	due.setMonth(due.getMonth() + DRILL_MONTHS);
+	if (Date.now() >= due.getTime()) return warn(`the last restore drill was on ${when(last.toISOString())}, over ${DRILL_MONTHS} months ago`, DRILL_FIX);
+	return ok(`last restore drill: ${when(last.toISOString())}`);
+}
+
 async function doctor(): Promise<number> {
-	const checks = [...toolChecks(), ...storeChecks(), ...gpgChecks(), clipboardCheck(), ...folderChecks(), ...driftChecks(), ...claudeCheck()];
+	const checks = [...toolChecks(), ...storeChecks(), ...gpgChecks(), clipboardCheck(), ...folderChecks(), ...driftChecks(), ...claudeCheck(), drillCheck()];
 	if (helloConfigured()) checks.push(...await helloChecks());
 	printChecks(checks);
 	const count = (status: Check["status"]) => checks.filter((check) => check.status === status).length;
@@ -3289,6 +3353,7 @@ async function main(args: string[]): Promise<number> {
 		return 0;
 	}
 	if (options.command === "doctor") return doctor();
+	if (options.command === "backup") return recordDrill();
 	if (options.command === "init") return init(options);
 	if (options.command === "hello") {
 		switch (options.action) {
