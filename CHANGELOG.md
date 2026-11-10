@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.0 - 2026-11-10
+
+### New
+
+- Also scan old Claude Code logs moved to ~/.claude/projects-archive ([#17](https://github.com/n8watkins/pass-env/pull/17))
+- Run and pipe show secret values in their output as *** ([#20](https://github.com/n8watkins/pass-env/pull/20))
+
 ## 1.4.0 - 2026-11-09
 
 ### New
