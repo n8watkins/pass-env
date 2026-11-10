@@ -1,0 +1,43 @@
+{
+  "$schema": "https://raw.githubusercontent.com/n8watkins/release-kit/main/schema/releases.v1.json",
+  "schemaVersion": 1,
+  "repository": "n8watkins/pass-env",
+  "releases": [
+    {
+      "version": "1.5.0",
+      "tag": "v1.5.0",
+      "date": "2026-11-10",
+      "time": "2026-11-10T14:42:48Z",
+      "url": "https://github.com/n8watkins/pass-env/releases/tag/v1.5.0",
+      "previous": "v1.4.0",
+      "summary": null,
+      "breaking": false,
+      "notes": [
+        {
+          "section": "new",
+          "type": "feat",
+          "scope": "scrub",
+          "text": "Also scan old Claude Code logs moved to ~/.claude/projects-archive",
+          "breaking": false,
+          "pr": 17,
+          "prUrl": "https://github.com/n8watkins/pass-env/pull/17",
+          "commit": "175383c1a3cfcef90b2887aa4bd9dbefa71d61d7",
+          "commitUrl": "https://github.com/n8watkins/pass-env/commit/175383c1a3cfcef90b2887aa4bd9dbefa71d61d7"
+        },
+        {
+          "section": "new",
+          "type": "feat",
+          "scope": null,
+          "text": "Run and pipe show secret values in their output as ***",
+          "breaking": false,
+          "pr": 20,
+          "prUrl": "https://github.com/n8watkins/pass-env/pull/20",
+          "commit": "740edb6dda00f4a0a1f611dbde7af182ae30eacc",
+          "commitUrl": "https://github.com/n8watkins/pass-env/commit/740edb6dda00f4a0a1f611dbde7af182ae30eacc"
+        }
+      ],
+      "source": "release",
+      "unattributed": 0
+    }
+  ]
+}
