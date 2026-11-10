@@ -51,6 +51,12 @@ Nothing from the audit of real projects was skipped.
 2. **npm package `pass-env`.** The name is free.
    Install would be `bun add -g pass-env` or `bunx pass-env`.
    It still needs Bun at runtime, and the owner has to log in to npm once to publish.
+3. **Mask secrets in what `run` and `pipe` print** (owner decision, 2026-11-10).
+   pass-env reads the command's output and replaces any exact copy of a value it handed over with `***` before it reaches the terminal, and so a coding agent's transcript.
+   It closes the gap the hook cannot see: an agent edits a named script (`npm run test`) to print a key, then runs it with `pass-env run`.
+   The command runs under a pseudo-terminal so colors and progress bars keep working; values are held only for that one command, nothing runs in the background.
+   Expected cost is a few kilobytes of RAM and no visible delay, but the decision depends on that holding: measure memory and latency on a long, chatty command (a full test run, `wrangler deploy`) before and after, and revisit if either is noticeable.
+   It does not catch a value that is transformed (reversed, split, encoded), written to a file or sent over the network; it stops accidents and simple tricks, like GitHub Actions masking.
 
 ## Not planned
 
