@@ -1042,6 +1042,16 @@ describe("scrub", () => {
 		expect(result.stdout).toContain("Nothing was changed. To replace them with [REDACTED:<kind>]: pass-env scrub --fix");
 	});
 
+	test("also scans ~/.claude/projects-archive", () => {
+		const fx = fixture({});
+		session(fx, [JSON.stringify({ text: `token ${samples["github-token"]}` })], ".claude/projects-archive/-home-me-old/session.jsonl");
+		const result = invoke(fx, ["scrub"]);
+		expect(result.status).toBe(1);
+		noSecrets(result.stdout + result.stderr);
+		expect(result.stdout).toContain("~/.claude/projects-archive/-home-me-old/session.jsonl: github-token 1\n");
+		expect(result.stdout).toContain("in ~/.claude/projects-archive");
+	});
+
 	test("lookalikes do not match, and a clean scan exits 0", () => {
 		const fx = fixture({});
 		const path = session(fx, decoys.map((text) => JSON.stringify({ type: "assistant", text })));

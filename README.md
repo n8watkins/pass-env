@@ -282,7 +282,7 @@ max-cache-ttl 28800
 ## Clean up keys agents already saw
 
 Coding agents save everything they see in chat logs on your machine.
-Claude Code keeps them in `~/.claude/projects/` and `~/.claude/history.jsonl`, Codex in `~/.codex/sessions/`, `~/.codex/archived_sessions/` and `~/.codex/history.jsonl`, and pi and OMP in `~/.pi/agent/sessions/` and `~/.omp/agent/sessions/`.
+Claude Code keeps them in `~/.claude/projects/` and `~/.claude/history.jsonl` (scrub also looks in `~/.claude/projects-archive/`, where old projects' logs are often moved), Codex in `~/.codex/sessions/`, `~/.codex/archived_sessions/` and `~/.codex/history.jsonl`, and pi and OMP in `~/.pi/agent/sessions/` and `~/.omp/agent/sessions/`.
 Any key an agent ever printed or read stays there in plain text, where any program running as you can find it.
 pass-env stops new leaks; `scrub` finds and blanks out the ones already saved.
 It is a command you run on your own machine, not in CI.
