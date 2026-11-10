@@ -44,12 +44,19 @@ gpg --batch -q --pinentry-mode loopback --passphrase demo-pass -d "$PASSWORD_STO
 step "run after unlock"
 pe run -- sh -c 'printf "AUTH_SECRET %s chars, STRIPE_SECRET_KEY %s chars (sk_test_synthetic is 17)\n" "${#AUTH_SECRET}" "${#STRIPE_SECRET_KEY}"'
 step "rotate a generated secret"
-before=$(pe run -- sh -c 'printf %s "$AUTH_SECRET"' | sha256sum | cut -c1-8)
+before=$(pe run -- sh -c 'printf %s "$AUTH_SECRET" | sha256sum | cut -c1-8')
 pe generate app/AUTH_SECRET --force
-after=$(pe run -- sh -c 'printf %s "$AUTH_SECRET"' | sha256sum | cut -c1-8)
+after=$(pe run -- sh -c 'printf %s "$AUTH_SECRET" | sha256sum | cut -c1-8')
 echo "fingerprint $before -> $after"
 step "pipe one secret into a command (stands in for gh secret set)"
 pe pipe app/STRIPE_SECRET_KEY -- sh -c 'v=$(cat); printf "received %s chars\n" "${#v}"'
+step "what run and pipe print is masked: a value becomes ***"
+out=$(pe run -- sh -c 'echo "stdout $STRIPE_SECRET_KEY"; echo "stderr $STRIPE_SECRET_KEY" >&2' 2>&1); printf '%s\n' "$out"
+expect "run masks stdout and stderr" "$out" "$(printf 'stdout ***\nstderr ***')"
+expect "pipe masks the value it sent" "$(pe pipe app/STRIPE_SECRET_KEY -- cat)" "***"
+expect "--no-mask shows it (not for agents)" "$(pe run --no-mask -- sh -c 'printf %s "$STRIPE_SECRET_KEY"')" sk_test_synthetic
+out=$(script -qec "$(if [ -n "$bin" ]; then printf '%q' "$bin"; else printf 'bun %q' "$cli"; fi) run -- sh -c 'test -t 1 && printf \"tty \\033[32m%s\\033[0m\" \"\$STRIPE_SECRET_KEY\"'" /dev/null </dev/null)
+expect "in a terminal the command still has one (colors kept), and the value is masked" "$out" "$(printf 'tty \033[32m***\033[0m')"
 step "pass still shows entries normally to the human"
 pass show app/STRIPE_SECRET_KEY | head -c 8; echo "..."
 
@@ -80,7 +87,8 @@ expect ".env.local still untouched" "$(cat .env.local)" "$original"
 step "the human unlocks and tests the app"
 gpg --batch -q --pinentry-mode loopback --passphrase demo-pass -d "$PASSWORD_STORE_DIR/web/OPENAI_API_KEY.gpg" >/dev/null 2>&1 && echo unlocked
 pe run -- sh -c 'printf "OPENAI_API_KEY %s chars, PRIVATE_KEY %s lines\n" "${#OPENAI_API_KEY}" "$(printf "%s\n" "$PRIVATE_KEY" | wc -l)"'
-expect "multi-line value round-trips exactly" "$(pe run -- sh -c 'printf %s "$PRIVATE_KEY"')" "$(printf -- '-----BEGIN SYNTHETIC KEY-----\nabc123\n-----END SYNTHETIC KEY-----')"
+expect "multi-line value round-trips exactly" "$(pe run -- sh -c 'printf %s "$PRIVATE_KEY" | od -An -tx1')" "$(printf -- '-----BEGIN SYNTHETIC KEY-----\nabc123\n-----END SYNTHETIC KEY-----' | od -An -tx1)"
+expect "the multi-line value is masked whole and line by line" "$(pe run -- sh -c 'printf "%s|" "$PRIVATE_KEY"; printf "%s\n" "$PRIVATE_KEY" | sed -n 2p')" "***|***"
 step "a second file in the same folder reuses entries with the same value (no --force)"
 printf 'OPENAI_API_KEY=sk-synthetic-openai\nWORKER_TOKEN=synthetic-worker\n' > .dev.vars
 pe import .dev.vars --prefix web; expect "second import exit" "$?" 0
