@@ -17,6 +17,25 @@ Each step keeps the existing rule: pass-env never prints a secret value.
 - **Scan history for `scrub`**: skip unchanged files, read only the new end of growing logs, and `scrub --history`.
   See "Scan history" in the README.
 
+- **Masked output for `run` and `pipe`** (owner decision, 2026-11-10): every copy of a value pass-env handed over is shown as `***`.
+  It closes the gap the hook cannot see: an agent edits a named script (`npm run test`) to print a key, then runs it with `pass-env run`.
+  See "What run and pipe print" in the README for what is and is not caught.
+  `--no-mask` turns it off only for the owner at a terminal, after a yes typed there; without a terminal (an agent) it refuses and runs nothing.
+  **Measured cost** (the owner's condition; 2026-11-10, WSL2 on 8 CPUs, five fake values including a 27-line PEM key).
+  pass-env's own peak memory (VmHWM of the pass-env process, not the command's) and wall time, for v1.4.0, this build with `--no-mask`, and this build masked; medians of 5 runs, 2 for the test suite:
+
+  | Command | v1.4.0 | new, `--no-mask` | new, masked |
+  | --- | --- | --- | --- |
+  | `true` (startup) | 0.19 s, 51.9 MB | 0.08 s, 28.5 MB | 0.06 s, 31.3 MB |
+  | 100k separate lines, 1 in 1000 with a value, to a pipe | 1.16 s, 52.1 MB | 1.13 s, 29.4 MB | 1.06 s, 47.6 MB |
+  | the same, to a terminal | 2.91 s, 51.9 MB | 2.56 s, 29.9 MB | 2.44 s, 46.4 MB |
+  | 50 MB in large writes, to a pipe | 0.39 s, 51.7 MB | 0.24 s, 28.6 MB | 0.42 s, 56.2 MB |
+  | pass-env's test suite (`bun test`), to a pipe | 65.0 s, 51.5 MB | 80.0 s, 29.4 MB | 50.4 s, 32.4 MB |
+  | the same, to a terminal | 45.7 s, 51.5 MB | 46.0 s, 28.7 MB | 84.0 s, 32.1 MB |
+
+  Latency is not noticeable: chatty output arrives as fast as unmasked (the same as piping it through `cat`), bulk output costs about 0.2 s per 50 MB, and the test suite's own spread (46 to 84 s, in both directions) hides any difference; a rerun alternating masked and unmasked in a terminal gave 65.8 and 74.4 s masked against 65.9 and 61.4 s unmasked.
+  Memory is not the "few kilobytes" first expected: a real long command peaks 3 MB above unmasked, and very heavy output up to 28 MB above, as garbage collected after; it stays below what v1.4.0 used for anything, because the move to Bun 1.4.4 saves 23 MB.
+
 - **Windows Hello unlock** (experimental): `pass-env unlock --hello`, see `docs/windows-hello.md`.
   Leaves experimental once the owner's manual test (`docs/windows-hello-manual-test.md`) passes.
 
@@ -41,6 +60,12 @@ Each step keeps the existing rule: pass-env never prints a secret value.
 - The scan history records the patterns version and the store fingerprint per run, and marks a record stale or no longer checked against the store when they change, so a location left out of one run is never trusted with results from older patterns or another store.
 - A dry run that skips an unchanged file still reports what the last scan found in it and exits with 1; `--fix` skips a file whose remaining findings are only lines it already had to leave (they would not stay valid JSON).
 - A file that was not UTF-8 text is remembered too, so it is not read again until it changes.
+- The pseudo-terminal carries only the command's output: stdin stays the real terminal, so the command keeps its controlling terminal and Ctrl-C, Ctrl-Z, prompts and `sudo` work as before.
+  Bun's own `Bun.Terminal` was not used: it puts stdin, stdout and stderr on one pty that is not the command's controlling terminal, so Ctrl-C typed into it does nothing, stderr cannot stay separate, and `pipe` would have to type the secret into it.
+  The pty comes from `openpty` in the C library through `bun:ffi`, with output processing off so bytes reach the terminal exactly as written; without it (or with Bun before 1.4.4) pass-env falls back to pipes, losing colors but still masking.
+- Output that could be the start of a value is held for at most 0.1 seconds, so prompts are not held back; a value printed in pieces further apart than that is not caught.
+- When stdout and stderr are the same file (a terminal, or the one log file coding agents use), the command gets one channel for both, so their order is kept.
+- After the command exits, output from background processes it left is passed on until they are quiet for 0.1 seconds; later output is dropped, never shown unmasked.
 - The drift check also reads `Bun.env.X`, `const { X } = process.env` and Prisma's `env("X")`, skips Python virtual environments and common build folders besides the requested ones, and runs only when there is a declaration file to compare with.
 
 ## Next
@@ -51,12 +76,6 @@ Nothing from the audit of real projects was skipped.
 2. **npm package `pass-env`.** The name is free.
    Install would be `bun add -g pass-env` or `bunx pass-env`.
    It still needs Bun at runtime, and the owner has to log in to npm once to publish.
-3. **Mask secrets in what `run` and `pipe` print** (owner decision, 2026-11-10).
-   pass-env reads the command's output and replaces any exact copy of a value it handed over with `***` before it reaches the terminal, and so a coding agent's transcript.
-   It closes the gap the hook cannot see: an agent edits a named script (`npm run test`) to print a key, then runs it with `pass-env run`.
-   The command runs under a pseudo-terminal so colors and progress bars keep working; values are held only for that one command, nothing runs in the background.
-   Expected cost is a few kilobytes of RAM and no visible delay, but the decision depends on that holding: measure memory and latency on a long, chatty command (a full test run, `wrangler deploy`) before and after, and revisit if either is noticeable.
-   It does not catch a value that is transformed (reversed, split, encoded), written to a file or sent over the network; it stops accidents and simple tricks, like GitHub Actions masking.
 
 ## Not planned
 

@@ -27,6 +27,7 @@ The first commit in this repository is that file unchanged.
 - `set <entry>`: store a pasted or piped value. The prompt is pass-env's own: a `*` for each character instead of a blank line, no second paste to confirm (it catches typos, not a paste that missed), surrounding spaces trimmed, a question before saving a value under 8 characters or with a space, and the number of characters saved.
 - `generate <entry> [length] [--charset] [--copy]`: store a random secret without printing it, unlike `pass generate`, which prints the new password. `--copy` also puts it on the clipboard for a human to paste.
 - `pipe <entry> -- command`: send one secret to a command's stdin, replacing `sh -c 'printf %s "$V" | ...'`.
+- Masked output for `run` and `pipe`: every copy of a value pass-env handed over (6 or more characters, also base64, base64url, URL- and JSON-encoded, and each line of a multi-line value) is shown as `***` on stdout and stderr, also when split across writes. In a terminal the command writes to a pseudo-terminal, so colors and progress bars keep working; stdin is untouched. `--no-mask` turns it off, only with stdin and stdout on a terminal and after a yes typed there; without one (as for an agent) it refuses and runs nothing. On a full test run the command takes as long as unmasked and pass-env uses 3 MB more memory (numbers in ROADMAP.md).
 - `copy <entry>`: put one secret on the clipboard. Like `pass -c`, it is cleared after `PASSWORD_STORE_CLIP_TIME` seconds (default 45), but only if the clipboard still holds it. Uses `clip.exe` on WSL, then `pbcopy`, `wl-copy` or `xclip`.
 - `unlock [entry]`: one place to type the GPG passphrase; refuses without a terminal so an agent cannot trigger a prompt.
 - `check`: report each mapping as ok or missing without decrypting.
@@ -47,4 +48,4 @@ The first commit in this repository is that file unchanged.
 
 ## Unchanged
 
-Strict data-only reference files, no symlinks in the store, no prompting during `run`, no secret output from the launcher, exit status and stdio passed through.
+Strict data-only reference files, no symlinks in the store, no prompting during `run`, no secret output from the launcher, exit status and stdin passed through, and stdout and stderr passed through apart from the masking above.
