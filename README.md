@@ -24,7 +24,8 @@ That is how real keys leak.
 pass-env takes plaintext secrets out of the places agents look, while still letting agents run your app, create new secrets and push secrets to production without seeing them.
 
 **What it does not do:** stop a determined attacker.
-While GPG is unlocked, anything running as your user can decrypt, including an agent that runs `pass-env run -- printenv KEY` on purpose.
+While GPG is unlocked, anything running as your user can decrypt.
+`run` and `pipe` show values in a command's output as `***`, but an agent that wants a key on purpose can still transform it first (`printenv KEY | rev`) or write it to a file.
 For a hard boundary, run agents as a different OS user or in a container, and keep production keys in your hosting platform.
 
 ## Install
@@ -69,7 +70,7 @@ gh attestation verify ~/.local/bin/pass-env --repo n8watkins/pass-env --source-r
   --signer-workflow n8watkins/pass-env/.github/workflows/release.yml --deny-self-hosted-runners   # the tag you downloaded
 ```
 
-With [Bun](https://bun.sh) you can run the script instead: download `pass-env.ts` from a release (attested the same way) or from `main` (latest, not attested) to `~/.local/bin/pass-env` and `chmod +x` it.
+With [Bun](https://bun.sh) 1.4.4 or later you can run the script instead: download `pass-env.ts` from a release (attested the same way) or from `main` (latest, not attested) to `~/.local/bin/pass-env` and `chmod +x` it.
 
 </details>
 
@@ -104,8 +105,8 @@ Lose that key and every stored secret is gone.
 | `pass-env set <entry>` | Store a key you were given. Paste it at the prompt (a `*` per character), or pipe it in | No |
 | `pass-env generate <entry>` | Make a random secret and store it. Never printed | No |
 | `pass-env generate <entry> --copy` | Same, and put it on your clipboard to paste somewhere (cleared after 45s) | No |
-| `pass-env run -- <command>` | Run a command with the secrets from `./.env.pass` as environment variables | Yes |
-| `pass-env pipe <entry> -- <command>` | Send one secret to a command's input, for example `gh secret set` | Yes |
+| `pass-env run -- <command>` | Run a command with the secrets from `./.env.pass` as environment variables. Its output shows them as `***` | Yes |
+| `pass-env pipe <entry> -- <command>` | Send one secret to a command's input, for example `gh secret set`. Its output shows it as `***` | Yes |
 | `pass-env copy <entry>` | Put one stored secret on your clipboard (cleared after 45s) | Yes |
 | `pass-env check` | Show each line of `./.env.pass` as ok or MISSING | No |
 | `pass-env list [prefix]` | Show the names in your store | No |
@@ -125,6 +126,7 @@ Options:
 - `--force` on `set` or `generate` replaces an existing entry (rotation).
 - `generate <entry> 64 --charset hex` sets the length (16 to 512, default 48) and characters (`alnum`, `hex`, `base64url`).
 - `--multiline` on `pipe` or `copy` uses the whole entry instead of its first line.
+- `--no-mask` on `run` or `pipe` shows the command's output exactly, values included (see [What run and pipe print](#what-run-and-pipe-print)); it needs you at a terminal and asks first.
 - `run -f file` or `run -e NAME=entry` uses other mappings instead of `./.env.pass`.
 - `--dry-run` on `import` shows the plan, names only.
 - `--skip NAME,NAME` on `import` leaves those names in the file, and `--force` replaces existing entries.
@@ -235,6 +237,57 @@ Then update every copy: run the production `pipe` command again, and update the 
 Local projects pick up the new value on their next run.
 Rotating `AUTH_SECRET` signs everyone out.
 
+## What run and pipe print
+
+`pass-env run` and `pass-env pipe` read what the command prints and show every copy of a value they handed over as `***`, on stdout and stderr alike.
+So a script that prints a key, by mistake or because an agent edited it, cannot put the key into your terminal or into an agent's transcript.
+
+```console
+$ pass-env run -- sh -c 'echo "key is $STRIPE_SECRET_KEY"'
+key is ***
+```
+
+**What is masked:**
+
+- Each value pass-env handed over: for `run`, every variable from `.env.pass`, `-f` and `-e`; for `pipe`, the value it sent.
+- Its base64 (with and without `=` padding), base64url, URL-encoded (`encodeURIComponent`) and JSON-escaped forms.
+- For a multi-line value: the whole value, also with `\r\n` line endings, and each line on its own.
+- A value split across two writes, such as a line printed piece by piece.
+  Output that could be the start of a value is held back until the next output shows whether it is, for at most 0.1 seconds.
+
+**What is not:**
+
+- Values shorter than 6 characters, because masking them would hide ordinary words and numbers.
+  The same goes for a line of a multi-line value.
+- Any other transformation: reversed, hex, compressed or encrypted, base64 of the value inside a longer text (such as an HTTP Basic `Authorization` header), JSON with `\uXXXX` escapes, or a value printed in pieces more than 0.1 seconds apart.
+- What the command writes to files, sends over the network, or writes straight to the terminal device (`/dev/tty`).
+
+Like GitHub Actions masking, it stops accidents and simple tricks, not a program that sets out to leak a key.
+
+**How it works:**
+
+- When pass-env's own output is a terminal, the command writes to a pseudo-terminal of the same size, so colors, progress bars and the terminal width keep working.
+  Otherwise (an agent, a pipe, a file) it writes to a pipe, as it would without pass-env.
+- Input is not touched: the command reads your terminal, or whatever you piped in, directly, so prompts, Ctrl-C and Ctrl-Z behave as before.
+- stdout and stderr stay separate, and keep their order when both go to the same place (a terminal, or the one log file coding agents use).
+- Everything else passes through byte for byte, binary output included, and the exit status, or the signal that ended the command, is kept.
+- When the command exits, pass-env passes on what its background processes still print until they have been quiet for 0.1 seconds, then exits; anything they print later is dropped, not shown unmasked.
+  A server started in the background should write to its own log file.
+- Values are held only in pass-env's memory while the command runs; nothing is written to disk and nothing keeps running afterwards.
+- On Windows it runs inside WSL, so it behaves as on Linux.
+
+**What it costs:**
+Measured on pass-env's own test suite, run through `pass-env run`, the command takes as long as without masking (the suite's own run-to-run spread, 46 to 84 seconds, is far larger), and pass-env's memory peaks at 32 MB, 3 MB more than with `--no-mask`.
+With very heavy output (100,000 separate lines, or 50 MB at once) the peak is 46 to 56 MB, up to 28 MB more than unmasked, all of it freed when the command ends; 100,000 lines arrive as fast as before, and 50 MB takes 0.2 seconds longer.
+That is still less memory than pass-env 1.4.0 used for anything (52 MB), because this release also moves to a newer Bun.
+Output passes through as it arrives; only text that could be the start of a value waits, for at most 0.1 seconds.
+The numbers and how they were taken are in [ROADMAP.md](ROADMAP.md).
+
+`--no-mask` turns it off for one command, for the rare case where you need the output exactly as printed.
+It is for you in your own terminal, so it works only when stdin and stdout are a terminal, and first asks there: "Show secret values unmasked in this command's output? [y/N]".
+Without a terminal, as for a coding agent, it refuses with `TTY: --no-mask needs the owner at a terminal; nothing was run` and exits with 2; anything but `y` cancels with exit 1.
+Either way nothing is decrypted and the command does not start.
+
 ## Does it work with my setup?
 
 pass-env sets ordinary environment variables, so anything that reads them works unchanged.
@@ -256,7 +309,7 @@ Paste this into `CLAUDE.md`, `AGENTS.md` or your agent's equivalent:
 
 ```markdown
 ## Secrets
-- Never open .env, .env.*, .dev.vars or ~/.password-store, and never print secret variables (env, printenv, echo).
+- Never open .env, .env.*, .dev.vars or ~/.password-store, and never print secret variables (env, printenv, echo). Never use --no-mask.
 - Each project lists its secrets by name in .env.pass. Run things with `pass-env run -- <command>`; check with `pass-env check`.
 - To create a secret we control: `pass-env generate <project>/<NAME>`, then add `NAME=<project>/<NAME>` to .env.pass.
 - To move a plaintext .env file into pass: `pass-env import <file> --prefix <project> --dry-run`, then without --dry-run; after I have tested the app, the same command with --remove.
@@ -460,7 +513,7 @@ Errors are one line, start with a code, and never include secret values or GPG o
 | `EXISTS` | Already stored: add `--force` to replace it |
 | `DECRYPT` | This machine's GPG key cannot open the entry |
 | `CLIPBOARD` | No clipboard tool found (`clip.exe`, `pbcopy`, `wl-copy` or `xclip`) |
-| `TTY` | `unlock` or `init` was run without a terminal (for example by an agent) |
+| `TTY` | `unlock`, `init` or `--no-mask` was run without a terminal (for example by an agent) |
 | `MISMATCH` | `import --remove` found a stored value that differs from the file, so it removed nothing |
 | `CONFLICT` | `import` found a name that `.env.pass` already maps to another entry |
 | `PARSE` | `import` could not read a line of the file (the line number is given) |
@@ -473,7 +526,7 @@ Errors are one line, start with a code, and never include secret values or GPG o
 ## Tests
 
 ```sh
-bun test           # 76 tests with a fake pass, gpg, clipboard and Windows Hello helper, including real-terminal tests
+bun test           # 109 tests with a fake pass, gpg, clipboard and Windows Hello helper, including real-terminal tests
 ./demo/e2e.sh      # walk-through against real pass and GPG in a temp folder, including import, --remove, scrub, its scan history and Hello unlock
 cd hello && cargo test   # the Windows helper's blob format and crypto (runs on Linux too)
 ```

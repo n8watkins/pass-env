@@ -1,8 +1,10 @@
+import { dlopen, FFIType, ptr } from "bun:ffi";
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { ReadStream as TtyReadStream } from "node:tty";
 
 // PASS_ENV_BIN runs the whole suite against a compiled binary instead.
 const cli = process.env.PASS_ENV_BIN ? resolve(process.env.PASS_ENV_BIN) : join(import.meta.dir, "pass-env.ts");
@@ -12,7 +14,9 @@ type Fixture = { root: string; store: string; env: NodeJS.ProcessEnv; calls: str
 
 // A fake `pass` that stores plaintext, so tests can inspect what was written.
 function fixture(entries: Record<string, string | Uint8Array> = { token: "synthetic-value" }): Fixture {
-	const root = mkdtempSync(join(tmpdir(), "pass-env-test-"));
+	// The real path: on macOS the temp folder is under /var, a symlink, and the
+	// store must not be reached through one.
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pass-env-test-")));
 	roots.push(root);
 	const store = join(root, ".password-store");
 	const bin = join(root, "bin");
@@ -118,6 +122,13 @@ function markerCommand(files: Fixture): string[] {
 	return ["--", process.execPath, "-e", `require("node:fs").writeFileSync(${JSON.stringify(join(files.root, "child-started"))}, "started")`];
 }
 
+// Output is masked, so tests that check a delivered value have the child print
+// it as hex, which is not one of the masked forms.
+function printEnv(names: string[]): string[] {
+	return [process.execPath, "-e", `console.log(JSON.stringify(${JSON.stringify(names)}.map((k) => process.env[k] === undefined ? null : Buffer.from(process.env[k]).toString("hex"))))`];
+}
+const delivered = (stdout: string) => (JSON.parse(stdout) as (string | null)[]).map((hex) => hex === null ? undefined : Buffer.from(hex, "hex").toString());
+
 const stored = (files: Fixture, entry: string) => readFileSync(join(files.store, `${entry}.gpg`), "utf8");
 
 afterEach(() => {
@@ -158,20 +169,19 @@ describe("run", () => {
 		files.env.KEEP_ME = "untouched";
 		const result = invoke(files, [
 			"run", "-e", "VALUE=last", "-f", first, "--env-file", second,
-			"--", process.execPath, "-e",
-			'console.log(JSON.stringify(["VALUE","FILE_ORDER","FIRST","WHOLE","EMPTY","NOTED","KEEP_ME"].map((k) => process.env[k])))',
+			"--", ...printEnv(["VALUE", "FILE_ORDER", "FIRST", "WHOLE", "EMPTY", "NOTED", "KEEP_ME"]),
 		]);
 		expect(result.stderr).toBe("");
 		expect(result.status).toBe(0);
-		expect(JSON.parse(result.stdout)).toEqual(["last", "second", "﻿ first line", multi, "", "sk-abc", "untouched"]);
+		expect(delivered(result.stdout)).toEqual(["last", "second", "﻿ first line", multi, "", "sk-abc", "untouched"]);
 	});
 
 	test("with no -f or -e, ./.env.pass is used", () => {
 		const files = fixture();
 		writeFileSync(join(files.root, ".env.pass"), "TOKEN=token\n");
-		const result = invoke(files, ["run", "--", "printenv", "TOKEN"]);
+		const result = invoke(files, ["run", "--", ...printEnv(["TOKEN"])]);
 		expect(result.status).toBe(0);
-		expect(result.stdout).toBe("synthetic-value\n");
+		expect(delivered(result.stdout)).toEqual(["synthetic-value"]);
 	});
 
 	test("with no mappings and no ./.env.pass, it explains what to do", () => {
@@ -184,9 +194,9 @@ describe("run", () => {
 
 	test("prototype-like variable names are delivered as ordinary environment entries", () => {
 		const files = fixture();
-		const result = invoke(files, ["run", "-e", "__proto__=token", "--", "printenv", "__proto__"]);
+		const result = invoke(files, ["run", "-e", "__proto__=token", "--", ...printEnv(["__proto__"])]);
 		expect(result.status).toBe(0);
-		expect(result.stdout).toBe("synthetic-value\n");
+		expect(delivered(result.stdout)).toEqual(["synthetic-value"]);
 		expect(result.stderr).toBe("");
 	});
 
@@ -236,11 +246,11 @@ describe("run", () => {
 		const files = fixture();
 		const result = invoke(files, [
 			"run", "-e", "TOKEN=token", "--", process.execPath, "-e",
-			'console.log(JSON.stringify([process.cwd(), process.argv.slice(1), await Bun.stdin.text(), process.env.TOKEN])); console.error("child-stderr"); process.exitCode = 37;',
+			'console.log(JSON.stringify([process.cwd(), process.argv.slice(1), await Bun.stdin.text(), Buffer.from(process.env.TOKEN).toString("hex")])); console.error("child-stderr"); process.exitCode = 37;',
 			"--", "argument with spaces", "$(not evaluated)",
 		], "child input\n");
 		expect(result.status).toBe(37);
-		expect(JSON.parse(result.stdout)).toEqual([files.root, ["argument with spaces", "$(not evaluated)"], "child input\n", "synthetic-value"]);
+		expect(JSON.parse(result.stdout)).toEqual([files.root, ["argument with spaces", "$(not evaluated)"], "child input\n", Buffer.from("synthetic-value").toString("hex")]);
 		expect(result.stderr).toBe("child-stderr\n");
 	});
 
@@ -276,7 +286,8 @@ describe("run", () => {
 
 	// Ctrl-C in a real terminal: the tty signals the whole foreground group,
 	// so the launcher must not forward it a second time.
-	test.skipIf(!Bun.which("script"))("one Ctrl-C in a terminal reaches the child once", async () => {
+	// `script -qec` is util-linux; macOS has BSD script, with other flags.
+	test.skipIf(!Bun.which("script") || process.platform === "darwin")("one Ctrl-C in a terminal reaches the child once", async () => {
 		const files = fixture();
 		const ready = join(files.root, "ready");
 		const count = join(files.root, "count");
@@ -294,6 +305,243 @@ setTimeout(() => { fs.writeFileSync(${JSON.stringify(count)}, String(n)); proces
 		await new Promise((done) => term.once("exit", done));
 		expect(readFileSync(count, "utf8")).toBe("1");
 	});
+});
+
+// A pseudo-terminal for tests, from the C library (Linux and macOS alike).
+function openPty(columns: number, rows: number): [number, number] {
+	const library = process.platform === "darwin" ? "/usr/lib/libSystem.B.dylib" : "libc.so.6";
+	const { symbols } = dlopen(library, { openpty: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 } });
+	const fds = new Int32Array(2);
+	if (symbols.openpty(ptr(fds), ptr(fds, 4), null, null, ptr(new Uint16Array([rows, columns, 0, 0]))) !== 0) throw new Error("openpty failed");
+	return [fds[0], fds[1]];
+}
+
+describe("output masking", () => {
+	const value = "synthetic-value";
+	// Runs pass-env with stdout and stderr in one file, as coding agents' shells do.
+	function invokeMerged(files: Fixture, args: string[], input = "") {
+		const out = join(files.root, "merged-output");
+		const fd = openSync(out, "w");
+		try {
+			const result = spawnSync(launcher[0], [...launcher.slice(1), ...args], { cwd: files.root, env: files.env, input, stdio: ["pipe", fd, fd], timeout: 20_000 });
+			if (result.error) throw result.error;
+			return { status: result.status, signal: result.signal, output: readFileSync(out, "latin1") };
+		} finally {
+			closeSync(fd);
+		}
+	}
+	const node = (code: string) => ["--", process.execPath, "-e", code];
+	// Runs pass-env with stdout and stderr on a terminal of its own.
+	async function invokeInPty(files: Fixture, args: string[]) {
+		const [master, slave] = openPty(80, 24);
+		const child = spawn(launcher[0], [...launcher.slice(1), ...args], { cwd: files.root, env: files.env, stdio: ["ignore", slave, slave] });
+		closeSync(slave);
+		const reader = new TtyReadStream(master);
+		let output = "";
+		reader.on("data", (chunk) => { output += chunk; });
+		const ended = new Promise<void>((done) => { reader.on("error", () => done()); reader.on("end", () => done()); });
+		const code = await new Promise<number | null>((done) => child.once("exit", (status) => done(status)));
+		await Promise.race([ended, Bun.sleep(1000)]);
+		reader.destroy();
+		return { code, output };
+	}
+
+	test("run masks each value in stdout and stderr, keeps everything else byte for byte, and keeps the exit status", () => {
+		const files = fixture({ token: `${value}\n`, other: "second-synthetic\n", short: "abc12\n" });
+		const result = spawnSync(launcher[0], [...launcher.slice(1), "run", "-e", "TOKEN=token", "-e", "OTHER=other", "-e", "SHORT=short",
+			...node(`const e = process.env;
+process.stdout.write("a " + e.TOKEN + " b " + e.OTHER + e.TOKEN + " short " + e.SHORT + "\\n");
+process.stdout.write(Buffer.from([0xff, 0xfe, 0x00, 0x80, 0x0a]));
+process.stderr.write("err " + e.OTHER + " \\u96ea\\n");
+process.exitCode = 5;`)], { cwd: files.root, env: files.env, timeout: 10_000 });
+		expect(result.status).toBe(5);
+		expect(result.stdout).toEqual(Buffer.concat([Buffer.from("a *** b ****** short abc12\n"), Buffer.from([0xff, 0xfe, 0x00, 0x80, 0x0a])]));
+		expect(result.stderr.toString()).toBe("err *** 雪\n");
+	});
+
+	test("pipe masks the value it sent, also in stderr", () => {
+		const files = fixture({ "app/KEY": "sk-synthetic-key\n" });
+		const result = invoke(files, ["pipe", "app/KEY", ...node('const v = await Bun.stdin.text(); console.log("got", v); console.error(v + "!"); process.exitCode = 3')]);
+		expect(result.status).toBe(3);
+		expect(result.stdout).toBe("got ***\n");
+		expect(result.stderr).toBe("***!\n");
+	});
+
+	test("a value split across writes is still masked, and stdout and stderr keep their order in one file", () => {
+		const files = fixture({ token: `${value}\n` });
+		const result = invokeMerged(files, ["run", "-e", "TOKEN=token", ...node(`const v = process.env.TOKEN;
+const fs = require("node:fs");
+for (let cut = 1; cut < v.length; cut++) { fs.writeSync(1, "[" + v.slice(0, cut)); await Bun.sleep(5); fs.writeSync(1, v.slice(cut) + "]"); }
+for (let i = 0; i < 3; i++) { fs.writeSync(1, "out" + i + "\\n"); fs.writeSync(2, "err" + i + " " + v + "\\n"); }`)]);
+		expect(result.status).toBe(0);
+		expect(result.output).toBe(`${"[***]".repeat(value.length - 1)}out0\nerr0 ***\nout1\nerr1 ***\nout2\nerr2 ***\n`);
+	});
+
+	test("output that could be the start of a value is shown after a short pause, not held until exit", async () => {
+		const files = fixture({ token: `${value}\n` });
+		const child = spawn(launcher[0], [...launcher.slice(1), "run", "-e", "TOKEN=token",
+			...node('process.stdout.write("Continue? synth"); await Bun.sleep(3000);')], { cwd: files.root, env: files.env, stdio: ["ignore", "pipe", "pipe"] });
+		let seen = "";
+		const started = Date.now();
+		const shown = new Promise<number>((done) => child.stdout!.on("data", (chunk) => {
+			seen += chunk;
+			if (seen === "Continue? synth") done(Date.now() - started);
+		}));
+		try {
+			expect(await Promise.race([shown, Bun.sleep(2500).then(() => -1)])).toBeGreaterThan(0);
+		} finally {
+			child.kill("SIGKILL");
+		}
+	});
+
+	test("multi-line values are masked whole, line by line, with \\r\\n, and JSON-escaped", () => {
+		const pem = "-----BEGIN SYNTHETIC KEY-----\nAAAAsyntheticline1\nBBBBsyntheticline2\n-----END SYNTHETIC KEY-----";
+		const files = fixture({ pem: `${pem}\n`, token: `${value}\n` });
+		const result = invoke(files, ["run", "-e", "PEM=multiline:pem", ...node(`const p = process.env.PEM;
+console.log("whole:" + p);
+console.log("one line:", p.split("\\n")[1]);
+console.log("crlf:" + p.replace(/\\n/g, "\\r\\n"));
+console.log("json:" + JSON.stringify({ p }));`)]);
+		expect(result.stdout).toBe("whole:***\none line: ***\ncrlf:***\njson:{\"p\":\"***\"}\n");
+	});
+
+	test("simple encodings are masked: base64, base64url, URL-encoded and JSON-escaped", () => {
+		const special = "syn/th+etic?&\"=\\x";
+		const files = fixture({ token: `${special}\n` });
+		const result = invoke(files, ["run", "-e", "TOKEN=token", ...node(`const v = process.env.TOKEN, b = Buffer.from(v);
+console.log([b.toString("base64"), b.toString("base64").replace(/=+$/, ""), b.toString("base64url"), encodeURIComponent(v), JSON.stringify(v).slice(1, -1), b.toString("hex")].join(" "));`)]);
+		expect(result.stdout).toBe(`*** *** *** *** *** ${Buffer.from(special).toString("hex")}\n`);
+	});
+
+	test("values shorter than 6 characters are not masked", () => {
+		const files = fixture({ short: "abc12\n", six: "abc123\n" });
+		const result = invoke(files, ["run", "-e", "SHORT=short", "-e", "SIX=six", ...node('console.log(process.env.SHORT, process.env.SIX)')]);
+		expect(result.stdout).toBe("abc12 ***\n");
+	});
+
+	test("--no-mask without a terminal (as for an agent) refuses before decrypting or starting anything", () => {
+		const files = fixture({ token: `${value}\n` });
+		for (const args of [["run", "--no-mask", "-e", "TOKEN=token", ...markerCommand(files)], ["pipe", "token", "--no-mask", ...markerCommand(files)]]) {
+			const result = invoke(files, args);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("--no-mask needs the owner at a terminal; nothing was run");
+			expect(result.stdout).toBe("");
+		}
+		expect(existsSync(files.calls)).toBe(false);
+		expect(existsSync(join(files.root, "child-started"))).toBe(false);
+		expect(invoke(files, ["pipe", "token", "--", "cat"]).stdout).toBe("***");
+	});
+
+	// `script -qec` is util-linux; macOS has BSD script, with other flags.
+	test.skipIf(!Bun.which("script") || process.platform === "darwin")("--no-mask at a terminal asks first, and shows values only after a yes", () => {
+		const files = fixture({ token: `${value}\n` });
+		const answer = (args: string[], reply: string) => {
+			const command = [...launcher, ...args].map((part) => `'${part.replace(/'/g, "'\\''")}'`).join(" ");
+			const result = spawnSync("sh", ["-c", `{ sleep 0.8; printf '%s' '${reply}'; sleep 1.5; } | script -qec "$0" /dev/null`, command],
+				{ cwd: files.root, env: files.env, encoding: "utf8", timeout: 20_000 });
+			if (result.error) throw result.error;
+			return result.stdout.replace(/\r/g, "");
+		};
+		const yes = answer(["run", "--no-mask", "-e", "TOKEN=token", "--", "sh", "-c", 'echo "value $TOKEN"; exit 3'], "y\r");
+		expect(yes).toContain("Show secret values unmasked in this command's output? [y/N]");
+		expect(yes).toContain(`value ${value}`);
+		expect(answer(["pipe", "token", "--no-mask", "--", "cat"], "yes\r")).toContain(value);
+		const no = answer(["run", "--no-mask", "-e", "TOKEN=token", ...markerCommand(files)], "n\r");
+		expect(no).toContain("CANCELLED: --no-mask was not confirmed; nothing was run");
+		expect(no).not.toContain(value);
+		expect(existsSync(join(files.root, "child-started"))).toBe(false);
+	}, 20_000);
+
+	test("the last output of a command that was quiet for a while is not lost, with pipes or a terminal", async () => {
+		const files = fixture({ token: `${value}\n` });
+		const args = ["run", "-e", "TOKEN=token", ...node(`process.stdout.write("start\\n");
+await Bun.sleep(300);
+process.stdout.write("end " + process.env.TOKEN + "\\n");
+process.exit(0);`)];
+		for (let run = 0; run < 3; run += 1) {
+			expect(invokeMerged(files, args).output).toBe("start\nend ***\n");
+			expect((await invokeInPty(files, args)).output).toBe("start\r\nend ***\r\n");
+		}
+	}, 20_000);
+
+	test("all output arrives before pass-env ends with the signal that killed the command", () => {
+		const files = fixture({ token: `${value}\n` });
+		const result = spawnSync(launcher[0], [...launcher.slice(1), "run", "-e", "TOKEN=token", ...node(`const fs = require("node:fs");
+for (let i = 0; i < 2000; i++) fs.writeSync(1, "line " + i + " " + process.env.TOKEN + " " + "y".repeat(500) + "\\n");
+process.kill(process.pid, "SIGTERM");`)], { cwd: files.root, env: files.env, encoding: "utf8", maxBuffer: 16 << 20, timeout: 20_000 });
+		expect(result.signal).toBe("SIGTERM");
+		const lines = result.stdout.split("\n");
+		expect(lines.length).toBe(2001);
+		expect(lines[1999]).toBe(`line 1999 *** ${"y".repeat(500)}`);
+	});
+
+	test("background processes the command leaves behind do not keep pass-env waiting", () => {
+		const files = fixture({ token: `${value}\n` });
+		const started = Date.now();
+		const result = invoke(files, ["run", "-e", "TOKEN=token", "--", "sh", "-c", '(sleep 5; echo late) & echo "now $TOKEN"']);
+		expect(result.stdout).toBe("now ***\n");
+		expect(Date.now() - started).toBeLessThan(4000);
+	});
+
+	test("a reader that stops early (| head) stops the command, as without pass-env", () => {
+		const files = fixture({ token: `${value}\n` });
+		const command = [...launcher, "run", "-e", "TOKEN=token", "--", "sh", "-c", 'while :; do echo "line $TOKEN"; done'].map((part) => `'${part}'`).join(" ");
+		const result = spawnSync("sh", ["-c", `${command} | head -n 2`], { cwd: files.root, env: files.env, encoding: "utf8", timeout: 10_000 });
+		expect(result.error).toBeUndefined();
+		expect(result.stdout).toBe("line ***\nline ***\n");
+	});
+
+	test("100,000 lines of output pass through masked, complete and quickly", () => {
+		const files = fixture({ token: `${value}\n`, other: "second-synthetic\n" });
+		const started = performance.now();
+		const result = spawnSync(launcher[0], [...launcher.slice(1), "run", "-e", "TOKEN=token", "-e", "OTHER=other", ...node(`const v = process.env.TOKEN;
+const lines = []; for (let i = 0; i < 100000; i++) lines.push(i % 1000 === 0 ? "line " + i + " " + v : "line " + i + " of ordinary output, nothing secret here");
+process.stdout.write(lines.join("\\n") + "\\n");`)], { cwd: files.root, env: files.env, maxBuffer: 64 << 20, timeout: 30_000 });
+		const elapsed = performance.now() - started;
+		const lines = result.stdout.toString().split("\n");
+		expect(lines.length).toBe(100_001);
+		expect(lines.filter((line) => line.endsWith(" ***")).length).toBe(100);
+		expect(result.stdout.includes(value)).toBe(false);
+		expect(lines[99_999]).toBe("line 99999 of ordinary output, nothing secret here");
+		expect(elapsed).toBeLessThan(10_000);
+	});
+
+	// In a terminal the command runs with a pseudo-terminal for its output, so
+	// colors, sizes and progress bars work; stdin stays the real terminal.
+	test("in a terminal, the command still sees a terminal of the same size, colors pass through, and values are masked", async () => {
+		const files = fixture({ token: `${value}\n` });
+		const [master, slave] = openPty(101, 33);
+		const child = spawn(launcher[0], [...launcher.slice(1), "run", "-e", "TOKEN=token", ...node(`
+console.log(JSON.stringify({ out: process.stdout.isTTY === true, err: process.stderr.isTTY === true, columns: process.stdout.columns, rows: process.stdout.rows }));
+console.log("\\x1b[31m" + process.env.TOKEN + "\\x1b[0m");
+console.error("to stderr " + process.env.TOKEN);
+process.stdout.on("resize", () => { process.stdout.write("resized " + process.stdout.columns + "\\n"); process.exit(4); });
+console.log("ready");
+setTimeout(() => process.exit(9), 5000);`)], { cwd: files.root, env: files.env, stdio: ["ignore", slave, slave] });
+		closeSync(slave);
+		const reader = new TtyReadStream(master);
+		let output = "";
+		reader.on("data", (chunk) => { output += chunk; });
+		reader.on("error", () => {});
+		const exited = new Promise<number | null>((done) => child.once("exit", (code) => done(code)));
+		const deadline = Date.now() + 5000;
+		while (!output.includes("ready") && Date.now() < deadline) await Bun.sleep(25);
+		// Resize the outer terminal: the command sees the new size.
+		spawnSync("stty", ["columns", "120", "rows", "40"], { stdio: [master, "ignore", "ignore"] });
+		child.kill("SIGWINCH");
+		const code = await exited;
+		if (code !== 4) console.log(JSON.stringify(output));
+		expect(code).toBe(4);
+		await Bun.sleep(50);
+		reader.destroy();
+		expect(output).toContain('{"out":true,"err":true,"columns":101,"rows":33}');
+		expect(output).toContain("\x1b[31m***\x1b[0m");
+		expect(output).toContain("to stderr ***");
+		expect(output).toContain("resized 120");
+		expect(output).not.toContain(value);
+		// Bytes reach the terminal as written: no second \r from the inner pty.
+		expect(output).not.toContain("\r\r");
+	}, 15_000);
 });
 
 describe("check", () => {
@@ -344,8 +592,8 @@ describe("generate", () => {
 	test("generated secrets round-trip through run without a trailing newline", () => {
 		const files = fixture({});
 		invoke(files, ["generate", "app/S"]);
-		const result = invoke(files, ["run", "-e", "S=app/S", "--", "sh", "-c", 'printf %s "$S"']);
-		expect(result.stdout).toBe(stored(files, "app/S").trimEnd());
+		const result = invoke(files, ["run", "-e", "S=app/S", "--", ...printEnv(["S"])]);
+		expect(delivered(result.stdout)).toEqual([stored(files, "app/S").trimEnd()]);
 	});
 });
 
@@ -392,14 +640,14 @@ describe("pipe", () => {
 	test("sends one secret to a command's stdin with no trailing newline and keeps its exit status", () => {
 		const files = fixture({ "app/KEY": "sk-synthetic\n" });
 		const result = invoke(files, ["pipe", "app/KEY", "--", process.execPath, "-e",
-			'const v = await Bun.stdin.text(); console.log(JSON.stringify(v)); process.exitCode = 3']);
-		expect(result.stdout).toBe('"sk-synthetic"\n');
+			'const v = await Bun.stdin.text(); console.log(Buffer.from(v).toString("hex")); process.exitCode = 3']);
+		expect(result.stdout).toBe(`${Buffer.from("sk-synthetic").toString("hex")}\n`);
 		expect(result.status).toBe(3);
 	});
 
 	test("multiline sends the whole entry; missing entries and commands are rejected", () => {
 		const files = fixture({ "app/PEM": "-----BEGIN-----\nabc\n-----END-----\n" });
-		expect(invoke(files, ["pipe", "app/PEM", "--multiline", "--", "cat"]).stdout).toBe("-----BEGIN-----\nabc\n-----END-----\n");
+		expect(invoke(files, ["pipe", "app/PEM", "--multiline", "--", process.execPath, "-e", 'process.stdout.write(Buffer.from(await Bun.stdin.text()).toString("hex"))']).stdout).toBe(Buffer.from("-----BEGIN-----\nabc\n-----END-----\n").toString("hex"));
 		expect(invoke(files, ["pipe", "app/NOPE", "--", "cat"]).status).toBe(1);
 		expect(invoke(files, ["pipe", "app/PEM"]).status).toBe(2);
 		expect(invoke(files, ["pipe", "app/PEM", "--"]).status).toBe(2);
@@ -480,7 +728,7 @@ describe("set", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toBe("Stored app/KEY: 17 characters.\n");
 		expect(stored(files, "app/KEY")).toBe("sk-live-synthetic\n");
-		expect(invoke(files, ["run", "-e", "K=app/KEY", "--", "sh", "-c", 'printf %s "$K"']).stdout).toBe("sk-live-synthetic");
+		expect(delivered(invoke(files, ["run", "-e", "K=app/KEY", "--", ...printEnv(["K"])]).stdout)).toEqual(["sk-live-synthetic"]);
 
 		const again = invoke(files, ["set", "app/KEY"], "other\n");
 		expect(again.status).toBe(1);
@@ -498,8 +746,8 @@ describe("set", () => {
 		expect(stored(files, "app/PEM")).toBe(pem);
 		expect(invoke(files, ["set", "app/FILE"], `${pem}\n`).status).toBe(0);
 		expect(stored(files, "app/FILE")).toBe(`${pem}\n`);
-		const run = invoke(files, ["run", "-e", "PEM=multiline:app/PEM", "--", process.execPath, "-e", "process.stdout.write(JSON.stringify(process.env.PEM))"]);
-		expect(JSON.parse(run.stdout)).toBe(pem);
+		const run = invoke(files, ["run", "-e", "PEM=multiline:app/PEM", "--", ...printEnv(["PEM"])]);
+		expect(delivered(run.stdout)).toEqual([pem]);
 	});
 
 	test("empty input and bad names are rejected", () => {
@@ -631,8 +879,8 @@ describe("import", () => {
 	test("multi-line values round-trip exactly through run", () => {
 		const files = setup();
 		invoke(files, ["import", ".env.local", "--prefix", "app"]);
-		const result = invoke(files, ["run", "--", process.execPath, "-e", "process.stdout.write(JSON.stringify([process.env.PEM, process.env.ESCAPED, process.env.SINGLE]))"]);
-		expect(JSON.parse(result.stdout)).toEqual(["-----BEGIN SYNTHETIC-----\nabc\n-----END SYNTHETIC-----", "synthetic line one\nline two", "literal-synthetic \\n kept #not-a-comment"]);
+		const result = invoke(files, ["run", "--", ...printEnv(["PEM", "ESCAPED", "SINGLE"])]);
+		expect(delivered(result.stdout)).toEqual(["-----BEGIN SYNTHETIC-----\nabc\n-----END SYNTHETIC-----", "synthetic line one\nline two", "literal-synthetic \\n kept #not-a-comment"]);
 	});
 
 	test("--dry-run prints names only and stores or writes nothing", () => {

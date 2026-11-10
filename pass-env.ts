@@ -2,6 +2,7 @@
 // pass-env: give programs and coding agents secrets from `pass` without
 // showing them. Fork of misty-step/mistystack's bin/pass-env.ts (MIT).
 
+import { dlopen, FFIType, ptr, type FFIFunction } from "bun:ffi";
 import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
@@ -9,6 +10,7 @@ import {
 	statSync, unlinkSync, utimesSync, writeFileSync, writeSync, type Stats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { isatty, ReadStream as TtyReadStream } from "node:tty";
 
 class CliError extends Error {
 	constructor(readonly code: string, message: string, readonly exitCode = 1) {
@@ -22,12 +24,12 @@ type Charset = "alnum" | "hex" | "base64url";
 type Options =
 	| { command: "help"; topic?: string; brief?: boolean }
 	| { command: "list"; prefix: string; json: boolean }
-	| ({ command: "run"; argv: string[] } & Sources)
+	| ({ command: "run"; argv: string[]; mask: boolean } & Sources)
 	| ({ command: "check" } & Sources)
 	| { command: "set"; entry: string; force: boolean }
 	| { command: "generate"; entry: string; length: number; charset: Charset; force: boolean; copy: boolean }
 	| { command: "copy"; entry: string; multiline: boolean }
-	| { command: "pipe"; entry: string; multiline: boolean; argv: string[] }
+	| { command: "pipe"; entry: string; multiline: boolean; mask: boolean; argv: string[] }
 	| { command: "unlock"; entry?: string; hello: boolean }
 	| { command: "hello"; action: "enrol"; entry?: string }
 	| { command: "hello"; action: "install"; file?: string; yes: boolean }
@@ -77,11 +79,17 @@ const HELP: Record<string, string> = {
       Make a random secret (default 48 alnum). Never printed.
       --copy also puts it on your clipboard to paste somewhere, cleared after 45s.
       --force replaces an existing one (rotation).`,
-	run: `  pass-env run [-f file]... [-e NAME=entry]... -- command args...
+	run: `  pass-env run [-f file]... [-e NAME=entry]... [--no-mask] -- command args...
       Start a command with secrets as environment variables.
-      With no -f or -e, uses ./.env.pass.`,
-	pipe: `  pass-env pipe <entry> [--multiline] -- command args...
-      Send one secret to a command's input, e.g. gh secret set NAME.`,
+      With no -f or -e, uses ./.env.pass.
+      What the command prints shows each value (6+ characters, also base64,
+      URL- or JSON-encoded) as ***. In a terminal it keeps colors and prompts.
+      --no-mask turns that off, for you at your terminal only: it asks you
+      to confirm there, and refuses without a terminal (as for agents).`,
+	pipe: `  pass-env pipe <entry> [--multiline] [--no-mask] -- command args...
+      Send one secret to a command's input, e.g. gh secret set NAME.
+      What the command prints shows the value as ***, like run; --no-mask
+      works as for run.`,
 	copy: `  pass-env copy <entry> [--multiline]
       Put one secret on your clipboard, cleared after 45s.`,
 	import: `  pass-env import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--map NAME=entry]... [--force]
@@ -229,15 +237,20 @@ function mapping(input: string, location: string): Mapping {
 	return { name, entry, multiline };
 }
 
-function parseSources(args: string[], allowCommand: boolean): Sources & { argv?: string[] } {
+function parseSources(args: string[], allowCommand: boolean): Sources & { argv?: string[]; mask?: boolean } {
 	const files: string[] = [];
 	const explicit: Mapping[] = [];
+	let mask = true;
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		if (arg === "--" && allowCommand) {
 			const argv = args.slice(index + 1);
 			if (!argv[0]) throw new CliError("USAGE", "run requires a command after --", 2);
-			return { files, explicit, argv };
+			return { files, explicit, argv, mask };
+		}
+		if (arg === "--no-mask" && allowCommand) {
+			mask = false;
+			continue;
 		}
 		if (!["-e", "--env", "-f", "--env-file"].includes(arg)) throw new CliError("USAGE", `unexpected argument ${JSON.stringify(arg)}`, 2);
 		const value = args[++index];
@@ -284,7 +297,7 @@ function parseArgs(args: string[]): Options {
 		}
 		case "run": {
 			const parsed = parseSources(rest, true);
-			return { command: "run", ...withDefaultFile(parsed), argv: parsed.argv! };
+			return { command: "run", ...withDefaultFile({ files: parsed.files, explicit: parsed.explicit }), argv: parsed.argv!, mask: parsed.mask! };
 		}
 		case "check":
 			return { command: "check", ...withDefaultFile(parseSources(rest, false)) };
@@ -328,9 +341,10 @@ function parseArgs(args: string[]): Options {
 			const before = split === -1 ? rest : rest.slice(0, split);
 			const argv = split === -1 ? [] : rest.slice(split + 1);
 			const multiline = before.includes("--multiline");
-			const positional = before.filter((arg) => arg !== "--multiline");
-			if (positional.length !== 1 || !argv[0]) throw new CliError("USAGE", "expected pipe <entry> [--multiline] -- command args...", 2);
-			return { command: "pipe", entry: checkedEntry(positional[0]), multiline, argv };
+			const mask = !before.includes("--no-mask");
+			const positional = before.filter((arg) => arg !== "--multiline" && arg !== "--no-mask");
+			if (positional.length !== 1 || !argv[0]) throw new CliError("USAGE", "expected pipe <entry> [--multiline] [--no-mask] -- command args...", 2);
+			return { command: "pipe", entry: checkedEntry(positional[0]), multiline, mask, argv };
 		}
 		case "unlock": {
 			const hello = rest.includes("--hello");
@@ -880,13 +894,13 @@ It cannot be recovered, so save it in your password manager.`;
 // Reads one line from the terminal and stops there. An async reader (for
 // await ... of console) keeps reading stdin in the background afterwards, and
 // would swallow the keystrokes meant for a pinentry prompt that opens later.
-function readLine(): string {
+function readLine(fd = 0): string {
 	const bytes: number[] = [];
 	const one = Buffer.alloc(1);
 	for (;;) {
 		let count: number;
 		try {
-			count = readSync(0, one, 0, 1, null);
+			count = readSync(fd, one, 0, 1, null);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "EAGAIN") continue;
 			throw error;
@@ -895,6 +909,26 @@ function readLine(): string {
 		if (bytes.length < 4096) bytes.push(one[0]);
 	}
 	return Buffer.from(bytes).toString("utf8").replace(/\r$/, "");
+}
+
+// --no-mask shows values in the output, so only the owner at a terminal may
+// use it, and only after saying yes on the terminal itself. Agents have no
+// terminal, so they are refused before anything is decrypted or started.
+function confirmNoMask(): void {
+	const refused = new CliError("TTY", "--no-mask needs the owner at a terminal; nothing was run", 2);
+	if (!isatty(0) || !isatty(1)) throw refused;
+	let tty: number;
+	try {
+		tty = openSync("/dev/tty", "r+");
+	} catch {
+		throw refused;
+	}
+	try {
+		writeSync(tty, "Show secret values unmasked in this command's output? [y/N] ");
+		if (!/^y(es)?$/i.test(readLine(tty).trim())) throw new CliError("CANCELLED", "--no-mask was not confirmed; nothing was run");
+	} finally {
+		closeSync(tty);
+	}
 }
 
 async function ask(question: string): Promise<string> {
@@ -1702,13 +1736,317 @@ function terminalSignalsReachChild(): boolean {
 	}
 }
 
-async function runChild(argv: string[], env: NodeJS.ProcessEnv, input?: string): Promise<number> {
-	let child: Bun.Subprocess<"inherit" | "pipe", "inherit", "inherit">;
+// Masking what run and pipe print. The child's stdout and stderr are read by
+// pass-env, every copy of a value it handed over becomes ***, and the rest is
+// passed on unchanged, byte for byte. Values live only in this process's memory
+// for the command's lifetime.
+const MASK = "***";
+// Shorter values are not masked: they would hide ordinary words and numbers.
+const MASK_MIN = 6;
+// The end of the output that could be the start of a value is held back until
+// more output shows whether it is, or until the command is quiet this long.
+const MASK_HOLD_MS = 100;
+// After the command exits, output still arriving (from processes it left
+// running in the background) is passed on until it has been quiet this long.
+const MASK_DRAIN_MS = 100;
+// The first Bun whose node:tty ReadStream reads a pseudo-terminal; older ones
+// fall back to plain pipes, so colors are lost but masking still works.
+const PTY_MIN_BUN = "1.4.4";
+
+// Every form of the values to replace, as UTF-8 bytes, so output is searched
+// and passed on as bytes and binary output stays unchanged. Longest first, so a
+// value inside a longer one is never replaced first.
+function maskTargets(values: Iterable<string>): Buffer[] {
+	const targets = new Map<string, Buffer>();
+	const add = (text: string) => {
+		if (text.length >= MASK_MIN) targets.set(text, Buffer.from(text, "utf8"));
+	};
+	const encodings = (text: string) => {
+		add(text);
+		add(JSON.stringify(text).slice(1, -1));
+		add(encodeURIComponent(text));
+		const base64 = Buffer.from(text, "utf8").toString("base64");
+		add(base64);
+		add(base64.replace(/=+$/, ""));
+		add(Buffer.from(text, "utf8").toString("base64url"));
+	};
+	for (const value of values) {
+		if (value.length < MASK_MIN) continue;
+		encodings(value);
+		if (!/[\r\n]/.test(value)) continue;
+		// Windows line endings, or a terminal's; tools may print one line at a time.
+		add(value.replace(/\r?\n/g, "\r\n"));
+		for (const line of value.split(/\r?\n/)) add(line);
+	}
+	return [...targets.values()].sort((a, b) => b.length - a.length);
+}
+
+const NO_BYTES = Buffer.alloc(0);
+
+class Masker {
+	private pending = NO_BYTES;
+	// The same values as latin1 text (one character per byte), for replacing.
+	private readonly texts: string[];
+	constructor(private readonly targets: Buffer[]) {
+		this.texts = targets.map((target) => target.toString("latin1"));
+	}
+
+	get holding(): boolean {
+		return this.pending.length > 0;
+	}
+
+	// Masks a chunk and returns what can be shown now; keeps back the end of the
+	// output only while it could be the start of a value split across chunks.
+	// Output with no value in it is passed on as it came, without a copy.
+	push(chunk: Uint8Array): Buffer {
+		const bytes = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+		let data = this.pending.length ? Buffer.concat([this.pending, bytes]) : bytes;
+		if (this.targets.some((target) => data.includes(target))) {
+			let text = data.toString("latin1");
+			for (const target of this.texts) {
+				if (text.includes(target)) text = text.split(target).join(MASK);
+			}
+			data = Buffer.from(text, "latin1");
+		}
+		const keep = this.heldLength(data);
+		this.pending = keep ? Buffer.from(data.subarray(data.length - keep)) : NO_BYTES;
+		return keep ? data.subarray(0, data.length - keep) : data;
+	}
+
+	flush(): Buffer {
+		const rest = this.pending;
+		this.pending = NO_BYTES;
+		return rest;
+	}
+
+	// The longest end of data that some value starts with (and is longer than).
+	private heldLength(data: Buffer): number {
+		let held = 0;
+		for (const target of this.targets) {
+			let at = data.indexOf(target[0], Math.max(0, data.length - target.length + 1));
+			while (at !== -1 && data.length - at > held) {
+				if (data.compare(target, 0, data.length - at, at) === 0) {
+					held = data.length - at;
+					break;
+				}
+				at = data.indexOf(target[0], at + 1);
+			}
+		}
+		return held;
+	}
+}
+
+// pipe(2) and openpty(3) from the C library, through bun:ffi; undefined where
+// unavailable, and the caller falls back.
+type Libc = { pipe?: (fds: Int32Array) => boolean; openpty?: (like: number, columns: number, rows: number) => [number, number] | undefined };
+let libcCache: Libc | undefined;
+
+function libc(): Libc {
+	if (libcCache) return libcCache;
+	const libraries = process.platform === "darwin" ? ["/usr/lib/libSystem.B.dylib"] : ["libc.so.6", "libutil.so.1", "libc.so"];
+	const load = <T extends Record<string, FFIFunction>>(symbols: T) => {
+		for (const library of libraries) {
+			try {
+				return dlopen(library, symbols).symbols;
+			} catch { /* Try the next library. */ }
+		}
+	};
+	const pipe = load({ pipe: { args: [FFIType.ptr], returns: FFIType.i32 } })?.pipe;
+	const openpty = load({ openpty: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 } })?.openpty;
+	const termios = load({
+		tcgetattr: { args: [FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+		cfmakeraw: { args: [FFIType.ptr], returns: FFIType.void },
+	});
+	libcCache = {
+		pipe: pipe && ((fds) => pipe(ptr(fds)) === 0),
+		// The pty starts as a copy of the real terminal with output processing
+		// off, so bytes reach the real terminal exactly as the command wrote them
+		// and it applies its own settings (which the command may change through
+		// stdin, the real terminal). struct termios is under 100 bytes everywhere.
+		openpty: openpty && ((like, columns, rows) => {
+			const fds = new Int32Array(2);
+			const size = new Uint16Array([rows, columns, 0, 0]);
+			const settings = new Uint8Array(256);
+			const raw = termios && termios.tcgetattr(like, ptr(settings)) === 0;
+			if (raw) termios.cfmakeraw(ptr(settings));
+			return openpty(ptr(fds), ptr(fds, 4), null, raw ? ptr(settings) : null, ptr(size)) === 0 ? [fds[0], fds[1]] : undefined;
+		}),
+	};
+	return libcCache;
+}
+
+// Where one or both of the child's output streams go: a pseudo-terminal when
+// pass-env's own stream is a terminal (so colors and progress bars keep
+// working), a pipe otherwise. childFd is undefined for Bun's own pipe.
+type Channel = { target: NodeJS.WriteStream; tty: boolean; readFd?: number; childFd?: number };
+
+function windowSize(target: NodeJS.WriteStream): [number, number] {
 	try {
-		child = Bun.spawn({ cmd: argv, env, stdin: input === undefined ? "inherit" : "pipe", stdout: "inherit", stderr: "inherit" });
+		return target.getWindowSize();
+	} catch {
+		return [80, 24];
+	}
+}
+
+function sameFile(a: number, b: number): boolean {
+	try {
+		const [x, y] = [fstatSync(a), fstatSync(b)];
+		return x.dev === y.dev && x.ino === y.ino && x.rdev === y.rdev;
+	} catch {
+		return false;
+	}
+}
+
+function openChannel(target: NodeJS.WriteStream, fd: number): Channel {
+	if (isatty(fd) && Bun.semver.order(Bun.version, PTY_MIN_BUN) >= 0) {
+		const [columns, rows] = windowSize(target);
+		const pair = libc().openpty?.(fd, columns, rows);
+		if (pair) return { target, tty: true, readFd: pair[0], childFd: pair[1] };
+	}
+	const fds = new Int32Array(2);
+	if (libc().pipe?.(fds)) return { target, tty: false, readFd: fds[0], childFd: fds[1] };
+	return { target, tty: false };
+}
+
+// Output from a channel, chunk by chunk; close() stops reading and closes it.
+type Source = { next(): Promise<Uint8Array | undefined>; close(): void };
+
+function channelSource(channel: Channel, fallback: ReadableStream<Uint8Array> | undefined): Source {
+	if (channel.tty) {
+		const stream = new TtyReadStream(channel.readFd!);
+		const chunks = stream[Symbol.asyncIterator]();
+		return {
+			// A pseudo-terminal reports EIO once every writer has closed it.
+			next: () => chunks.next().then((step) => step.done ? undefined : step.value as Uint8Array, () => undefined),
+			close: () => stream.destroy(),
+		};
+	}
+	const reader = (fallback ?? Bun.file(channel.readFd!).stream()).getReader();
+	let closed = false;
+	return {
+		next: () => reader.read().then((step) => step.done ? undefined : step.value, () => undefined),
+		close: () => {
+			if (closed) return;
+			closed = true;
+			reader.cancel().catch(() => {});
+			if (channel.readFd !== undefined) closeQuietly(channel.readFd);
+		},
+	};
+}
+
+function closeQuietly(fd: number): void {
+	try {
+		closeSync(fd);
+	} catch { /* Already closed. */ }
+}
+
+// Copies a source to its target through the masker, in order. If the target
+// stops accepting output (a closed pipe), reading stops too, so the child gets
+// SIGPIPE as it would have without pass-env in between.
+async function forward(source: Source, target: NodeJS.WriteStream, masker: Masker, active: () => void): Promise<void> {
+	let broken = false;
+	const failed = (error?: Error | null) => {
+		if (error) broken = true;
+	};
+	target.on("error", failed);
+	// Waits only when the target has more queued than it wants (or on error).
+	const settled = () => broken || !target.writableNeedDrain ? undefined : new Promise<void>((done) => {
+		const finish = () => {
+			target.removeListener("drain", finish);
+			target.removeListener("error", finish);
+			done();
+		};
+		target.once("drain", finish);
+		target.once("error", finish);
+	});
+	const show = (bytes: Uint8Array) => {
+		if (bytes.length && !broken) target.write(bytes, failed);
+	};
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	for (let chunk = await source.next(); chunk; chunk = await source.next()) {
+		active();
+		clearTimeout(timer);
+		show(masker.push(chunk));
+		await settled();
+		if (broken) break;
+		if (masker.holding) timer = setTimeout(() => show(masker.flush()), MASK_HOLD_MS);
+	}
+	clearTimeout(timer);
+	source.close();
+	show(masker.flush());
+	// Everything is handed to the system before pass-env exits (or re-raises
+	// the child's signal).
+	if (!broken && target.writableLength > 0) {
+		await new Promise<void>((done) => target.write(NO_BYTES, () => done()));
+	}
+	await settled();
+	target.removeListener("error", failed);
+}
+
+// Runs the child with its output read through a Masker. Returns the child's
+// output channels' descriptors to pass to spawn and a function that finishes
+// passing on the output once the child has exited.
+function maskOutput(targets: Buffer[]): { stdout: number | "pipe"; stderr: number | "pipe"; attach(child: Bun.Subprocess): () => Promise<void> } {
+	const out = openChannel(process.stdout, 1);
+	const err = sameFile(1, 2) && (out.childFd !== undefined) ? out : openChannel(process.stderr, 2);
+	const channels = err === out ? [out] : [out, err];
+	return {
+		stdout: out.childFd ?? "pipe",
+		stderr: err.childFd ?? "pipe",
+		attach(child) {
+			// Our copies of the child's ends must close, or the output never ends.
+			const ttyFd = channels.find((channel) => channel.tty)?.childFd;
+			for (const channel of channels) if (channel.childFd !== undefined && channel.childFd !== ttyFd) closeQuietly(channel.childFd);
+			let last = Date.now();
+			const sources = channels.map((channel, index) => channelSource(channel,
+				channel.childFd === undefined ? (index === 0 ? child.stdout : child.stderr) as ReadableStream<Uint8Array> : undefined));
+			const done = Promise.all(sources.map((source, index) => forward(source, channels[index].target, new Masker(targets), () => { last = Date.now(); })));
+			// Keep the terminal's size: the pty is resized with stty on its child
+			// end (kept open for that), and the child told to look again.
+			let resize: (() => void) | undefined;
+			let pending: ReturnType<typeof setTimeout> | undefined;
+			if (ttyFd !== undefined) {
+				const outer = channels.find((channel) => channel.tty)!.target;
+				resize = () => {
+					clearTimeout(pending);
+					pending = setTimeout(() => {
+						try {
+							const [columns, rows] = windowSize(outer);
+							const set = Bun.spawnSync({ cmd: ["stty", "rows", String(rows), "columns", String(columns)], stdin: ttyFd, stdout: "ignore", stderr: "ignore" });
+							if (set.exitCode === 0) child.kill("SIGWINCH");
+						} catch { /* The size stays as it was. */ }
+					}, 20);
+				};
+				process.on("SIGWINCH", resize);
+			}
+			return async () => {
+				if (resize) process.removeListener("SIGWINCH", resize);
+				clearTimeout(pending);
+				if (ttyFd !== undefined) closeQuietly(ttyFd);
+				// Background processes the child left may keep its output open:
+				// pass on what they print until they are quiet, then stop reading.
+				let finished = false;
+				void done.then(() => { finished = true; });
+				last = Date.now();
+				while (!finished && Date.now() - last < MASK_DRAIN_MS) await Promise.race([done, Bun.sleep(MASK_DRAIN_MS / 4)]);
+				if (!finished) sources.forEach((source) => source.close());
+				await done;
+			};
+		},
+	};
+}
+
+async function runChild(argv: string[], env: NodeJS.ProcessEnv, input?: string, masked: string[] = []): Promise<number> {
+	const targets = maskTargets(masked);
+	// Nothing long enough to mask: the child writes straight to our output.
+	const output = targets.length ? maskOutput(targets) : undefined;
+	let child: Bun.Subprocess<"inherit" | "pipe", "inherit" | "pipe" | number, "inherit" | "pipe" | number>;
+	try {
+		child = Bun.spawn({ cmd: argv, env, stdin: input === undefined ? "inherit" : "pipe", stdout: output?.stdout ?? "inherit", stderr: output?.stderr ?? "inherit" });
 	} catch {
 		throw new CliError("COMMAND", "could not start command");
 	}
+	const finish = output?.attach(child);
 	if (input !== undefined) {
 		const sink = child.stdin as import("bun").FileSink;
 		sink.write(input);
@@ -1729,6 +2067,7 @@ async function runChild(argv: string[], env: NodeJS.ProcessEnv, input?: string):
 	} finally {
 		signals.forEach((signal, index) => process.removeListener(signal, handlers[index]));
 	}
+	await finish?.();
 	if (child.signalCode) process.kill(process.pid, child.signalCode);
 	return code;
 }
@@ -2968,6 +3307,7 @@ async function main(args: string[]): Promise<number> {
 		}
 	}
 	if (options.command === "scrub") return scrub(options);
+	if ((options.command === "run" || options.command === "pipe") && !options.mask) confirmNoMask();
 	const root = storePath();
 	switch (options.command) {
 		case "list": {
@@ -3013,7 +3353,7 @@ async function main(args: string[]): Promise<number> {
 			if (!entryExists(root, options.entry)) throw new CliError("ENTRY", `${options.entry}: entry does not exist or is a symlink`);
 			const board = options.command === "copy" ? clipboard() : undefined;
 			const value = await decrypt(root, { name: options.entry, entry: options.entry, multiline: options.multiline });
-			if (options.command === "pipe") return runChild(options.argv, process.env, value);
+			if (options.command === "pipe") return runChild(options.argv, process.env, value, options.mask ? [value] : []);
 			const seconds = await copyToClipboard(board!, value);
 			console.log(`Copied ${options.entry} to the clipboard; it clears in ${seconds}s.`);
 			return 0;
@@ -3047,7 +3387,7 @@ async function main(args: string[]): Promise<number> {
 				}
 				env[item.name] = value;
 			}
-			return runChild(options.argv, env);
+			return runChild(options.argv, env, undefined, options.mask ? [...values.values()] : []);
 		}
 	}
 }
