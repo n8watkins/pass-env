@@ -2341,10 +2341,11 @@ async function doctor(): Promise<number> {
 
 // scrub: find and blank out secrets that coding agents already saved in
 // their chat logs. Where each agent keeps its transcripts, relative to HOME:
-// Claude Code (projects/**/*.jsonl, history.jsonl), Codex (sessions,
+// Claude Code (projects/**/*.jsonl, history.jsonl, and projects-archive, a
+// common place to move old projects' logs), Codex (sessions,
 // archived_sessions, history.jsonl) and pi and its fork OMP (agent/sessions).
 const AGENT_LOGS = [
-	".claude/projects", ".claude/history.jsonl",
+	".claude/projects", ".claude/projects-archive", ".claude/history.jsonl",
 	".codex/sessions", ".codex/archived_sessions", ".codex/history.jsonl",
 	".pi/agent/sessions", ".omp/agent/sessions",
 ];
