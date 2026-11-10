@@ -417,12 +417,38 @@ console.log([b.toString("base64"), b.toString("base64").replace(/=+$/, ""), b.to
 		expect(result.stdout).toBe("abc12 ***\n");
 	});
 
-	test("--no-mask passes output through unchanged, for run and pipe", () => {
+	test("--no-mask without a terminal (as for an agent) refuses before decrypting or starting anything", () => {
 		const files = fixture({ token: `${value}\n` });
-		expect(invoke(files, ["run", "--no-mask", "-e", "TOKEN=token", ...node("console.log(process.env.TOKEN)")]).stdout).toBe(`${value}\n`);
-		expect(invoke(files, ["pipe", "token", "--no-mask", "--", "cat"]).stdout).toBe(value);
+		for (const args of [["run", "--no-mask", "-e", "TOKEN=token", ...markerCommand(files)], ["pipe", "token", "--no-mask", ...markerCommand(files)]]) {
+			const result = invoke(files, args);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("--no-mask needs the owner at a terminal; nothing was run");
+			expect(result.stdout).toBe("");
+		}
+		expect(existsSync(files.calls)).toBe(false);
+		expect(existsSync(join(files.root, "child-started"))).toBe(false);
 		expect(invoke(files, ["pipe", "token", "--", "cat"]).stdout).toBe("***");
 	});
+
+	// `script -qec` is util-linux; macOS has BSD script, with other flags.
+	test.skipIf(!Bun.which("script") || process.platform === "darwin")("--no-mask at a terminal asks first, and shows values only after a yes", () => {
+		const files = fixture({ token: `${value}\n` });
+		const answer = (args: string[], reply: string) => {
+			const command = [...launcher, ...args].map((part) => `'${part.replace(/'/g, "'\\''")}'`).join(" ");
+			const result = spawnSync("sh", ["-c", `{ sleep 0.8; printf '%s' '${reply}'; sleep 1.5; } | script -qec "$0" /dev/null`, command],
+				{ cwd: files.root, env: files.env, encoding: "utf8", timeout: 20_000 });
+			if (result.error) throw result.error;
+			return result.stdout.replace(/\r/g, "");
+		};
+		const yes = answer(["run", "--no-mask", "-e", "TOKEN=token", "--", "sh", "-c", 'echo "value $TOKEN"; exit 3'], "y\r");
+		expect(yes).toContain("Show secret values unmasked in this command's output? [y/N]");
+		expect(yes).toContain(`value ${value}`);
+		expect(answer(["pipe", "token", "--no-mask", "--", "cat"], "yes\r")).toContain(value);
+		const no = answer(["run", "--no-mask", "-e", "TOKEN=token", ...markerCommand(files)], "n\r");
+		expect(no).toContain("CANCELLED: --no-mask was not confirmed; nothing was run");
+		expect(no).not.toContain(value);
+		expect(existsSync(join(files.root, "child-started"))).toBe(false);
+	}, 20_000);
 
 	test("the last output of a command that was quiet for a while is not lost, with pipes or a terminal", async () => {
 		const files = fixture({ token: `${value}\n` });

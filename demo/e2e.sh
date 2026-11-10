@@ -54,7 +54,10 @@ step "what run and pipe print is masked: a value becomes ***"
 out=$(pe run -- sh -c 'echo "stdout $STRIPE_SECRET_KEY"; echo "stderr $STRIPE_SECRET_KEY" >&2' 2>&1); printf '%s\n' "$out"
 expect "run masks stdout and stderr" "$out" "$(printf 'stdout ***\nstderr ***')"
 expect "pipe masks the value it sent" "$(pe pipe app/STRIPE_SECRET_KEY -- cat)" "***"
-expect "--no-mask shows it (not for agents)" "$(pe run --no-mask -- sh -c 'printf %s "$STRIPE_SECRET_KEY"')" sk_test_synthetic
+pe run --no-mask -- sh -c 'printf %s "$STRIPE_SECRET_KEY"' </dev/null >/dev/null 2>&1
+expect "--no-mask without a terminal (an agent) is refused" "$?" 2
+out=$({ sleep 1; printf 'y\r'; sleep 1; } | script -qec "$(if [ -n "$bin" ]; then printf '%q' "$bin"; else printf 'bun %q' "$cli"; fi) run --no-mask -- sh -c 'printf \"%s\" \"\$STRIPE_SECRET_KEY\"'" /dev/null | tr -d '\r')
+expect "--no-mask at a terminal asks, then shows it" "$(printf '%s' "$out" | tr '\n' ' ' | grep -c 'unmasked.*sk_test_synthetic')" 1
 out=$(script -qec "$(if [ -n "$bin" ]; then printf '%q' "$bin"; else printf 'bun %q' "$cli"; fi) run -- sh -c 'test -t 1 && printf \"tty \\033[32m%s\\033[0m\" \"\$STRIPE_SECRET_KEY\"'" /dev/null </dev/null)
 expect "in a terminal the command still has one (colors kept), and the value is masked" "$out" "$(printf 'tty \033[32m***\033[0m')"
 step "pass still shows entries normally to the human"

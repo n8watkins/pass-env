@@ -84,10 +84,12 @@ const HELP: Record<string, string> = {
       With no -f or -e, uses ./.env.pass.
       What the command prints shows each value (6+ characters, also base64,
       URL- or JSON-encoded) as ***. In a terminal it keeps colors and prompts.
-      --no-mask turns that off; for you, never for an agent.`,
+      --no-mask turns that off, for you at your terminal only: it asks you
+      to confirm there, and refuses without a terminal (as for agents).`,
 	pipe: `  pass-env pipe <entry> [--multiline] [--no-mask] -- command args...
       Send one secret to a command's input, e.g. gh secret set NAME.
-      What the command prints shows the value as ***, like run.`,
+      What the command prints shows the value as ***, like run; --no-mask
+      works as for run.`,
 	copy: `  pass-env copy <entry> [--multiline]
       Put one secret on your clipboard, cleared after 45s.`,
 	import: `  pass-env import <file> --prefix <prefix> [--dry-run] [--skip NAME,NAME] [--map NAME=entry]... [--force]
@@ -892,13 +894,13 @@ It cannot be recovered, so save it in your password manager.`;
 // Reads one line from the terminal and stops there. An async reader (for
 // await ... of console) keeps reading stdin in the background afterwards, and
 // would swallow the keystrokes meant for a pinentry prompt that opens later.
-function readLine(): string {
+function readLine(fd = 0): string {
 	const bytes: number[] = [];
 	const one = Buffer.alloc(1);
 	for (;;) {
 		let count: number;
 		try {
-			count = readSync(0, one, 0, 1, null);
+			count = readSync(fd, one, 0, 1, null);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "EAGAIN") continue;
 			throw error;
@@ -907,6 +909,26 @@ function readLine(): string {
 		if (bytes.length < 4096) bytes.push(one[0]);
 	}
 	return Buffer.from(bytes).toString("utf8").replace(/\r$/, "");
+}
+
+// --no-mask shows values in the output, so only the owner at a terminal may
+// use it, and only after saying yes on the terminal itself. Agents have no
+// terminal, so they are refused before anything is decrypted or started.
+function confirmNoMask(): void {
+	const refused = new CliError("TTY", "--no-mask needs the owner at a terminal; nothing was run", 2);
+	if (!isatty(0) || !isatty(1)) throw refused;
+	let tty: number;
+	try {
+		tty = openSync("/dev/tty", "r+");
+	} catch {
+		throw refused;
+	}
+	try {
+		writeSync(tty, "Show secret values unmasked in this command's output? [y/N] ");
+		if (!/^y(es)?$/i.test(readLine(tty).trim())) throw new CliError("CANCELLED", "--no-mask was not confirmed; nothing was run");
+	} finally {
+		closeSync(tty);
+	}
 }
 
 async function ask(question: string): Promise<string> {
@@ -3285,6 +3307,7 @@ async function main(args: string[]): Promise<number> {
 		}
 	}
 	if (options.command === "scrub") return scrub(options);
+	if ((options.command === "run" || options.command === "pipe") && !options.mask) confirmNoMask();
 	const root = storePath();
 	switch (options.command) {
 		case "list": {
