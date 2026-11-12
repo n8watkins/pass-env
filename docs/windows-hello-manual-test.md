@@ -17,7 +17,7 @@ Your real `~/.gnupg`, store and any future real enrolment are never touched.
    After the release: download `pass-env-hello.exe` from the release page into `~/Downloads`, or build it from the repository on Windows:
 
    ```sh
-   cd ~/projects/pass-env
+   cd ~/projects/tools/pass-env
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w hello/build-release.ps1)"
    ```
 
